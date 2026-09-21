@@ -19,3 +19,14 @@ dev = [
     "pytest==9.1.1",
     "ruff==0.16.7",
 ]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["app", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
