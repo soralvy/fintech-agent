@@ -12,15 +12,24 @@ Do not mark a verification task complete unless the command/test was actually ru
 
 Target: ~30–45 minutes.
 
-- [ ] Inspect repository structure.
-- [ ] Read existing README, `pyproject.toml`, lockfile, Docker configuration, tests, `docs/DECISIONS.md`, and any existing specs.
-- [ ] Reconcile repository state with `docs/SPEC.md`.
-- [ ] Verify Python version from repository configuration.
-- [ ] Verify resolved package versions before using current APIs.
-- [ ] Confirm current official docs for any dependency whose installed API is uncertain.
-- [ ] Add/update `docs/DECISIONS.md` if repository reality requires a decision different from the specification.
-- [ ] Ensure `.env` is ignored.
-- [ ] Establish configuration loading without printing secret values.
+- [x] Inspect repository structure.
+- [x] Read existing README, `pyproject.toml`, lockfile, Docker configuration, tests, `docs/DECISIONS.md`, and any existing specs.
+- [x] Reconcile repository state with `docs/SPEC.md`.
+- [x] Verify Python version from repository configuration.
+- [x] Verify resolved package versions before using current APIs.
+- [x] Confirm current official docs for any dependency whose installed API is uncertain.
+- [x] Add/update `docs/DECISIONS.md` if repository reality requires a decision different from the specification.
+- [x] Ensure `.env` is ignored.
+- [x] Establish configuration loading without printing secret values.
+
+**Verified 2026-09-21.** Evidence per item:
+
+- Structure and documents read in full; `README.md` is empty. No Docker configuration exists, and no document prescribes one.
+- Reconciliation produced one deviation: the flat `app/` layout replaced `src/fintech_agent/`, recorded as a dated amendment to `docs/DECISIONS.md` §4.
+- Python: `.python-version` and `requires-python` pin 3.12; `uv run python -V` → `3.12.14`.
+- Package versions and APIs were confirmed by introspecting the installed packages rather than from web documentation: psycopg 3.3.5, psycopg_pool 3.3.1 (`AsyncConnectionPool` takes `open`, `configure`, `timeout`; `timeout` defaults to 30.0), pgvector 0.5.0 (`register_vector_async`, `Vector`; numpy absent, so values bind through `Vector`). `uv lock --check` → unchanged.
+- `.env`: `git check-ignore -v .env` → matched by `.gitignore:16`.
+- Configuration: `app/config.py` reads `DATABASE_URL` with no default; `ConfigError` names the variable, never its value. A review run with a password-bearing URL confirmed the password appears in neither the response nor the logs.
 
 **Exit condition:** project starts/imports with a clear dependency baseline and no known spec/repository contradiction.
 
@@ -30,15 +39,29 @@ Target: ~30–45 minutes.
 
 Target: ~1–1.5 hours.
 
-- [ ] Add/start local PostgreSQL with pgvector support.
-- [ ] Create database migration/init script enabling `CREATE EXTENSION vector`.
-- [ ] Add `documents` table.
-- [ ] Add `document_chunks` table with `vector(1536)`.
-- [ ] Add checksum uniqueness and chunk FK/unique constraints.
-- [ ] Add database connection/pool lifecycle.
-- [ ] Add repository functions for document/chunk inserts and duplicate lookup.
-- [ ] Add a database test proving pgvector is enabled.
-- [ ] Add deterministic vector retrieval test using cosine distance.
+- [x] Add/start local PostgreSQL with pgvector support.
+- [x] Create database migration/init script enabling `CREATE EXTENSION vector`.
+- [x] Add `documents` table.
+- [x] Add `document_chunks` table with `vector(1536)`.
+- [x] Add checksum uniqueness and chunk FK/unique constraints.
+- [x] Add database connection/pool lifecycle.
+- [x] Add repository functions for document/chunk inserts and duplicate lookup.
+- [x] Add a database test proving pgvector is enabled.
+- [x] Add deterministic vector retrieval test using cosine distance.
+
+**Verified 2026-09-21** against PostgreSQL 18.6 + pgvector 0.8.6 on port 5433:
+
+- `uv run pytest tests/test_retrieval_db.py` — 17 passed, including
+  `test_nearest_vector_is_retrieved_by_cosine_distance`.
+- Migration applied to a freshly created database, then re-applied: both succeed.
+- Live smoke test, `uv run fastapi dev app/main.py` with `curl /health`:
+  - database up → `200 {"status":"ok","database":"ok"}`;
+  - database stopped under the running app → `503 {"detail":"database unavailable"}` in 2 ms
+    (the pooled connection fails immediately on its dead socket);
+  - app started with the database already down, so the pool is empty →
+    `503` in **5.008 s**, the configured pool timeout (30 s before the fix);
+  - database restarted → `200` again with no application restart;
+  - no connection string or credential in the server log.
 
 **Exit condition:** tests can insert chunks containing vectors and retrieve the expected nearest vector from PostgreSQL.
 
@@ -168,8 +191,8 @@ Target: ~1–1.5 hours.
 
 Target: ~1–1.5 hours.
 
-- [ ] Add `/health`.
-- [ ] Use FastAPI lifespan for shared resources where appropriate.
+- [x] Add `/health`. *(Pulled forward into Milestone 1 once the pool existed: `SELECT 1`, `503` on failure, bounded by the pool timeout.)*
+- [ ] Use FastAPI lifespan for shared resources where appropriate. *(Partial: lifespan owns the database pool. The OpenAI client and MCP handle join it when those milestones create them.)*
 - [ ] Normalize public application error responses.
 - [ ] Confirm database failures do not expose connection strings.
 - [ ] Confirm provider failures do not expose API keys.

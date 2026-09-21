@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A FinTech research agent: upload financial documents, ask questions, get answers grounded in those documents with verifiable citations, plus an optional bounded market-data lookup over MCP.
 
-**Almost none of it is built yet.** The repository currently contains only the Milestone 0/1 scaffold: `app/main.py` with a single `GET /health` returning `{"status": "ok"}`, and `tests/test_health.py`. Everything else — PostgreSQL, ingestion, retrieval, the LangGraph workflow, OpenAI calls, MCP — exists as specification under `docs/`, not as code.
+**Milestones 0 and 1 are done; the rest is specification.** Built and verified: the `documents` / `document_chunks` schema with `vector(1536)`, the psycopg pool and its pgvector registration, repository functions for insert / duplicate-lookup / nearest-neighbour search, and `GET /health`. Not built: ingestion, retrieval service, the LangGraph workflow, OpenAI calls, MCP — those exist under `docs/`, not as code.
 
 Treat `docs/` as the source of truth and build against it. `README.md` is empty.
 
@@ -19,10 +19,30 @@ uv run ruff check .                     # lint
 uv run ruff check --fix .               # lint with autofix
 uv run mypy app tests                   # strict type check
 uv run pytest                           # full suite
-uv run pytest tests/test_health.py::test_health_returns_ok   # single test
+uv run pytest tests/test_health.py::test_health_reports_ok   # single test
 uv run pytest -k health                 # by name
 uv run fastapi dev app/main.py          # dev server on :8000
 ```
+
+### Database
+
+PostgreSQL 18.6 + pgvector 0.8.6, installed via Homebrew and run on **port 5433** so it cannot collide with the machine's PostgreSQL 14. PG 18 is keg-only and not linked, so use absolute paths:
+
+```bash
+PG=/opt/homebrew/opt/postgresql@18/bin
+$PG/pg_ctl -D /opt/homebrew/var/postgresql@18 -o "-p 5433" -l /tmp/pg18.log start
+$PG/pg_ctl -D /opt/homebrew/var/postgresql@18 stop
+$PG/psql -h 127.0.0.1 -p 5433 -d fintech -f migrations/001_initial.sql   # apply the migration
+```
+
+Two databases: `fintech` (application) and `fintech_test` (integration tests). **`TEST_DATABASE_URL` and `DATABASE_URL` must never point at the same database** — the test fixtures drop both tables on every test.
+
+```bash
+export DATABASE_URL=postgresql://localhost:5433/fintech
+export TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test
+```
+
+Without `TEST_DATABASE_URL` the database tests **skip rather than fail**, and `uv run pytest` still reports success. A green suite therefore does not prove the vector path works — check the skip count, or run `uv run pytest tests/test_retrieval_db.py` explicitly.
 
 The four gates — format, lint, mypy, pytest — apply to every change. A live HTTP smoke test against a running server is additionally required after changes to startup, lifespan, the database, or the HTTP contract, and before final completion; for self-contained work such as an MCP response parser, the gates plus that change's own tests are sufficient. `docs/TASKS.md` is explicit: do not mark a verification task complete unless the command actually ran successfully.
 
@@ -79,9 +99,15 @@ Four documents, in the order they bind:
 
 Flat `app/` package at the repository root, with `migrations/` and `tests/` alongside it. `docs/DECISIONS.md` §4 records this layout and carries a dated amendment noting it replaced an earlier `src/fintech_agent/` proposal — **do not migrate back.** The module responsibilities listed in §4 (`db.py`, `ingestion.py`, `retrieval.py`, `openai_provider.py`, `graph.py`, `prompts.py`, `market_data.py`, `mcp_server.py`, `mcp_client.py`, `schemas.py`, `config.py`, `logging.py`, `errors.py`) remain the intended decomposition, just under `app/`. Do not create these as empty placeholder modules ahead of the milestone that needs them.
 
-## `/health` is deliberately partial
+## Database layer
 
-`docs/SPEC.md` §6.1 specifies `{"status": "ok", "database": "ok"}` backed by `SELECT 1` with `503` on failure. The current handler returns only `{"status": "ok"}` because no pool exists yet. Complete it during Milestone 1 — `HealthResponse` in `app/main.py` is shaped to absorb the extra field.
+`app/db.py` owns SQL and nothing else — no business decisions, and no import of FastAPI route objects. Cosine distance is returned raw; converting it to a similarity and filtering weak results belongs to the retrieval service (Milestone 3), not here.
+
+numpy is **not** installed (pgvector 0.5.0 makes it optional), so embeddings bind through `pgvector.Vector`, not ndarrays or bare lists — a bare list would bind as a PostgreSQL array, not a vector. `_to_vector` rejects any embedding that is not exactly 1536-dimensional before a row is written.
+
+`insert_chunks` deliberately opens no transaction: ingestion commits the document and all its chunks together, so the caller owns the boundary.
+
+The pool carries an explicit 5-second `timeout`; psycopg_pool's 30-second default made an outage take 30 seconds to reach `/health`'s 503. It also opens **without** waiting for a first connection — do not "fix" that with `open(wait=True)`, because the app must stay up and report 503 while the database is down (`docs/DECISIONS.md` §6).
 
 ## Tooling configuration
 

@@ -243,6 +243,7 @@ Use this structure:
 │
 ├── tests/
 │   ├── __init__.py
+│   ├── conftest.py
 │   ├── fixtures/
 │   ├── fakes.py
 │   ├── test_health.py
@@ -258,7 +259,9 @@ Use this structure:
 └── README.md
 ```
 
-Only `app/__init__.py`, `app/main.py`, `tests/__init__.py`, and `tests/test_health.py` exist so far. The remaining files are created by the milestone that needs them, not ahead of it.
+Implemented as of Milestone 1: `migrations/001_initial.sql`, `app/__init__.py`, `app/main.py`, `app/config.py`, `app/db.py`, `tests/__init__.py`, `tests/conftest.py`, `tests/test_health.py`, `tests/test_retrieval_db.py`, and `.env.example`. Every other file in the tree is created by the milestone that needs it, not ahead of it.
+
+`app/config.py` currently holds only database configuration; the remaining SPEC §14 values join it with the milestones that consume them.
 
 `app/` and `tests/` are both regular packages carrying `__init__.py`. This is deliberate: it gives every module a unique dotted name, so a test module can share a basename with an application module without colliding during mypy's module discovery.
 
@@ -395,6 +398,16 @@ and creates the two application tables.
 
 No migration framework is required for the MVP. The SQL file itself is the migration artifact and is executed explicitly during setup/tests.
 
+Every statement in the file is idempotent (`CREATE EXTENSION IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`), so re-applying it to an existing database is a no-op rather than an error. The file only ever creates; dropping is a test concern and lives in the test fixtures.
+
+### Local provisioning (recorded 2026-09-21)
+
+The development machine already ran PostgreSQL 14, which pgvector's Homebrew bottle does not build for. PostgreSQL 18.6 and pgvector 0.8.6 — the versions `TECH_BASELINE.md` selects — were installed alongside it and are run on **port 5433** so the two servers cannot collide. PostgreSQL 18 is keg-only and deliberately not `brew link`ed, so its binaries are invoked by absolute path.
+
+### Test database separation
+
+Integration tests read `TEST_DATABASE_URL`, not `DATABASE_URL`, and skip when it is unset. The fixtures drop and recreate both tables on every test, so the two variables must never point at the same database. Keeping them distinct means pointing the application at a database can never put that database's contents at risk.
+
 ### Reason
 
 There is only one initial schema. Adding Alembic or another migration subsystem does not help satisfy an acceptance criterion.
@@ -477,6 +490,12 @@ Use an explicitly opened `AsyncConnectionPool`.
 Every pooled connection registers the pgvector type through the pool configuration hook.
 
 All queries use bound parameters.
+
+### Pool timeout and startup (recorded 2026-09-21)
+
+The pool is built with an explicit `timeout` of 5 seconds (`DEFAULT_POOL_TIMEOUT_SECONDS` in `app/config.py`), bounding every wait for a connection. psycopg_pool's own default is 30 seconds, under which a database outage took 30 seconds to surface as `/health`'s 503 — longer than a typical health probe waits — and every other caller of `pool.connection()` would inherit the same stall. On timeout the pool raises `PoolTimeout`, a `psycopg.Error`, so the existing 503 mapping applies unchanged.
+
+The pool is opened without waiting for a first connection. This is deliberate: SPEC §6.1 has `/health` report a database outage as 503, which requires the application to be up while the database is down. Opening with `wait=True` would instead make the application refuse to start.
 
 ## Ingestion transaction
 
