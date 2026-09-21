@@ -208,7 +208,9 @@ The application starts or connects to a local MCP server as part of its runtime 
 
 # 4. Repository structure
 
-Use this initial structure:
+**Amended 2026-09-21.** This section originally prescribed a `src/fintech_agent/` layout. The implemented scaffold uses a flat `app/` package at the repository root, and this section now records that implemented layout. Module responsibilities are unchanged; only the package path moved. Continue with `app/`; do not migrate to `src/fintech_agent/`.
+
+Use this structure:
 
 ```text
 .
@@ -219,30 +221,31 @@ Use this initial structure:
 │   └── TASKS.md
 ├── migrations/
 │   └── 001_initial.sql
-├── src/
-│   └── fintech_agent/
-│       ├── __init__.py
-│       ├── main.py
-│       ├── config.py
-│       ├── errors.py
-│       ├── logging.py
-│       ├── schemas.py
-│       │
-│       ├── db.py
-│       ├── ingestion.py
-│       ├── retrieval.py
-│       │
-│       ├── openai_provider.py
-│       ├── graph.py
-│       ├── prompts.py
-│       │
-│       ├── market_data.py
-│       ├── mcp_server.py
-│       └── mcp_client.py
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── errors.py
+│   ├── logging.py
+│   ├── schemas.py
+│   │
+│   ├── db.py
+│   ├── ingestion.py
+│   ├── retrieval.py
+│   │
+│   ├── openai_provider.py
+│   ├── graph.py
+│   ├── prompts.py
+│   │
+│   ├── market_data.py
+│   ├── mcp_server.py
+│   └── mcp_client.py
 │
 ├── tests/
+│   ├── __init__.py
 │   ├── fixtures/
 │   ├── fakes.py
+│   ├── test_health.py
 │   ├── test_ingestion.py
 │   ├── test_retrieval_db.py
 │   ├── test_graph.py
@@ -254,6 +257,10 @@ Use this initial structure:
 ├── .env.example
 └── README.md
 ```
+
+Only `app/__init__.py`, `app/main.py`, `tests/__init__.py`, and `tests/test_health.py` exist so far. The remaining files are created by the milestone that needs them, not ahead of it.
+
+`app/` and `tests/` are both regular packages carrying `__init__.py`. This is deliberate: it gives every module a unique dotted name, so a test module can share a basename with an application module without colliding during mypy's module discovery.
 
 Do not create interface/repository/domain package hierarchies until file size or actual duplication justifies them.
 
