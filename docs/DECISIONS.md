@@ -145,6 +145,8 @@ Do not add:
 
 The project intentionally depends on one external AI provider. Provider failure becomes a controlled infrastructure error rather than triggering fallback behavior.
 
+The optional post-baseline decision layer (§25) does not change this. It is not an LLM or embedding provider, it is off by default, and when it fails the graph falls back to this baseline path rather than to another provider.
+
 ---
 
 ## 3.4 LangGraph answering workflow
@@ -260,6 +262,8 @@ Use this structure:
 ```
 
 Implemented as of Milestone 1: `migrations/001_initial.sql`, `app/__init__.py`, `app/main.py`, `app/config.py`, `app/db.py`, `tests/__init__.py`, `tests/conftest.py`, `tests/test_health.py`, `tests/test_retrieval_db.py`, and `.env.example`. Every other file in the tree is created by the milestone that needs it, not ahead of it.
+
+The optional post-baseline decision layer (§25) would add `app/typesafe_provider.py` and `app/decisions.py` in Milestone 10, and a top-level `evals/` package in Milestone 9 holding the manually invoked evaluation runner (`uv run python -m evals.run`). `evals/` is not collected by pytest (it falls outside `testpaths`) but is added to the mypy `files` setting. All three are deliberately absent from the tree above because they are not part of the MVP baseline.
 
 `app/config.py` currently holds only database configuration; the remaining SPEC §14 values join it with the milestones that consume them.
 
@@ -1819,3 +1823,262 @@ The MVP is complete only after the repository's actual:
 have been run successfully and the observed results are recorded.
 
 Until then, implementation and verification status must remain explicit.
+
+---
+
+# 25. Optional post-baseline decision layer (TypeSafe Jev)
+
+**Recorded 2026-09-21. Status: proposed, not implemented.** Nothing in this section is built. It takes effect only through `docs/TASKS.md` Milestones 9–12, which start after the Milestone 8 exit condition has actually been met. Verified API facts and sources are in `docs/TECH_BASELINE.md` §3.13; the behavioral contract is `docs/SPEC.md` §18.
+
+## 25.1 Position in the architecture
+
+### Chosen approach
+
+An optional decision step sits after pgvector retrieval and before grounded generation:
+
+```text
+question
+  -> embed_query
+  -> retrieve                     (pgvector top-K + MIN_RETRIEVAL_SIMILARITY, unchanged)
+  -> decide_passages              optional Jev passage decisions   (Milestone 10)
+  -> route_tools
+       use_tools=false -> build_context
+       use_tools=true  -> gate_tools   optional Jev routing gate   (Milestone 11)
+                          -> decide_tool (existing planner) -> call_tool (at most one)
+                          -> build_context
+  -> answer
+  -> finalize                     (application-owned citation validation, unchanged)
+```
+
+Jev returns probabilities. **Application code** turns them into decisions: it applies thresholds, selects and orders passages, and decides whether the MCP path may run at all.
+
+The graph stays loop-free. Each new node runs at most once per execution, so the topology argument of §11 still holds.
+
+### Reason
+
+pgvector cosine similarity measures wording resemblance, not whether a passage answers the question. The weak-result threshold (§8) is a heuristic that cannot tell a passage that answers the question from one that only resembles it, from one that contradicts the question's premise, or from one carrying an injected instruction. A narrow per-passage judgment can separate those cases. It does this without giving a generative model more authority, and it is cheap enough to try (`docs/TECH_BASELINE.md` §3.13 pricing).
+
+### Rejected alternatives
+
+- **Jev before retrieval, or instead of pgvector.** Rejected: pgvector retrieval is a required, visible part of the project, and Jev's accuracy falls as `state` grows with irrelevant content.
+- **Jev choosing or adding passages.** Rejected: Jev may only reorder or remove candidates that pgvector retrieval and the existing similarity floor already admitted. It can never widen the evidence set.
+- **Jev after generation (answer or citation checking).** Deferred: it does not serve the first milestone, and citation validity is already enforced deterministically in `finalize`.
+- **Letting the answer model do the gating.** Rejected: that folds evidence selection into the same generative call whose grounding it is meant to protect.
+
+### Consequence
+
+Every query with the layer enabled makes extra network calls and pays extra latency. The benefit is unproven until Milestone 12 measures it against the frozen baseline.
+
+## 25.2 Passage decisions and deterministic selection
+
+### Chosen approach
+
+For each retrieved chunk that survived the similarity floor, send one Jev request whose `state` is the pair `{question, passage text}`. The request asks four atomic Noul questions:
+
+| Question key | Meaning |
+|---|---|
+| `is_relevant` | the passage is about what the question asks |
+| `contains_answer_evidence` | the passage states something usable to answer the question |
+| `contradicts_query_premise` | the passage contradicts something the question takes for granted |
+| `contains_prompt_injection` | the passage contains text addressed to an AI system or tries to instruct one |
+
+The `state` carries no document UUID, chunk UUID, or filename; those stay application-side. Requests for one query run concurrently under one shared deadline.
+
+A pure application function maps the four probabilities to exactly one label. The first matching rule wins:
+
+1. `contains_prompt_injection >= T_injection` → `exclude` (reason `injection_signal`)
+2. `is_relevant < T_relevant` → `exclude` (reason `not_relevant`)
+3. `contradicts_query_premise >= T_conflict` → `conflicting_evidence`
+4. `contains_answer_evidence >= T_evidence` → `include`
+5. otherwise → `exclude` (reason `no_answer_evidence`)
+
+Ordering: `include` passages are sorted by `contains_answer_evidence` descending, with ties broken by the original pgvector rank. `conflicting_evidence` passages follow them in pgvector rank order. `build_context` then assigns `D1…Dn` in that order. Conflicting passages are real stored chunks, so they are citable. They are presented in a separately delimited conflicting-evidence block, and the answer prompt instructs the model to state the conflict rather than resolve it silently (SPEC §5.1 already requires this).
+
+If no passage is `include` or `conflicting_evidence` and there is no successful tool result, the graph routes to `finalize_insufficient` without calling the answer model. This is the existing no-evidence rule of §10.7, now applied after the evidence gate.
+
+The thresholds are configuration values tuned on the project's evaluation development split (Milestone 9). They are not copied from TypeSafe cookbooks. Noul thresholds are never reused for Choice questions, and no arithmetic identity between separate questions is assumed (`docs/TECH_BASELINE.md` §3.13, structural invariants).
+
+### Reason
+
+Four atomic questions follow TypeSafe's documented guidance: combine atomic judgments in code, and do not hide several judgments inside one question. Keeping the combination rule in code makes the policy reviewable, deterministic under test, and replaceable without re-prompting.
+
+### Rejected alternatives
+
+- **One Choice over `include | conflicting | exclude`.** Rejected: it hides several judgments inside one question and moves the policy out of code.
+- **One request carrying all passages.** Rejected for the first implementation: a larger `state` holding several unrelated passages is exactly the "large state full of irrelevant detail" failure mode. Batching can be evaluated later as a cost optimization.
+- **A Score for relevance.** Rejected: a graded score adds no decision the code can act on, and the independent calibration work found Score miscalibrated more than Noul.
+
+### Consequence
+
+Up to `RETRIEVAL_TOP_K` (6) Jev requests per query. At about 1k input tokens per passage, that is on the order of $0.0003 per query at the published price. This is an estimate, to be replaced by the Milestone 12 measurement.
+
+## 25.3 Integration boundary: direct REST, not the SDK
+
+### Chosen approach
+
+`app/typesafe_provider.py` (created in Milestone 10, not before) makes direct `POST /v1/systemone` calls with `httpx.AsyncClient`, which `fastapi[standard]` already provides. The module:
+
+- builds the request from application-owned question definitions;
+- parses the response into its own Pydantic models, strictly: every requested key present, the type tag matching, probabilities in `[0, 1]`, and the response `model` equal to the configured pinned ID;
+- returns application dataclasses carrying probabilities only, never raw responses;
+- raises one application error type carrying a safe reason code, never the response body.
+
+The graph depends on a small `typing.Protocol` implemented by this adapter and by a deterministic fake in `tests/fakes.py`. The pure selection and gating policy lives in `app/decisions.py`. Neither module imports FastAPI route objects (§21). FastAPI lifespan creates the `httpx.AsyncClient` only when at least one decision stage is enabled and configured, and closes it on shutdown.
+
+### Reason
+
+The integration uses one endpoint with a three-variant answer union. A hand-written client is small. It keeps strict typing under the project's own models, keeps timeout and retry behavior fully in application control (the SDK's default retry budget of up to 30 s conflicts with the bounded deadline in §25.5), and pins the model explicitly (the SDK defaults to `jev-latest`). It also keeps the adapter replaceable: a future provider implements the same Protocol.
+
+### Rejected alternatives
+
+- **Official `typesafe-sdk`.** Rejected for now. Adding it would cost only one package, since its transitive dependencies are already locked (`docs/TECH_BASELINE.md` §3.13), and it ships `py.typed`. However, it is a week-old 0.x line with two breaking releases in its first week. Its defaults (moving alias, retries with backoff, 10 s timeout) would each need overriding, and it still adds a dependency where the existing client suffices. Revisit when it reaches a stable major version and a concrete need appears.
+- **`langchain-typesafe`, a TypeSafe MCP adapter, Vercel AI Gateway, Cloudflare, or OpenRouter.** Rejected: each adds a dependency or an intermediary without serving the slice. Routing uploaded financial text through additional third parties also widens its exposure.
+- **A generalized decision-provider framework or plugin registry, or a DI framework.** Rejected (§22): one Protocol with one real and one fake implementation is enough.
+
+### Consequence
+
+The project owns about a hundred lines of request and response schema and must track TypeSafe API changes by hand. It also imports `httpx`, which it receives only transitively through `fastapi[standard]`. If that extra ever stops providing `httpx`, declaring it explicitly is a deliberate dependency change under `docs/TECH_BASELINE.md` §5, not something done silently.
+
+## 25.4 Confidence-gated MCP routing (later milestone)
+
+### Chosen approach
+
+This applies only when `use_tools=true`; `use_tools=false` still guarantees zero MCP calls without consulting Jev. A single Choice over the **question text only** (never document text, preserving §10.4's security reason) has a closed option set:
+
+- `document_answer`
+- `market_data_lookup`
+- `unsupported`
+
+The gate authorizes the existing `decide_tool` → `call_tool` path only when the choice is `market_data_lookup` **and** its confidence meets `T_route`. In every other case the MCP path is skipped:
+
+- any other choice;
+- confidence below the threshold;
+- any provider failure.
+
+Jev never outputs a tool name, symbol, URL, or argument. When authorized, the existing planner still chooses among the two allow-listed tools or none. Its output is still validated by application code, the symbol is validated again at the MCP server, and the one-call cap is unchanged. The gate can only **remove** MCP calls, never add one.
+
+`unsupported` does not short-circuit the query in this design. The document path and its insufficient-context policy still run. The route is logged and evaluated, and any stronger use of it requires a later recorded decision based on Milestone 12 data.
+
+### Reason
+
+The independent evaluation found out-of-scope inputs confidently misrouted (`docs/TECH_BASELINE.md` §3.13). A gate that can only withhold a read-only call is therefore safe to be wrong in one direction, and the cost of that error (a missing optional tool result) is already handled by SPEC §12.5.
+
+### Rejected alternatives
+
+- **Jev selecting the tool (a Choice over tool names).** Rejected for now: it adds no capability over the existing planner and moves allow-list-adjacent authority to a new component.
+- **Falling back to the planner when routing fails.** Rejected: routing failure must not authorize MCP.
+
+### Consequence
+
+The system becomes deliberately asymmetric. With the layer **disabled**, the baseline planner decides as before. With it **enabled but failing or uncertain**, no MCP call occurs. Tool-dependent questions then become `insufficient_context` or document-only answers, which is fail-closed behavior.
+
+## 25.5 Failure and fallback policy
+
+### Chosen approach
+
+Passage decisions (`JEV_ENABLED`) and the routing gate (`JEV_ROUTING_ENABLED`) are configured independently, and neither depends on the other; routing enabled with passage decisions disabled is valid. Each stage is always in exactly one of three states (SPEC §18.5):
+
+| State | Provider called | Passage decisions | Routing gate | Logging |
+|---|---|---|---|---|
+| 1. Disabled (the stage's flag is false, the default); normal baseline operation, not a fallback | never | baseline path | baseline planner runs as today | none; no per-query decision event, and no `decision.fallback` |
+| 2. Unavailable: enabled with required configuration missing (`TYPESAFE_API_KEY` missing, an explicit `JEV_MODEL` not exactly the pinned ID (an alias, an arbitrary string, or a different ID; unset resolves to the pin), or one of the stage's own thresholds absent); a startup problem, not a runtime fallback | never for that stage | baseline path | baseline planner runs as today | one `decision.config_invalid` at startup per distinct `(reason_code, setting)`: `missing_api_key` / `unpinned_model` / `missing_threshold`; no per-query decision event, and no `decision.fallback` |
+| 3. Enabled and successfully configured | yes | runtime rules below | runtime rules below | per-query events below |
+
+Runtime fallback applies **only in state 3**. Fallback for passage decisions means **the exact baseline path**: pgvector order, the existing similarity floor, and the existing insufficient-context rules. Fallback for routing means **no MCP call**. Neither fallback turns into an HTTP error, and neither changes the public response shape.
+
+| State-3 condition | Passage decisions | Routing gate | `decision.fallback` `reason_code` |
+|---|---|---|---|
+| Timeout or shared deadline exceeded | baseline path | no MCP | `timeout` |
+| `429` rate limit / `529` overloaded | baseline path, no retry | no MCP, no retry | `rate_limited` / `overloaded` |
+| `401`, including a present but invalid `TYPESAFE_API_KEY` (not detectable at startup) | baseline path | no MCP | `auth_failed` |
+| `422` provider-side rejection that local validation cannot detect (for example, a malformed question). A configured model other than the pinned ID never reaches the provider, because it is state 2. | baseline path | no MCP | `invalid_request` |
+| Transport error or other status | baseline path | no MCP | `transport_error` / `unexpected_status` |
+| Unparseable body, missing answer key, wrong type tag, out-of-range value, or a `model` field that is missing, null, empty, or not a string | baseline path | no MCP | `invalid_response` |
+| The response passes structural validation, but its `model` field differs from the exact pinned ID the application requested. This is the only mismatch signal; nothing is inferred from content, headers, latency, confidence, or other heuristics. | baseline path | no MCP | `model_mismatch` |
+| Some but not all passage requests fail | whole query falls back to the baseline path; partial results are discarded | — | the reason code of the failure with the lowest pgvector rank, regardless of completion order; when every request fails, the same rule picks among them |
+| Low probability or low confidence | handled by the §25.2 rules (tends toward `exclude`) | no MCP | none (normal decision) |
+| Every passage excluded, no tool result | `finalize_insufficient` | — | none (normal decision) |
+
+Rules:
+
+- **Bounded wait.** Each stage has one overall deadline (`JEV_TIMEOUT_SECONDS`, provisional default 2.0 s, to be revisited from Milestone 9 measurements). There are no retries in the request path. Generation never waits on Jev beyond that deadline.
+- **Visible runtime fallback.** In state 3 only, every failed decision-stage invocation emits exactly one structured `decision.fallback` event.
+  - It carries `request_id`, `stage` (`passage` or `routing`), and `reason_code` (from the table above), plus an optional integer `status_code` and `duration_ms`.
+  - One failed invocation never emits duplicates; a partial passage failure is one invocation and one event.
+  - Several failed stages in one query each emit their own event, sharing the `request_id`.
+  - Milestone 10 has only the passage stage, so it emits at most one event per affected query. From Milestone 11, passage and routing failures are recorded independently.
+  - `decision.fallback` is never emitted in states 1 or 2.
+- **Startup validation.** An absent stage-specific setting (unset, or empty after trimming) is allowed while its stage is disabled.
+  - **Type validity** (booleans, the numeric timeout, and numeric thresholds within range) is always checked.
+  - **Operational requirements** (credentials, required thresholds, and model pinning) are checked only for an enabled stage.
+
+  A supplied typed setting that fails type validity makes the application refuse to start, and the layer is not silently disabled. This covers:
+  - a non-numeric `JEV_TIMEOUT_SECONDS`;
+  - a non-positive `JEV_TIMEOUT_SECONDS`;
+  - a supplied threshold outside [0, 1];
+  - a `JEV_ENABLED` or `JEV_ROUTING_ENABLED` value other than `true` or `false`, case-insensitive.
+
+  The error names the setting, never its value. There is no enum or mode setting, so no enum validation exists until a real one is introduced. `JEV_MODEL` is an opaque string during parsing. With both stages disabled it is not checked at all, so an alias, an arbitrary string, or an absent value starts cleanly with no event and no provider client. With any stage enabled, an unset or whitespace-only value means no override and resolves to the exact pinned ID in `docs/TECH_BASELINE.md` §3.13, with no event. Any explicit non-empty value other than that ID is state 2 (`unpinned_model`), detected locally without calling the provider. Missing required configuration is state 2, not a startup failure. A *missing* threshold is state 2; a supplied *out-of-range* threshold is a startup failure. Startup never calls the provider, so credentials are not validated there, and a present but invalid key surfaces at runtime as `auth_failed`.
+- **Startup configuration warning.** In state 2 only, lifespan emits exactly one structured `decision.config_invalid` event per distinct problem per process start.
+  - Events are deduplicated on the pair `(reason_code, setting)`. A missing key with an alias model emits two events (`missing_api_key`, `unpinned_model`). A missing key with both stages enabled emits one.
+  - Each stage's thresholds are checked independently, and each absent threshold of an enabled stage emits its own `missing_threshold` event.
+  - Each event carries `reason_code` and `setting` (the environment-variable *name*, never its value). It carries no `request_id`, because it describes startup validation, not a query.
+  - It is never emitted per query, and a stage in state 2 is never given a provider call.
+- **Successful decisions.** In state 3, a successful decision emits `decision.passages.completed` (`model`, `passage_count`, `included_count`, `conflicting_count`, `excluded_count`, per-reason exclusion counts, `input_tokens`, `duration_ms`) or `decision.route.completed` (`route`, `confidence`, `mcp_authorized`, `duration_ms`). Per-chunk probabilities may be logged keyed by `chunk_id` only.
+- **Never logged**, in any of these events: passage or document text, the question text, the request `state`, question instructions, the API key or `Authorization` header, provider response or error bodies, or exception messages derived from them (§19).
+
+### Reason
+
+The layer is an optimization on an already-correct path. When it cannot deliver a decision, the right outcome is the path the baseline already verified, not a new failure mode. The only exception is authorization: a failed gate must withhold rather than grant.
+
+### Rejected alternatives
+
+- **Failing the request (`502`) on a Jev failure.** Rejected: it would make an optional component a hard dependency.
+- **Validating the API key with a provider call at startup.** Rejected: startup would then depend on an optional external service. A present but invalid key therefore surfaces at runtime as `auth_failed`.
+- **Silently disabling the layer on malformed local configuration.** Rejected: a typo in a timeout or threshold would quietly turn the layer off and invalidate evaluation runs. Failing fast makes the mistake visible. Missing provider configuration is different, because it is an expected way to run without the layer (state 2).
+- **For the MVP, out of scope rather than rejected on the merits:** a circuit breaker for repeated authentication failures, process-local disabling after the first authentication failure, and suppression or deduplication of authentication-error logs. Each failed invocation is logged on its own.
+- **Using partial passage results.** Rejected: the selected evidence would then depend on which calls happened to succeed, which is neither reproducible nor evaluable.
+- **Retrying with backoff in the request path.** Rejected: unbounded or opaque latency for an optional step.
+
+### Consequence
+
+An outage of the decision service silently (but visibly in logs) degrades to baseline quality. That includes losing the injection signal, which is acceptable only because the signal was never a security boundary (§25.7).
+
+## 25.6 Model pinning and upgrade policy
+
+### Chosen approach
+
+The pinned model ID has one authoritative record, `docs/TECH_BASELINE.md` §3.13 (currently `jev-1.13.0`), mirrored by a single code constant. `JEV_MODEL` is an optional override: unset or whitespace-only resolves to the pinned ID, so users never have to repeat it. When any stage is enabled, an explicit `JEV_MODEL` must exactly equal the pinned ID. Any other explicit value, whether an alias (`jev-latest`, `jev-preview`), an arbitrary string, or a different explicit ID, makes the enabled stages unavailable at startup (`unpinned_model`, §25.5). Every response's `model` field must equal the requested pinned ID. A structurally valid response with a different `model` is the runtime reason `model_mismatch`. A missing, null, empty, or non-string `model` is `invalid_response`. Every benchmark record stores the model ID. A model upgrade is a separate change, handled like a dependency upgrade (`docs/TECH_BASELINE.md` §5):
+
+1. re-run the Milestone 9 dataset against the candidate ID;
+2. re-tune thresholds on the development split only;
+3. compare against the current pinned model and the vector-only baseline on the held-out split;
+4. record the result and change the pin in the same commit.
+
+### Reason
+
+Thresholds are tuned against one model's probability distribution. An alias can move under the application and invalidate them without any code change.
+
+### Consequence
+
+The project will not pick up TypeSafe improvements automatically. That is intended.
+
+## 25.7 Security position
+
+- Jev's injection signal is **an additional heuristic, not a security boundary**. TypeSafe documents that adversarial content in `state` can move the answer. Accepted passages remain untrusted source text inside delimited blocks, and every rule of §17 still applies unchanged.
+- Passage text sent to Jev appears only in `state`, never in question instructions or criteria. The question definitions are fixed application constants.
+- Jev output can remove or reorder evidence and withhold an MCP call. It cannot add evidence, select a tool, supply a symbol, or influence citation metadata. `finalize` validation is unchanged.
+- `TYPESAFE_API_KEY` has no default, is never logged, and is sent only to the fixed TypeSafe endpoint. The base URL is not configurable, so a misconfigured host cannot receive the key.
+- Enabling the layer sends the user question and retrieved chunk text to a second third party (after OpenAI). Standard accounts have no fixed retention period and no zero-retention guarantee (`docs/TECH_BASELINE.md` §3.13). The layer is therefore off by default and intended only for public or sample documents. Production handling of confidential financial documents is out of scope.
+
+## 25.8 Evaluation-first acceptance
+
+The layer is retained only if Milestone 12 shows a measured improvement over the frozen vector-only baseline (Milestone 9) on the project's own held-out dataset, with no regression in citation validity or prompt-injection handling and acceptable p95 latency. It must not be retained on the strength of public benchmarks, cookbook numbers, or popularity. The criteria are in SPEC §18.6. If it is not retained, the code may stay disabled or be removed; the decision and its data are recorded here either way.
+
+## 25.9 Jev-compatible local implementations
+
+Laya and other Jev-compatible implementations are recorded only as **possible future experimental providers**. They are not fallback models. API compatibility does not establish equivalent accuracy, equivalent probability calibration (thresholds would need re-tuning), equivalent behavior under adversarial input, or acceptable latency on the development hardware. A local provider may be considered only after the cloud integration and the baseline have been evaluated on the same Milestone 9 dataset, and then only as a new recorded decision implementing the same Protocol.
+
+## 25.10 Explicitly out of scope for this layer
+
+Browser automation; Pi or Claude Code routing; automated code review with Jev; context compaction; trading or order execution; any generative use of Jev; online or automatic threshold tuning; a generalized decision framework or provider marketplace; and production handling of confidential documents.
