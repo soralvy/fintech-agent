@@ -458,11 +458,73 @@ For the one real asynchronous in-process MCP protocol-boundary test, follow the 
 
 pytest 9.1.1 supports Python 3.12.
 
-Do not add network-dependent tests to the normal suite. The specification requires OpenAI, embeddings, and market-provider calls to use mocks/fakes in automated tests, with real configured services reserved for the explicit manual smoke test.
+Do not add network-dependent tests to the normal suite. The specification requires OpenAI, embeddings, and market-provider calls to use mocks/fakes in automated tests, with real configured services reserved for the explicit manual smoke test, plus, for the optional Jev layer, the manually invoked evaluation runner (`docs/TASKS.md` Milestone 9; `docs/SPEC.md` §18.6, §18.8) — never `uv run pytest`.
 
 Do not add pytest plugins unless an implemented test actually requires them.
 
 **Verified:** 2026-09-16
+
+---
+
+## 3.13 TypeSafe Jev decision API — optional, post-baseline, no dependency
+
+**Status:** optional service for the post-baseline decision layer (`docs/SPEC.md` §18, `docs/DECISIONS.md` §25, `docs/TASKS.md` Milestones 9–12). It is **not** part of the MVP baseline, is **not** a package dependency, and nothing in the base vertical slice may require it.
+
+**Selected model ID:** `jev-1.13.0` (pinned versioned ID; the aliases `jev-latest` and `jev-preview` are not used — see `docs/DECISIONS.md` §25.6)
+
+**Selected integration:** direct REST over the `httpx` client already present through `fastapi[standard]`. The official `typesafe-sdk` is not added (`docs/DECISIONS.md` §25.3).
+
+**Official sources** (all read 2026-09-21):
+
+- [Introduction](https://docs.typesafe.ai/introduction) and [documentation index](https://docs.typesafe.ai/llms.txt)
+- [HTTP API reference](https://docs.typesafe.ai/api)
+- [Models](https://docs.typesafe.ai/models)
+- [Primitives: Choice](https://docs.typesafe.ai/primitives/choice), [Score](https://docs.typesafe.ai/primitives/score), [Noul](https://docs.typesafe.ai/primitives/noul)
+- [Confidence](https://docs.typesafe.ai/confidence)
+- [Jev 1.13 jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13) (page states "Last reviewed 2026-09-17")
+- [Python SDK](https://docs.typesafe.ai/sdk/python), [SDK changelog](https://docs.typesafe.ai/sdk/python/changelog), [SDK constants](https://docs.typesafe.ai/sdk/python/api/constants), [SDK exceptions](https://docs.typesafe.ai/sdk/python/api/exceptions), [SDK retries](https://docs.typesafe.ai/sdk/python/api/retries)
+- [Classifying RAG passages cookbook](https://docs.typesafe.ai/cookbooks/classifying_rag_passages), [Re-ranking cookbook](https://docs.typesafe.ai/cookbooks/rerank_typesafe), [Confidence-gated routing pattern](https://docs.typesafe.ai/patterns/confidence-routing)
+- [Legal](https://docs.typesafe.ai/legal) and [Data Processing Agreement](https://typesafe.ai/legal/data-processing) (DPA "last updated Apr 24, 2026")
+- PyPI metadata for [`typesafe-sdk`](https://pypi.org/project/typesafe-sdk/) 0.7.1
+
+**Verified API facts:**
+
+- Endpoint: `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <API_KEY>`, JSON body. `GET https://api.typesafe.ai/v1/models` lists aliases only; versioned IDs are accepted by the `model` field whether or not they are listed.
+- Request: `state` (string, object, or array of text), `model` (required), `questions` (a map of caller-chosen keys to typed questions). The question keys are not sent to the model.
+- Response: `model` (the **versioned** ID that answered, even when an alias was sent), `answers` keyed by the same question IDs, `usage.input_tokens` / `usage.output_tokens`.
+- Question contracts:
+  - **Noul** — yes/no; optional `criteria.true` / `criteria.false`; the answer is `noul`, a number in 0–1 read as the probability of yes. **Noul answers carry no `confidence`.**
+  - **Choice** — `criteria` maps option → description (or null), at most 255 options; the answer is `choice` (the highest-probability option), `probabilities` over every option summing to 1, and `confidence`.
+  - **Score** — `criteria` is an ordered array of 2–10 level descriptions; the answer is `score` (probability-weighted, may fall between levels), `legend`, `probabilities`, and `confidence`.
+- Confidence: a 0–1 statistic TypeSafe derives from the shape of the Choice/Score probability distribution (its interactive example approximates Choice confidence as `(n × max_p − 1) / (n − 1)`). It is a convenience; the full distribution is returned so callers may compute their own measure. The docs state that correct threshold values "depend on your domain" and must be tested on your own data.
+- Documented HTTP errors: `401` missing/invalid key, `422` request validation failure (for example a malformed question), `429` rate limit, `529` overloaded. Error bodies are JSON.
+- Model `jev-1.13.0`: price **$0.042 per million input tokens, output tokens free**; rate limits **250,000 tokens/s and 1,200 requests/min**, explicitly "adjusting dynamically" and changeable without notice; context **64k tokens per request, 32k for `state` plus the longest question**; text-only input; English is the primary language.
+- Aliases: `jev-latest` and `jev-preview` both currently resolve to `jev-1.13.0`. The docs warn that an alias moves when a new release ships, so answers can change without a change on the caller's side, and advise pinning the versioned ID when thresholds were tuned against it.
+- Documented failure modes of `jev-1.13` (jaggedness page): literal reading; math and numbers, including counting; date and time comparison; multi-hop indirection; accuracy loss as `state` fills with irrelevant detail; **adversarial content in `state` "can move the answer"** — state is not treated as hostile; contradictory instructions/criteria; no guaranteed structural invariants between questions (for example a Noul and its negation need not sum to 1, and a threshold tuned on a Noul must not be carried to a Choice); not a text generator.
+- Data handling: "Jev is not trained on customer requests or responses." The DPA sets retention as "as long as necessary taking into account the purpose of the Processing"; it states no fixed retention period and no zero-retention guarantee. Zero data retention is offered to enterprise customers only, on request.
+- Python SDK: `typesafe-sdk` 0.7.1 (released 2026-09-21; first public release 0.5.7 on 2026-09-14; breaking changes in both 0.6.0 and 0.7.0). It ships `py.typed`, provides `AsyncTypeSafeClient`, reads `TYPESAFE_API_KEY`, defaults to model `jev-latest`, a 10 s per-operation timeout, and a retry policy of 2 retries on 408/429/5xx within a 30 s total budget. It depends on `httpx2`, `pydantic`, `pydantic-core`, `tenacity`, and `typing-extensions`. A `uv lock --dry-run` against a scratch copy of this repository's `pyproject.toml`/`uv.lock` resolved it as exactly one added package with no version changes, because those transitive packages are already locked through LangGraph/LangChain-core. The repository lockfile was not modified.
+
+**Schema validity is not semantic correctness.** Every successful Jev response is a well-formed typed value by construction. That proves only that the response parsed; it says nothing about whether the judgment is right. Correctness is established only by the project's own evaluation (`docs/TASKS.md` Milestones 9 and 12).
+
+**Latency:** TypeSafe publishes no latency figure or SLA for `jev-1.13.0`; its claims are qualitative ("fast") or relative (batching questions into one call is roughly 10× faster than separate calls, per its own cookbook). **Unresolved** until measured on this project in Milestone 9/12.
+
+**Independent evaluations consulted** (reproducible repositories with code and raw data; not re-run here, so treat as indicative, not verified):
+
+- [priorbench/jev](https://github.com/priorbench/jev) — pre-registered, 5,721 calls, 2026-09-20, via OpenRouter: roughly a 430 ms per-request latency floor; notably **0 of 30 out-of-scope messages were flagged, at 0.99 confidence**.
+- [scienthoon/jev-ood-calibration](https://github.com/scienthoon/jev-ood-calibration) — 2026-09-19, via Vercel AI Gateway (model version not exposed): calibration error differs by question type and changes sign (Choice and Score overconfident, Noul underconfident).
+
+Both reinforce two design rules: thresholds must be tuned per question type on project data, and high confidence does not prove the input is in scope.
+
+**Not verified / unresolved:**
+
+- whether the short form `jev-1.13` (used in one jaggedness-page example) is accepted as a model ID; the project uses `jev-1.13.0`, the ID the Models page lists;
+- actual latency and error rates from the development machine;
+- actual retention period for request content on a non-enterprise account;
+- any behavior of Jev-compatible third-party or local implementations (see `docs/DECISIONS.md` §25.9).
+
+**Explicitly not used:** `typesafe-sdk`, `langchain-typesafe`, any TypeSafe MCP adapter, Vercel AI Gateway, Cloudflare, OpenRouter, or other gateways, and the configurable `TYPESAFE_BASE_URL` override.
+
+**Verified:** 2026-09-21
 
 ---
 
@@ -550,6 +612,8 @@ Do not introduce the following merely as part of dependency setup:
 - frontend dependencies.
 
 Those additions do not help satisfy the approved MVP and would consume the limited implementation budget.
+
+The optional TypeSafe Jev decision service (§3.13) is not a second LLM or embedding provider. It is a post-baseline, evaluation-gated addition that brings in no package dependency, and the baseline must run without it. It does not reopen any exclusion above.
 
 ---
 

@@ -77,7 +77,7 @@ Specific reductions:
 - no frontend;
 - no authentication;
 - no cloud deployment;
-- no reranker;
+- no reranker (see §18 for the optional post-baseline decision layer, which is not part of the MVP);
 - no hybrid lexical/vector search;
 - no ANN indexing requirement.
 
@@ -304,7 +304,7 @@ The MVP explicitly excludes:
 - scanned-PDF support;
 - web crawling;
 - arbitrary URL ingestion;
-- reranking;
+- reranking (an optional, evaluation-gated passage-decision layer is specified separately in §18 and is not part of the MVP);
 - hybrid BM25/vector retrieval;
 - query expansion;
 - HNSW/IVFFlat tuning;
@@ -953,6 +953,8 @@ MIN_RETRIEVAL_SIMILARITY=0.30
 MCP_TOOL_TIMEOUT_SECONDS=<small bounded value>
 ```
 
+The optional post-baseline decision layer has its own configuration, listed in §18.7. None of it is required for the baseline.
+
 Secrets must not have hard-coded defaults.
 
 Tests should replace external clients with deterministic fakes and therefore must not require real API keys.
@@ -1135,3 +1137,216 @@ The final README/project notes must report exactly which commands were run and t
 - the documented verification commands have actually passed.
 
 Features merely designed, mocked without integration coverage, or described in documentation are not considered complete.
+
+The optional decision layer in §18 is not part of this completion definition. The MVP is finished without it.
+
+---
+
+# 18. Optional post-baseline decision layer (TypeSafe Jev)
+
+**Added 2026-09-21. Status: specified, not implemented.** Architecture, rejected alternatives, and failure policy: `docs/DECISIONS.md` §25. Verified API facts: `docs/TECH_BASELINE.md` §3.13. Ordered work: `docs/TASKS.md` Milestones 9–12.
+
+## 18.1 Scope
+
+After the MVP (§17) is complete and verified, the system MAY add an optional decision step between retrieval and grounded generation, using TypeSafe's Jev model:
+
+1. **Passage decisions** (primary). Each retrieved passage is judged for relevance, answer evidence, contradiction of the question's premise, and prompt-injection content. Application code then includes, flags as conflicting, or excludes the passage, and reorders the included ones.
+2. **MCP routing gate** (secondary, later milestone). A closed-set, confidence-gated classification of the question that can withhold, but never initiate, the existing single MCP call.
+
+The layer MUST be disabled by default. The base vertical slice MUST remain fully functional, and its tests MUST pass, when the layer is disabled, unconfigured, or unavailable.
+
+## 18.2 Backward compatibility
+
+- The HTTP contracts of §6 are unchanged: no new request field, no new required response field, and no new `status` value.
+- `use_tools=false` MUST still guarantee zero MCP calls, independent of the decision layer.
+- With the layer disabled, `/v1/query` behavior MUST be identical to the baseline.
+- A decision-layer failure MUST NOT produce an HTTP error on its own.
+
+## 18.3 Passage decisions
+
+When enabled, the system:
+
+- MUST evaluate only passages that pgvector retrieval returned and that passed `MIN_RETRIEVAL_SIMILARITY`. The layer MUST NOT add passages.
+- MUST ask atomic yes/no questions (`is_relevant`, `contains_answer_evidence`, `contradicts_query_premise`, `contains_prompt_injection`) about the pair (question, passage text), placing the passage text only in the request `state`.
+- MUST NOT send document IDs, chunk IDs, or filenames to the decision provider.
+- MUST decide `include`, `conflicting_evidence`, or `exclude` in application code, using configured thresholds and the ordered rules of `docs/DECISIONS.md` §25.2.
+- MUST keep conflicting passages citable, but present them to the answer model in a separately delimited block with an instruction to report the conflict.
+- MUST treat every accepted passage as untrusted source text exactly as in §13. The injection signal is additional filtering, not a security boundary.
+- MUST route to insufficient context without calling the answer model when no passage is accepted and no successful tool result exists.
+
+Citation behavior (§5.1 Citations, §10) is unchanged. Labels are still request-local, excerpts are still sliced by application code from stored chunks, and `finalize` still validates every model-returned ID.
+
+## 18.4 MCP routing gate
+
+Only when `use_tools=true` and routing is separately enabled:
+
+- A closed Choice over `document_answer | market_data_lookup | unsupported`, evaluated on the question text only.
+- The existing tool planner and MCP call MAY run only if the choice is `market_data_lookup` and its confidence meets the configured threshold.
+- A low-confidence result, any other choice, or any provider failure MUST result in no MCP call.
+- The decision provider MUST NOT choose a tool name, provider URL, symbol, or any tool argument. Allow-list enforcement, symbol validation at both boundaries, and the one-call cap (§5.1, §13) are unchanged.
+- `unsupported` MUST NOT by itself refuse or short-circuit the query. The document path and its insufficient-context policy still decide the answer.
+
+## 18.5 Failure and insufficient-context behavior
+
+The layer has two decision stages, configured independently: passage decisions (`JEV_ENABLED`) and the routing gate (`JEV_ROUTING_ENABLED`). Each stage is always in exactly one of three states (`docs/DECISIONS.md` §25.5). Only the third can produce a runtime fallback. Either stage may be enabled without the other, so routing enabled with passage decisions disabled is a valid configuration.
+
+1. **Disabled** (the stage's flag is false, which is the default). This is normal baseline operation for that stage, not a failure or a fallback.
+   - The decision provider MUST NOT be called.
+   - Queries use the baseline path.
+   - A per-query decision event, including `decision.fallback`, MUST NOT be emitted.
+2. **Unavailable: required configuration missing.** The stage is enabled, but a setting it requires is missing or unusable. The complete list of state-2 causes, each with its `reason_code`:
+   - `TYPESAFE_API_KEY` is missing (`missing_api_key`);
+   - an explicit non-empty `JEV_MODEL` is not exactly the pinned model ID recorded in `docs/TECH_BASELINE.md` §3.13 (`unpinned_model`). This covers a known provider alias, an arbitrary value such as `foo`, and a different explicit model ID. It is detected locally, and the provider is never called to check whether a model exists;
+   - one of the stage's own threshold settings is absent (`missing_threshold`).
+
+   This is a startup configuration problem, not a per-query runtime fallback. It is distinct from malformed local configuration, which fails startup (below). A *missing* threshold is state 2; a *malformed or out-of-range* threshold that was supplied fails startup.
+   - The application MUST start.
+   - Startup MUST emit exactly one structured `decision.config_invalid` event per distinct problem, deduplicated on the pair `(reason_code, setting)`. For example, a missing key with an alias model emits two events, one `missing_api_key` and one `unpinned_model`. A missing key with both stages enabled emits one event, not one per stage.
+   - These events are never emitted per query.
+   - The stage MUST stay unavailable for the life of the process. The provider MUST NOT be created or called for that stage.
+   - A missing threshold affects only the stage that owns it. The other stage may still be in state 3.
+   - Queries use the baseline path.
+   - A per-query decision event, including `decision.fallback`, MUST NOT be emitted.
+3. **Enabled and successfully configured.** The runtime rules below apply.
+
+Startup validation:
+
+- An absent stage-specific setting is allowed while that stage is disabled. A setting counts as absent when its variable is unset or empty after trimming whitespace, following the existing rule in `app/config.py`.
+- Validation has two levels:
+  - **Type validity** of typed settings is always checked, whether or not any stage is enabled. This covers booleans, the numeric timeout, and numeric thresholds, including their documented ranges.
+  - **Operational requirements** (provider credentials, required thresholds, and model pinning) are evaluated only for an enabled stage that needs them. When both stages are disabled, none of them is checked.
+- A supplied typed setting that fails type validity MUST make the application refuse to start, and the decision layer MUST NOT be silently disabled. This covers:
+  - a non-numeric `JEV_TIMEOUT_SECONDS`;
+  - a non-positive `JEV_TIMEOUT_SECONDS`;
+  - a threshold outside its documented range (§18.7);
+  - an invalid boolean value for `JEV_ENABLED` or `JEV_ROUTING_ENABLED`, meaning anything other than `true` or `false`, case-insensitive.
+- The startup error names the setting, never its value.
+- The configuration has no enum or mode setting, so no enum validation applies. Enum validation is added only if a real enum setting is introduced.
+- `JEV_MODEL` is an opaque string during parsing, so an alias or unknown name is never a syntax error.
+  - With both stages disabled, it is not compared with the pinned ID. An alias, an arbitrary string, or an absent value does not prevent startup, emits no `decision.config_invalid` event, and creates no provider client.
+  - With at least one stage enabled, an unset or whitespace-only `JEV_MODEL` means no override was supplied. It resolves to the exact pinned ID recorded in `docs/TECH_BASELINE.md` §3.13 (currently `jev-1.13.0`), validation passes, and no `decision.config_invalid` event is emitted. Users do not need to repeat the pinned ID in the environment. Any explicit non-empty value other than the exact pinned ID is state 2: one `decision.config_invalid` event with `reason_code` `unpinned_model` and `setting` `JEV_MODEL`, and no provider is created or called for the affected stages.
+  - The pinned ID has one authoritative definition, in `docs/TECH_BASELINE.md` §3.13. The code carries it as a single constant, changed in the same commit as that record (`docs/DECISIONS.md` §25.6). This document does not maintain an independent default.
+- Missing provider configuration (state 2) is not malformed configuration and MUST NOT be reclassified as a fatal startup error.
+- Startup MUST NOT call the provider, whether to validate credentials or for any other reason.
+
+Runtime rules (state 3 only):
+
+- A passage-decision runtime failure of any kind MUST fall back to the baseline path for the whole query: pgvector order, the similarity floor, and existing insufficient-context rules. The failures are the runtime reasons in `docs/DECISIONS.md` §25.5: timeout, rate limit, overload, authentication error, request rejected, transport error or unexpected status, malformed response, unexpected model ID, and partial passage failure.
+- `model_mismatch` is defined only by the provider response's documented `model` field. The response must first pass structural validation, and then its `model` field, a non-empty string, must differ from the exact pinned ID the application requested.
+  - If `model` is missing, null, empty, or not a string, the response is `invalid_response`, never `model_mismatch`.
+  - A mismatch is never inferred from answer content, headers, latency, confidence values, or any other heuristic.
+- `invalid_request` covers other provider-side rejections (`422`) that local validation cannot reliably detect. A configured model that differs from the pinned ID never reaches the provider, because it is state 2 at startup, so it can produce neither reason code.
+- A `TYPESAFE_API_KEY` that is present but invalid cannot be detected locally at startup, so it is a state-3 runtime failure. The provider answers `401`, which is recorded with `reason_code` `auth_failed`. The stage falls back and the user request does not fail. Neither the key nor the provider's raw response appears in any log.
+- A runtime routing failure MUST NOT authorize MCP.
+- Each stage MUST be bounded by a configured overall deadline. There are no retries in the request path, and generation MUST NOT wait indefinitely for the decision provider.
+- A runtime failure MUST NOT fail the user request.
+- Every failed decision-stage invocation MUST emit exactly one structured `decision.fallback` event, carrying at least `request_id`, `stage`, and a stable `reason_code`.
+  - A single failed stage invocation MUST NOT emit duplicate events. For example, a partial passage failure is one failed invocation and produces one event.
+  - Several failed stages in the same query produce one event each, sharing the same `request_id`.
+  - Milestone 10 has only the passage stage, so it emits at most one `decision.fallback` per affected query.
+  - Once Milestone 11 adds routing, passage and routing failures are recorded independently.
+- Repeated authentication failures are handled per invocation like any other runtime failure. Out of scope for the MVP:
+  - a circuit breaker for repeated authentication failures;
+  - process-local disabling after the first authentication failure;
+  - suppression or deduplication of authentication-error logs.
+
+In every state:
+
+- `decision.fallback` MUST NOT be emitted in states 1 or 2.
+- Logs, including `decision.config_invalid` and `decision.fallback`, MUST NOT contain document or passage text, the question text, request `state`, question instructions, the API key, provider response or error bodies, or raw provider exception messages.
+- A valid typed response proves only that it parsed, not that the judgment is correct. Correctness is established only by §18.6.
+
+## 18.6 Evaluation dataset and acceptance criteria
+
+Before implementation, the vector-only baseline is frozen and measured on a project-specific dataset. The layer is compared against that frozen baseline, with the same corpus, questions, embedding model, top-K, similarity floor, and answer model.
+
+The dataset MUST include:
+
+- ordinary answerable questions;
+- insufficient-context questions;
+- semantically similar but irrelevant passages (near-miss distractors);
+- false-premise questions;
+- conflicting passages;
+- prompt injections embedded in uploaded documents;
+- questions that genuinely need market data;
+- questions that must not call MCP.
+
+Each item records the question, the gold relevant chunk(s) or "none", the expected status, and, for tool items, whether an MCP call is expected. The dataset is split into a **development** split, used for tuning thresholds, and a **held-out** split, used only for the final comparison.
+
+The measured criteria are:
+
+| Criterion | Applies to |
+|---|---|
+| Recall@K and nDCG@K of gold chunks | passage decisions |
+| Passage-selection precision (accepted passages that are gold) | passage decisions |
+| Insufficient-context precision and recall | end-to-end |
+| Grounded-answer correctness (manually or rubric-judged, recorded per item) | end-to-end |
+| Citation validity (every returned citation maps to a stored chunk that supports the claim) | end-to-end |
+| Prompt-injection false negatives (injected passages that reach the answer context) | passage decisions |
+| MCP routing accuracy, and MCP calls on must-not-call items | routing gate |
+| p50 and p95 end-to-end and decision-stage latency | both |
+| Cost per query (decision-provider input tokens × published price) | both |
+| Fallback behavior under injected provider failures | both |
+
+The layer is retained only if, on the held-out split, it improves passage-selection precision or insufficient-context precision/recall over the baseline, does not reduce citation validity or grounded-answer correctness, does not increase injected passages reaching the answer context, and keeps p95 latency within a bound recorded before the run. For routing, there must be zero MCP calls on must-not-call items. All thresholds are tuned on the development split only. Thresholds from vendor documentation or cookbooks MUST NOT be presented as defaults.
+
+Results, the pinned model ID, the dataset version, and the commands run are recorded in `docs/TASKS.md` Milestone 12 and `docs/DECISIONS.md` §25.
+
+## 18.7 Configuration
+
+```text
+JEV_ENABLED=false                 # passage decisions; default off
+JEV_ROUTING_ENABLED=false         # MCP routing gate; default off; later milestone
+TYPESAFE_API_KEY                  # secret; no default; required only when a stage is enabled
+JEV_MODEL                         # optional override; unset or whitespace-only resolves to the pinned ID in docs/TECH_BASELINE.md §3.13; any explicit value must equal it exactly when any stage is enabled; not checked when all stages are disabled
+JEV_TIMEOUT_SECONDS=2.0           # overall per-stage deadline; provisional; must be a number > 0
+JEV_PASSAGE_T_INJECTION / _T_RELEVANT / _T_CONFLICT / _T_EVIDENCE   # passage stage; no default; tuned on the development split; range [0, 1]
+JEV_ROUTE_MIN_CONFIDENCE          # routing stage; no default; tuned on the development split; range [0, 1]
+```
+
+The provider base URL is fixed in code and is not configurable. The threshold ranges follow from the provider contract: Noul answers and Choice confidence are both values in 0–1 (`docs/TECH_BASELINE.md` §3.13). Any supplied value that is out of range, a malformed timeout, or an invalid boolean flag fails startup, even for a disabled stage (§18.5).
+
+If an enabled stage has a missing key, an explicit `JEV_MODEL` other than the exact pinned ID (unset resolves to the pin), or an absent threshold of its own, it enters state 2 of §18.5:
+
+- the application starts;
+- one `decision.config_invalid` event is emitted per distinct `(reason_code, setting)`, with `reason_code` one of `missing_api_key`, `unpinned_model`, or `missing_threshold`;
+- that stage stays unavailable, and queries use its baseline path with no per-query warning.
+
+Each stage's thresholds are validated and reported independently. A disabled stage's absent thresholds produce no event. `JEV_ENABLED` and `JEV_ROUTING_ENABLED` are independent flags.
+
+## 18.8 Testing
+
+- All automated tests MUST use a deterministic fake decision provider. They MUST NOT make network calls or require `TYPESAFE_API_KEY`.
+- Required automated paths:
+  - disabled layer (state 1): the provider is not called, the baseline result is returned, and no `decision.fallback` or other per-query decision event is emitted;
+  - one missing setting, for example the key (state 2): the application starts; exactly one `decision.config_invalid` event with the expected `reason_code` and `setting` and no `request_id` is emitted;
+  - two distinct problems, a missing key plus an alias model (state 2): exactly two `decision.config_invalid` events, `missing_api_key` and `unpinned_model`, each naming its setting and neither containing a value;
+  - after startup in state 2, repeated queries produce no further `decision.config_invalid` events and no `decision.fallback`, and the queries use the baseline path;
+  - passage stage enabled with one `JEV_PASSAGE_T_*` absent: the application starts; one `missing_threshold` event naming that setting is emitted; the passage stage is unavailable; the provider is not called; queries use the baseline path;
+  - passage stage disabled with every passage-stage setting absent: startup succeeds with no `decision.config_invalid` event;
+  - passage stage disabled with an explicitly malformed `JEV_TIMEOUT_SECONDS` (non-numeric, or non-positive), a supplied `JEV_PASSAGE_T_*` outside [0, 1], or an invalid `JEV_ENABLED` value: startup fails with an error naming the setting and not its value;
+  - runtime provider failure (state 3), for each runtime reason in `docs/DECISIONS.md` §25.5: the baseline result is returned; exactly one `decision.fallback` event is emitted for the failed passage-stage invocation, carrying `request_id`, `stage`, and the expected `reason_code`; neither the key nor the raw provider error body or message appears in any log;
+  - present but invalid key (state 3): the fake returns `401`; the application starts without any provider call; the baseline result is returned; one `decision.fallback` event with `reason_code` `auth_failed` is emitted per failed invocation, including on repeated queries; the key never appears in logs;
+  - a missing key or missing threshold is still state 2, not a startup failure;
+  - `include`, `conflicting_evidence`, and `exclude` selection;
+  - reordering;
+  - all passages excluded → insufficient context without an answer-model call;
+  - injection-flagged passage excluded;
+  - partial passage failure → full fallback, with exactly one `decision.fallback` event (no duplicates per failed invocation);
+  - runtime model mismatch (the pinned ID was requested, and the fake returns a structurally valid response whose `model` is a different non-empty string) → fallback, with one `decision.fallback` carrying `reason_code` `model_mismatch`, and no `decision.config_invalid` event;
+  - response whose `model` is missing, null, empty, or not a string (separate cases) → fallback, with one `decision.fallback` carrying `reason_code` `invalid_response` and never `model_mismatch`;
+  - an enabled stage with `JEV_MODEL` unset: the pinned ID from `docs/TECH_BASELINE.md` §3.13 is selected and sent, and no `decision.config_invalid` event is emitted;
+  - an enabled stage with whitespace-only `JEV_MODEL`: treated as no override, the pinned ID is selected, and no `decision.config_invalid` event is emitted;
+  - both stages disabled with `JEV_MODEL` set to an alias, and separately set to `foo`: startup succeeds, no `decision.config_invalid` event is emitted, and no provider client is created or called;
+  - an enabled stage with `JEV_MODEL` set to an alias, and separately set to `foo`: startup succeeds in state 2; exactly one `decision.config_invalid` event with `reason_code` `unpinned_model` and `setting` `JEV_MODEL`, without the value; no provider client is created or called for that stage;
+  - an enabled stage with `JEV_MODEL` equal to the exact pinned ID: model validation passes, and no model-related `decision.config_invalid` event is emitted;
+  - absence of passage text and key from logs.
+- Routing milestone paths:
+  - `use_tools=false` with Jev never consulted;
+  - confident `market_data_lookup` → planner runs;
+  - low confidence, `document_answer`, `unsupported`, and provider failure → no MCP call;
+  - routing enabled with passage decisions disabled works: passages take the baseline path and the gate still applies;
+  - both stages failing in one query → two `decision.fallback` events sharing the `request_id`, one with `stage` `passage` and one with `stage` `routing`;
+  - routing enabled with `JEV_ROUTE_MIN_CONFIDENCE` absent: the application starts; one `missing_threshold` event naming that setting is emitted; the routing gate is unavailable, so the baseline planner runs, while the passage stage is unaffected;
+  - routing disabled with `JEV_ROUTE_MIN_CONFIDENCE` absent: startup succeeds; the same setting supplied outside [0, 1], or an invalid `JEV_ROUTING_ENABLED` value, fails startup.
+- Real TypeSafe calls occur only in an explicitly manual evaluation or smoke command, never in `uv run pytest`.

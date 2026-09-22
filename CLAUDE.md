@@ -82,7 +82,17 @@ These are the decisions the whole design rests on; violating one silently defeat
 - **MCP data carries an `as_of` field and is described as provider data, never as "real-time"** — the free quote feed may be end-of-day.
 - **Secrets never get logged** — no API keys, no passwords, no full connection strings, and no raw provider errors that might embed them. Secrets get no hard-coded defaults. Parameterized SQL only.
 
-Automated tests must not call live OpenAI or market-data APIs — use deterministic fakes for both, and never require real API keys. PostgreSQL integration tests may use a local test database (`docs/SPEC.md` §15.2, `docs/DECISIONS.md` §20.2 expect exactly that). Live external services are reserved for the one manual smoke test.
+Automated tests must not call live OpenAI or market-data APIs — use deterministic fakes for both, and never require real API keys. PostgreSQL integration tests may use a local test database (`docs/SPEC.md` §15.2, `docs/DECISIONS.md` §20.2 expect exactly that). Live external services are reserved for the one manual smoke test, plus, for the optional Jev layer, the manually invoked evaluation runner of Milestones 9–12 (`docs/SPEC.md` §18.6, §18.8) — `uv run pytest` never calls TypeSafe.
+
+### Optional Jev decision layer (post-baseline, not built)
+
+`docs/SPEC.md` §18 and `docs/DECISIONS.md` §25 specify an optional TypeSafe Jev layer for passage decisions and MCP gating. Milestones 9–12 in `docs/TASKS.md` build it, and they start only after Milestone 8 is verified. Do not start it early, and do not treat it as part of the MVP. When it is built:
+
+- The baseline must work unchanged with it disabled (the default), unconfigured, or failing. Any passage-decision failure falls back to the plain pgvector path. Typed Jev settings are always type-checked, even when every stage is disabled; a bad timeout, an out-of-range threshold, or a non-boolean flag fails startup. Operational requirements (key, exact pinned model, an enabled stage's threshold) are checked only for enabled stages, and a missing or mismatched one leaves that stage unavailable instead.
+- Jev returns probabilities; application code applies thresholds and decides. Jev may only remove or reorder retrieved passages or withhold MCP. It never adds evidence and never chooses a tool, symbol, or URL. A failed or uncertain route means no MCP call.
+- Its prompt-injection signal is not a security boundary: accepted passages remain untrusted.
+- Pin a versioned model ID (`jev-1.13.0`). An unset `JEV_MODEL` resolves to that pin. With any stage enabled, any other explicit value is startup `unpinned_model`. Runtime `model_mismatch` comes only from a valid response whose `model` field differs from the pin. Keep arithmetic and date comparison in code. Use direct REST over the existing `httpx`, with no `typesafe-sdk` or other new dependency.
+- Tests use a deterministic fake. Never log passage text, the question, `state`, the key, or provider bodies.
 
 ## Reading the docs
 
@@ -91,7 +101,7 @@ Four documents, in the order they bind:
 - `docs/SPEC.md` — requirements, HTTP/MCP contracts, persistence model, LangGraph node and transition design, error behavior, acceptance criteria. The contract.
 - `docs/DECISIONS.md` — chosen architecture with rejected alternatives and consequences. Read the "Rejected alternative" blocks before proposing a different approach; most obvious alternatives were already considered and declined.
 - `docs/TECH_BASELINE.md` — per-dependency version justification and the APIs actually intended for use.
-- `docs/TASKS.md` — 8 ordered milestones with exit conditions. Milestone 1 is PostgreSQL + pgvector.
+- `docs/TASKS.md` — ordered milestones with exit conditions: 0–8 are the MVP (Milestone 1 is PostgreSQL + pgvector), and 9–12 are the optional post-baseline Jev layer.
 
 `docs/SPEC.md` was written before the repository existed and says so. Where installed package behavior differs from the docs, the standing instruction is to investigate and update the document rather than silently adapting the implementation.
 
