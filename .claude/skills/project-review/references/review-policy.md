@@ -24,8 +24,9 @@ Review the implementation against these sources, in this order:
 If these sources contradict each other or the repository, report the
 contradiction. Do not silently select one interpretation.
 
-Only review behavior introduced or affected by the current changes.
-Unrelated pre-existing issues are non-blocking unless they present an
+Only review behavior within the requested scope: introduced or affected by
+the current changes, or belonging to the named milestone. Unrelated
+pre-existing issues are non-blocking unless they present an
 immediate security or data-loss risk.
 
 ## Scope discipline
@@ -340,24 +341,44 @@ Verify that:
 A mismatch such as documented `src/fintech_agent/` versus actual `app/` is a
 documentation/architecture finding until explicitly resolved.
 
-## Review exclusions
+## Reportability
 
-Do not report as semantic findings:
+A finding is reportable only when it identifies a concrete present problem:
 
-* Ruff formatting or lint diagnostics already shown by Ruff;
-* mypy diagnostics already shown by mypy;
+* incorrect behavior;
+* security or privacy risk;
+* data-loss or partial-persistence risk;
+* contradiction between binding documents;
+* mismatch between implementation and the current contract;
+* missing test for a current required behavior;
+* broken verification, typing, or dependency integrity;
+* material maintainability problem in the changed scope.
+
+Do not report:
+
+* speculative requirements for hypothetical future functionality;
+* alternative names when the existing name is coherent;
+* optional improvements or refactors that do not reduce a demonstrated risk;
+* style preferences;
+* edge cases outside the current milestone;
+* questions already resolved by an existing source of truth or a recorded
+  user decision;
+* "remaining notes" or observations that require no action;
+* Ruff or mypy diagnostics already shown by those tools (report the failed
+  gate once instead);
 * harmless formatting in generated lockfiles;
-* naming preferences without a concrete ambiguity or defect;
-* optional refactors that do not reduce a demonstrated risk;
-* missing features outside the active milestone;
 * production-scale infrastructure excluded by the MVP;
 * performance concerns unsupported by the expected corpus or measurements;
-* speculative future requirements;
 * a preference for another framework or library.
+
+Wording is not a defect when the meaning is coherent and consistent with the
+binding contract. Do not demand mechanical replacement of plain-language
+phrases that paraphrase a defined term.
 
 ## Blocking threshold
 
-A finding is blocking when it provides evidence of at least one of:
+A finding blocks a clean verdict (P0–P2) when it provides evidence of at
+least one of:
 
 * incorrect behavior;
 * violation of `SPEC.md`;
@@ -369,6 +390,8 @@ A finding is blocking when it provides evidence of at least one of:
 * secret or sensitive-data exposure;
 * resource or transaction leakage;
 * broken public API contract;
+* contradiction between binding documents;
+* missing test for a current required behavior;
 * regression in an already implemented requirement;
 * failed required quality gate.
 
