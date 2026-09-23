@@ -1,5 +1,8 @@
 {
     "$schema": "https://json.schemastore.org/claude-code-settings.json",
+    "env": {
+        "TEST_DATABASE_URL": "postgresql://localhost:5433/fintech_test"
+    },
     "permissions": {
         "ask": [
             "Bash(git switch *)",
@@ -23,6 +26,19 @@
             "Bash(git restore *)",
             "Bash(gh pr merge *)",
             "Bash(gh pr close *)"
+        ]
+    },
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Edit|Write|NotebookEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-protected-branch-edits.sh"
+                    }
+                ]
+            }
         ]
     }
 }

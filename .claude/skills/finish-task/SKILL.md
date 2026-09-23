@@ -22,13 +22,12 @@ allowed-tools:
   - "Bash(git rev-parse *)"
   - "Bash(git merge-base *)"
   - "Bash(git branch --show-current)"
+  - "Bash(uv run python scripts/verify.py)"
   - "Bash(uv lock --check)"
-  - "Bash(uv run ruff format --check .)"
   - "Bash(uv run ruff format *)"
-  - "Bash(uv run ruff check .)"
-  - "Bash(uv run ruff check --fix *)"
-  - "Bash(uv run mypy app tests)"
-  - "Bash(uv run mypy app tests evals)"
+  - "Bash(uv run ruff check *)"
+  - "Bash(uv run mypy)"
+  - "Bash(uv run mypy *)"
   - "Bash(uv run pytest)"
   - "Bash(uv run pytest *)"
 disallowed-tools:
@@ -78,6 +77,11 @@ this context.
 
 ## 1. Establish scope
 
+First run `git branch --show-current`. If it prints `main` or `master`, or
+nothing (detached `HEAD`), stop with `BLOCKED`: work is finished only on a
+task branch. Tell the user to run `/start-task <slug> --carry` and to rerun
+this skill afterwards. The edit hook is early protection, not the only one.
+
 Read `CLAUDE.md`, then run `git status --short`, `git diff --stat HEAD`,
 `git diff HEAD`, and `git ls-files --others --exclude-standard`. Read the
 relevant parts of `docs/SPEC.md`, `docs/DECISIONS.md`, `docs/TASKS.md`,
@@ -94,25 +98,21 @@ State the scope being finished in one concise sentence.
 
 ## 2. Run verification
 
-Run the gates from `CLAUDE.md` that apply to the scope. The full set is:
+Run the canonical full gate named in `CLAUDE.md`:
+`uv run python scripts/verify.py`. It runs every static check and the full
+test suite, and it fails on any skipped test or a missing
+`TEST_DATABASE_URL`. While fixing a failure, individual Ruff, mypy, or pytest
+commands are fine for diagnosis, but a round is verified only by a passing
+full-gate run.
 
-1. `uv lock --check`
-2. `uv run ruff format --check .`
-3. `uv run ruff check .`
-4. `uv run mypy app tests`
-5. `uv run pytest` (note the skip count)
-
-Take the exact commands from `CLAUDE.md`; the list above is the current
-baseline, not a replacement for what that file says.
-
-For documentation- or configuration-only scopes the gates still run, since
-they are cheap and prove nothing else broke. The live HTTP smoke test is
+For documentation- or configuration-only scopes the gate still runs, since it
+is cheap and proves nothing else broke. The live HTTP smoke test is
 required by `CLAUDE.md` only after changes to startup, lifespan, the
 database, or the HTTP contract; if the scope needs it and you cannot run it,
 report that instead of claiming it.
 
-Fix in-scope gate failures before the first review. If a gate cannot run at
-all, stop and report `BLOCKED`.
+Fix in-scope gate failures before the first review. If the gate cannot run at
+all, including a missing `TEST_DATABASE_URL`, stop and report `BLOCKED`.
 
 ## 3. Invoke project-review
 
