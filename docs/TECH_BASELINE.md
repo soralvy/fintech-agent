@@ -370,7 +370,8 @@ No HTTP MCP server, remote MCP deployment, sampling, elicitation, or generalized
 
 [OpenAI Python SDK](https://github.com/openai/openai-python)  
 [GPT-5.6 Luna model reference](https://developers.openai.com/api/docs/models/gpt-5.6-luna?utm_source=chatgpt.com)  
-[OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create?utm_source=chatgpt.com)
+[OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create?utm_source=chatgpt.com)\
+[GPT-6 Luna model reference](https://developers.openai.com/api/docs/models/gpt-6-luna) (the selected default since 2026-09-23; the GPT-5.6 Luna link above is the previous default)
 
 **API/features used:**
 
@@ -406,7 +407,7 @@ The model name is configuration rather than a Python package pin. If the configu
 
 Recorded by the Milestone 4 contract alignment (`docs/changes/M4-query-graph.md` §4, §7.5, §7.6; decisions D6, D10, D11, D12). Implementation is Milestone 4, Stage C; nothing below is built yet.
 
-**Default model: `gpt-6-luna` (D11, user decision 2026-09-23).** No project-specific reason had been recorded for `gpt-5.6-luna`, and no verified evidence on file showed it supports Structured Outputs together with `reasoning.effort="none"`, which Milestone 4 needs. The OpenAI `gpt-6-luna` model page (developers.openai.com, fetched 2026-09-23) lists Responses as a supported endpoint and `structured_outputs` as a supported feature, and states that "`reasoning.effort` supports `none`, `low`, `medium` (default), `high`, `xhigh`, and `max`." `OPENAI_LLM_MODEL` still overrides it (`docs/SPEC.md` §14); any configured model must support Structured Outputs and `effort: "none"`, or the provider rejects the request, which surfaces as a provider failure (`docs/DECISIONS.md` §12).
+**Default model: `gpt-6-luna` (D11, user decision 2026-09-23).** No project-specific reason had been recorded for `gpt-5.6-luna`, and no verified evidence on file showed it supports Structured Outputs together with `reasoning.effort="none"`, which Milestone 4 needs. The [OpenAI `gpt-6-luna` model page](https://developers.openai.com/api/docs/models/gpt-6-luna) (fetched 2026-09-23, and re-confirmed the same day) lists Responses as a supported endpoint and `structured_outputs` as a supported feature, and states that "`reasoning.effort` supports `none`, `low`, `medium` (default), `high`, `xhigh`, and `max`." `OPENAI_LLM_MODEL` still overrides it (`docs/SPEC.md` §14); any configured model must support Structured Outputs and `effort: "none"`, or the provider rejects the request, which surfaces as a provider failure (`docs/DECISIONS.md` §12).
 
 **Request shape.** Each logical answer call is exactly one `client.responses.create(...)` on the shared `AsyncOpenAI` client:
 

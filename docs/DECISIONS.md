@@ -1915,7 +1915,7 @@ Every event below carries the `request_id` bound by `UnexpectedErrorMiddleware` 
 
 | Event | Fields |
 |---|---|
-| `graph.started` | `use_tools` |
+| `graph.started` | `use_tools`† |
 | `graph.node.started` | `node` |
 | `graph.node.completed` | `node`, `duration_ms` |
 | `graph.route` | `node`, `route`, `context_count`† |
@@ -1926,7 +1926,7 @@ Every event below carries the `request_id` bound by `UnexpectedErrorMiddleware` 
 | `generation.completed` | `attempt`, `input_tokens`, `output_tokens`, `duration_ms` |
 | `generation.request_failed` | `attempt`, `error_type`, `status_code` |
 | `generation.invalid_output` | `attempt`, `reason` (§12), `will_retry` |
-| `http.request.failed` | `status_code` (`500`), `error_code` (`internal_error`), `error_type` |
+| `http.request.failed` | `status_code` (`500`), `error_code` (`internal_error`), `error_type`† |
 
 - A wrapper applied in `build_query_graph` emits `graph.node.started` and `graph.node.completed` for every node. When a node raises, it emits `graph.failed` once and re-raises. Its `error_code` is the `AppError` code, or `internal_error` for any other exception. `run_query` emits `graph.started` and `graph.completed`.
 - **`http.request.failed` is emitted early, in Milestone 4, for unexpected exceptions only**, by `UnexpectedErrorMiddleware`. `http.request.started`, `http.request.completed`, and `http.request.failed` for other failures remain Milestone 7 work.
