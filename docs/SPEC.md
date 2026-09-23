@@ -42,7 +42,7 @@ Implementation must re-check these decisions against the repository and lockfile
 - PostgreSQL with the pgvector extension.
 - Psycopg 3 for PostgreSQL access unless an existing repository dependency dictates otherwise.
 - OpenAI as the single LLM and embedding provider.
-- Default answer model: `gpt-5.6-luna`, configurable through environment.
+- Default answer model: `gpt-6-luna`, configurable through environment. *(Amended 2026-09-23 for Milestone 4, user decision: the default was `gpt-5.6-luna`, for which no project-specific reason was recorded and no verified support for Structured Outputs with `reasoning.effort="none"` was on file. `gpt-6-luna` has that verified support; `docs/TECH_BASELINE.md` §3.10.)*
 - Embedding model: `text-embedding-3-small`.
 - Embedding dimension: 1536.
 - Cosine distance for retrieval.
@@ -943,7 +943,7 @@ Expected environment/configuration values:
 ```text
 DATABASE_URL
 OPENAI_API_KEY
-OPENAI_LLM_MODEL=gpt-5.6-luna
+OPENAI_LLM_MODEL=gpt-6-luna
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 OPENAI_EMBEDDING_DIMENSIONS=1536
 ALPHA_VANTAGE_API_KEY
@@ -956,6 +956,8 @@ MCP_TOOL_TIMEOUT_SECONDS=<small bounded value>
 The optional post-baseline decision layer has its own configuration, listed in §18.7. None of it is required for the baseline.
 
 Secrets must not have hard-coded defaults.
+
+`OPENAI_LLM_MODEL` defaults to `gpt-6-luna` (*amended 2026-09-23*; previously `gpt-5.6-luna`). Unset or blank resolves to that default. Any other value is an opaque model name, which must support the Responses API with Structured Outputs and `reasoning.effort="none"`; the provider rejects any other model at request time (`docs/TECH_BASELINE.md` §3.10).
 
 `OPENAI_EMBEDDING_MODEL` and `OPENAI_EMBEDDING_DIMENSIONS` describe stored vectors, not tunables. The MVP supports exactly `text-embedding-3-small` at 1536 dimensions. Unset or blank values resolve to those, and any other value fails startup (*recorded 2026-09-23*; `docs/TECH_BASELINE.md` §3.11).
 
