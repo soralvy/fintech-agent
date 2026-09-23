@@ -1,8 +1,11 @@
 ---
 name: start-task
 description: Start a new implementation task on a safe feature branch before any repository file is edited. Invoke automatically when the user asks to begin or implement a new milestone, feature, fix, refactor, documentation task, test task, CI task, or issue. Do not invoke for read-only analysis, review, questions, or continuation of work already on the matching task branch.
-when_to_use: Use before the first repository mutation for a new implementation scope. Infer a concise branch slug from an explicitly named task; ask one question only when the scope cannot be named safely.
+when_to_use: Use before the first repository mutation for a new implementation scope. Infer a concise branch slug from an explicitly named task and pass it as the argument; ask one question only when the scope cannot be named safely. Pass `--carry` only when the user explicitly asked for it.
 argument-hint: "<slug | type/slug> [--carry]"
+context: fork
+agent: general-purpose
+background: false
 model: sonnet
 effort: high
 allowed-tools:
@@ -45,10 +48,16 @@ Requested task:
 
 `$ARGUMENTS`
 
-Run this workflow inline in the current session. Its only state changes are
-one `git fetch` and one `git switch`, each a separate Bash call the user
-approves. Never commit, push, stash, reset, restore, clean, merge, rebase,
-pull, tag, or delete or rename a branch, and never edit a file.
+This workflow runs as a blocking forked subagent. The caller waits for your
+report, and your tool restrictions end when you return. You cannot see the
+caller's conversation: act only on the arguments above, and never infer
+`--carry`. Your only state changes are one `git fetch` and one `git switch`,
+each a separate Bash call. Project settings list both under
+`permissions.ask`, so interactive permission modes prompt for them; other
+modes, such as `dontAsk` or `bypassPermissions`, may not, so do not tell the
+user that a confirmation happened unless one did. Never commit, push, stash,
+reset, restore, clean, merge, rebase, pull, tag, or delete or rename a branch,
+and never edit a file.
 
 If the user rejects a command, stop at that boundary and report it. Do not
 retry through an equivalent command.
@@ -85,8 +94,8 @@ Stop, change nothing, and report the exact condition when any of these holds:
 
 1. a merge, rebase, or cherry-pick is in progress;
 2. `HEAD` is detached;
-3. the current branch is not `main` or `master`. Task branches start from the
-   default branch; say which branch is checked out and let the user decide;
+3. the current branch is not exactly `main`. Task branches start from
+   `main`; say which branch is checked out and let the user decide;
 4. a local branch `<type>/<slug>` already exists;
 5. the working tree has staged, unstaged, or untracked changes and `--carry`
    was not given. List the paths and explain that `--carry` moves them onto
@@ -97,14 +106,16 @@ Stop, change nothing, and report the exact condition when any of these holds:
 
 ## 4. Relate to origin/main
 
-Explain that the next command updates only remote-tracking refs, then request
-a separate:
+Explain that the next command updates only remote-tracking refs: it refreshes
+every `origin/*` branch, including `origin/main` and any existing
+`origin/<type>/<slug>`, and prunes deleted ones. Then request exactly one
+separate fetch:
 
 ```text
-git fetch --prune origin main
+git fetch --prune origin
 ```
 
-Then run, read-only:
+Only after that fetch, run, read-only:
 
 - `git rev-list --left-right --count main...origin/main`;
 - `git branch -r --list origin/<type>/<slug>`.
@@ -139,5 +150,5 @@ BASE: origin/main @ <short sha>
 CARRIED CHANGES: <paths, or "none">
 STATUS:
 <git status --short output, or "clean">
-NEXT: plan the change against docs/DECISIONS.md section 4, then implement.
+NEXT: inspect the binding documents for this scope and plan the change before implementation. Consult docs/DECISIONS.md section 4 when adding, moving, or changing module responsibilities.
 ```

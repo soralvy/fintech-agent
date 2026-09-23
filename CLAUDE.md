@@ -12,7 +12,8 @@ Treat `docs/` as the source of truth and build against it. `README.md` is empty.
 
 ## Workflow
 
-- When the user asks to begin or implement a new milestone, feature, fix, refactor, documentation task, test task, CI task, or issue, invoke `start-task` before the first repository mutation. Do not create a new branch for read-only work or when continuing the matching current task branch.
+- When the user asks to begin or implement a new milestone, feature, fix, refactor, documentation task, test task, CI task, or issue, invoke `start-task` before the first repository mutation. It runs as a blocking forked subagent, so its tool restrictions do not carry over to the implementation. Do not create a new branch for read-only work or when continuing the matching current task branch.
+- If a repository-file mutation is denied by policy during implementation, stop and report the permission boundary. Do not perform the same denied mutation through Bash, Python, sed, Perl, heredocs, or another tool. Explicitly permitted project commands such as formatters, generators, migrations, and verification scripts are not considered bypasses.
 - Before implementing, compare the planned module ownership with `docs/DECISIONS.md` §4. If a better boundary is needed, update that decision in the same change, with the evidence for it.
 - Finish with `/finish-task`, then publish with `/git-workflow publish`.
 
