@@ -12,7 +12,9 @@ import psycopg
 import pytest
 
 from app.db import (
+    SHA256_CONSTRAINT,
     Connection,
+    DuplicateChecksumError,
     EmbeddingDimensionError,
     NewChunk,
     NewDocument,
@@ -21,8 +23,11 @@ from app.db import (
     find_document_by_sha256,
     insert_chunks,
     insert_document,
+    pooled_connection,
+    pooled_transaction,
     search_chunks_by_embedding,
 )
+from app.errors import DatabaseUnavailableError
 from tests.conftest import embedding
 
 pytestmark = pytest.mark.anyio
@@ -110,8 +115,84 @@ async def test_find_by_checksum_returns_none_when_absent(db: Connection) -> None
 async def test_duplicate_checksum_is_rejected(db: Connection) -> None:
     await insert_document(db, make_document(sha256="c" * 64))
 
-    with pytest.raises(psycopg.errors.UniqueViolation):
+    with pytest.raises(DuplicateChecksumError) as raised:
         await insert_document(db, make_document(sha256="c" * 64))
+
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+
+
+async def test_checksum_constraint_carries_the_name_db_py_recognizes(
+    db: Connection,
+) -> None:
+    cursor = await db.execute(
+        """
+        SELECT contype FROM pg_constraint
+        WHERE conrelid = 'documents'::regclass AND conname = %s
+        """,
+        (SHA256_CONSTRAINT,),
+    )
+
+    assert await cursor.fetchone() == ("u",)
+
+
+async def test_other_document_constraint_violations_are_not_duplicates(
+    db: Connection,
+) -> None:
+    """Only the checksum constraint means "already ingested"."""
+    document = make_document(sha256="7" * 64)
+    await insert_document(db, document)
+    same_id = NewDocument(
+        id=document.id,
+        filename="other.pdf",
+        content_type="application/pdf",
+        sha256="8" * 64,
+        page_count=None,
+        chunk_count=1,
+    )
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await insert_document(db, same_id)
+
+
+async def test_transaction_turns_driver_errors_into_database_unavailable(
+    pool: Pool, db: Connection
+) -> None:
+    """A non-checksum violation rolls back and surfaces without driver detail."""
+    document = make_document(sha256="9" * 64)
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        async with pooled_transaction(pool) as conn:
+            await insert_document(conn, document)
+            await insert_chunks(
+                conn,
+                [
+                    make_chunk(document_id=document.id, chunk_index=0, hot_index=0),
+                    make_chunk(document_id=document.id, chunk_index=0, hot_index=1),
+                ],
+            )
+
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+    await db.commit()
+    assert await find_document_by_sha256(db, document.sha256) is None
+
+
+async def test_transaction_lets_a_checksum_duplicate_through(
+    pool: Pool, db: Connection
+) -> None:
+    await insert_document(db, make_document(sha256="6" * 64))
+    await db.commit()
+
+    with pytest.raises(DuplicateChecksumError):
+        async with pooled_transaction(pool) as conn:
+            await insert_document(conn, make_document(sha256="6" * 64))
+
+
+async def test_pooled_connection_turns_driver_errors_into_database_unavailable(
+    pool: Pool, db: Connection
+) -> None:
+    with pytest.raises(DatabaseUnavailableError):
+        async with pooled_connection(pool) as conn:
+            await conn.execute("SELECT * FROM no_such_table")
 
 
 async def test_chunk_index_is_unique_per_document(db: Connection) -> None:
@@ -182,7 +263,7 @@ async def test_nearest_vector_is_retrieved_by_cosine_distance(db: Connection) ->
     """The Milestone 1 exit condition.
 
     Three orthogonal chunk vectors; a query equal to the second must come back
-    first at distance 0.0, with the rest at 1.0.
+    first at distance 0.0, then the two tied at 1.0 in ``chunk_index`` order.
     """
     document = make_document(sha256="2" * 64, chunk_count=3)
     await insert_document(db, document)
@@ -207,6 +288,41 @@ async def test_nearest_vector_is_retrieved_by_cosine_distance(db: Connection) ->
     assert matches[0].cosine_distance == pytest.approx(0.0)
     assert matches[1].cosine_distance == pytest.approx(1.0)
     assert matches[2].cosine_distance == pytest.approx(1.0)
+
+
+async def test_equal_distances_are_ordered_by_document_then_chunk_index(
+    db: Connection,
+) -> None:
+    """Ties are common (the fakes use orthogonal one-hot vectors), so the order
+    among equally distant chunks must be defined, not left to the scan."""
+    documents = [make_document(sha256=char * 64, chunk_count=3) for char in "ab"]
+    for document in documents:
+        await insert_document(db, document)
+    # Inserted out of order; every chunk is orthogonal to the query.
+    for document in reversed(documents):
+        await insert_chunks(
+            db,
+            [
+                make_chunk(
+                    document_id=document.id,
+                    chunk_index=index,
+                    hot_index=10 + index,
+                    content=f"{document.sha256[0]}{index}",
+                )
+                for index in (2, 0, 1)
+            ],
+        )
+
+    matches = await search_chunks_by_embedding(db, embedding(hot_index=0), limit=6)
+
+    assert len(matches) == 6
+    assert all(match.cosine_distance == pytest.approx(1.0) for match in matches)
+    first, second = sorted(documents, key=lambda document: document.id)
+    assert [match.content for match in matches] == [
+        f"{document.sha256[0]}{index}"
+        for document in (first, second)
+        for index in (0, 1, 2)
+    ]
 
 
 async def test_match_carries_trusted_document_metadata(db: Connection) -> None:

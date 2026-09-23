@@ -71,22 +71,78 @@ Target: ~1–1.5 hours.
 
 Target: ~2 hours.
 
-- [ ] Add `POST /v1/documents`.
-- [ ] Validate extension/MIME type and upload size.
-- [ ] Compute SHA-256.
-- [ ] Implement duplicate detection.
-- [ ] Parse `.txt` and `.md`.
-- [ ] Parse text-based PDFs and preserve page number where available.
-- [ ] Reject documents with no extractable text.
-- [ ] Implement deterministic ~800-token chunks with ~120-token overlap.
-- [ ] Add embedding client abstraction.
-- [ ] Implement OpenAI embedding adapter.
-- [ ] Batch embeddings where straightforward.
-- [ ] Persist document + chunks + vectors in one transaction.
-- [ ] Roll back on embedding/database failure.
-- [ ] Add ingestion tests using fake embeddings.
+- [x] Add `POST /v1/documents`.
+- [x] Validate extension/MIME type and upload size.
+- [x] Compute SHA-256.
+- [x] Implement duplicate detection.
+- [x] Parse `.txt` and `.md`.
+- [x] Parse text-based PDFs and preserve page number where available.
+- [x] Reject documents with no extractable text.
+- [x] Implement deterministic ~800-token chunks with ~120-token overlap.
+- [x] Add embedding client abstraction.
+- [x] Implement OpenAI embedding adapter.
+- [x] Batch embeddings where straightforward.
+- [x] Persist document + chunks + vectors in one transaction.
+- [x] Roll back on embedding/database failure.
+- [x] Add ingestion tests using fake embeddings.
 
 **Vertical-slice checkpoint:** a document can now enter through FastAPI and end up as pgvector-backed chunks.
+
+**Verified 2026-09-23, after the pre-finish cleanup.** The exit condition is met. Everything below was run on the final code of this change. It replaces the earlier record, whose counts predated the cleanup.
+
+Dependencies `pypdf==6.19.0` and `tiktoken==0.14.0` were added (`docs/TECH_BASELINE.md` §3.14–3.15).
+
+Automated verification, with deterministic fakes for the tokenizer and embeddings, no network, and no real key:
+
+- `DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py`: exit 0.
+  - `uv lock --check`: passed.
+  - `uv run ruff format --check .`: 36 files already formatted.
+  - `uv run ruff check .`, with `ASYNC`, `B`, `C901`, `PLR0911`, `PLR0912`, and `PLR0915` enabled: passed.
+  - `uv run mypy` (strict; `app`, `tests`, `scripts`): no issues in 25 source files.
+  - `uv run pytest`: 172 passed, 0 skipped.
+- `git diff --check`: passed.
+- Without `TEST_DATABASE_URL`, `uv run pytest` reports 120 passed and 52 skipped; `scripts/verify.py` refuses to run (exit 2).
+- The test-database guard was checked end to end. `TEST_DATABASE_URL` pointing at the non-`_test` `postgres` database errors with `UnsafeTestDatabaseError` and creates no tables there. A `DATABASE_URL` that resolves to the test target is refused the same way.
+
+Offline live HTTP smoke, `uv run fastapi run app/main.py` against the `fintech` database with a dummy key and no OpenAI request:
+
+- Started with `OPENAI_EMBEDDING_MODEL=text-embedding-3-large`: startup fails with `ConfigError: OPENAI_EMBEDDING_MODEL must be unset or text-embedding-3-small, …`, and the process exits with status 3.
+- Started normally:
+  - `/health` returned `200 {"status":"ok","database":"ok"}`.
+  - An unsupported extension returned `415 unsupported_file_type`, a MIME mismatch returned `415 unsupported_media_type`, and an empty file returned `400 empty_document`, all in the SPEC §12.1 envelope.
+- Neither log contained the key, a `postgresql://` string, or a traceback.
+
+**Real-provider smoke test (approved).**
+
+Setup:
+
+- Server: `uv run --env-file .env fastapi run app/main.py --port 8765`. The key came from the gitignored `.env` and was never printed.
+- The server log was checked by count only: 0 occurrences of the real key, `sk-`, `Authorization`, `postgresql://`, and `traceback`.
+
+Results:
+
+1. `/health` returned `200`.
+2. A new 22-token TXT upload (`live-smoke-2.txt`) returned `201 ingested`, with `chunk_count 1` and `page_count null`.
+   - The stored chunk is `text/plain`, `chunk_index 0`, `page_number` null, `token_count 22`, `vector_dims 1536`, and has an L2 norm of 0.9996, which is a real embedding.
+   - Events: `ingestion.started`, `parsed`, `embedded` (1328 ms), and `persisted`.
+3. The repeat upload returned `200 already_ingested` with the same `document_id` and emitted `ingestion.duplicate` (`concurrent: false`).
+
+The `cl100k_base` encoding had been downloaded and cached (1,681,126 bytes) by the first real ingestion earlier on 2026-09-23, so this run loaded it from the cache.
+
+An earlier attempt in the same session sent its requests to a server that was already listening on port 8000, not to the current code. It is therefore not counted as evidence. Its cleanup command, a `pkill` by command line, most likely stopped that server. That attempt made one OpenAI embeddings call and left `live-smoke.txt` in `fintech`. In total, the database now holds 3 documents and 3 chunks: `smoke.txt`, `live-smoke.txt`, and `live-smoke-2.txt`.
+
+## Accepted deferrals (recorded 2026-09-23)
+
+The Milestone 2 architecture audit found these gaps and deliberately deferred them. Each is fixed at the point named here, and this is the only place they are recorded.
+
+| Deferred change | Do it at |
+|---|---|
+| Request-ID `ContextVar` in `app/logging.py`, so adapter events carry `request_id` without threading it through every signature; list the adapter events (`embedding.*`, `tokenizer.load_failed`) in `docs/DECISIONS.md` §19 | The first Milestone 3 `retrieval.*` event; no later than Milestone 4 |
+| Catch-all `internal_error` envelope, and a `RequestValidationError` handler that keeps JSON-body validation in the SPEC §12.1 envelope | Milestone 4, with `POST /v1/query` |
+| Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change | Milestone 4 |
+| `contextlib.AsyncExitStack` in the lifespan | Milestone 5, when the MCP client becomes the third lifespan resource |
+| Single-flight tokenizer load, so a stalled download cannot pile up worker threads; level and timestamp in JSON log lines | Milestone 7 |
+| Move PDF extraction off the event loop (`asyncio.to_thread`) | Only if the Milestone 8 real-PDF measurement shows the event loop stalling (`docs/DECISIONS.md` §22) |
 
 ---
 
@@ -142,7 +198,7 @@ Target: ~1.5–2 hours.
 
 Do this only after the RAG-only path works.
 
-- [ ] Verify installed MCP SDK major version against current official documentation.
+- [ ] Verify installed MCP SDK major version against current official documentation. The pin is `mcp==2.2.0`; re-verify every API note in `docs/TECH_BASELINE.md` §3.9 against the installed 2.2.0 package before writing MCP code, and record any difference there.
 - [ ] Create local MCP server.
 - [ ] Implement strict ticker validator.
 - [ ] Implement `get_market_quote`.
@@ -192,7 +248,7 @@ Target: ~1–1.5 hours.
 Target: ~1–1.5 hours.
 
 - [x] Add `/health`. *(Pulled forward into Milestone 1 once the pool existed: `SELECT 1`, `503` on failure, bounded by the pool timeout.)*
-- [ ] Use FastAPI lifespan for shared resources where appropriate. *(Partial: lifespan owns the database pool. The OpenAI client and MCP handle join it when those milestones create them.)*
+- [ ] Use FastAPI lifespan for shared resources where appropriate. *(Partial: lifespan owns the database pool and, as of Milestone 2, the OpenAI client. The MCP handle joins it when that milestone creates it.)*
 - [ ] Normalize public application error responses.
 - [ ] Confirm database failures do not expose connection strings.
 - [ ] Confirm provider failures do not expose API keys.
@@ -316,22 +372,7 @@ Target: ~2–3 hours.
   - must-not-call-MCP.
 - [ ] Record per item: question, gold chunk(s) or none, expected status, expected MCP call.
 - [ ] Split the dataset into development and held-out sets, and record the dataset version.
-- [ ] Add a manually invoked evaluation runner (`evals/`, run with `uv run python -m evals.run`) that is not collected by pytest, and extend the mypy `files` setting to cover it.
-- [ ] In the same change, bring every active mypy quality gate up to date, because mypy ignores the `files` setting once paths are given on the command line. Do not work from a remembered list or a fixed count:
-  - search the whole tracked repository for hard-coded occurrences, for example
-    `git grep -n "uv run mypy app tests"`, and repeat it for any untracked
-    skill or tooling file that is part of the same change;
-  - update every occurrence that is an active project quality gate to
-    `uv run mypy app tests evals`. At the time of writing these include
-    `CLAUDE.md`, and both the allowed-tools entry and the verification/gate
-    instructions of `.claude/skills/project-review/SKILL.md`,
-    `.claude/skills/finish-task/SKILL.md`, and
-    `.claude/skills/git-workflow/SKILL.md` — but treat that list as a starting
-    point to verify, never as the complete set;
-  - remember that a skill's allowed-tools entry and its gate instructions must
-    change together: updating only the instructions leaves the new command
-    unpermitted, and updating only the allow-list leaves the gate unchanged.
-- [ ] Re-run the repository-wide search afterwards and confirm that no active mypy quality gate still omits `evals`. Historical prose, dated records, and commands that are intentionally narrower may keep the old form only where the surrounding text makes that intent clear.
+- [ ] Add a manually invoked evaluation runner (`evals/`, run with `uv run python -m evals.run`) that is not collected by pytest, and add `evals` to the `[tool.mypy] files` setting. Since 2026-09-23 every gate runs a bare `uv run mypy` through `scripts/verify.py`, so that setting is the only place to change. Confirm with `git grep -n "mypy app"` that no active gate passes explicit paths, because mypy ignores `files` when paths are given.
 - [ ] Implement the metrics of `docs/SPEC.md` §18.6 as pure functions, with deterministic unit tests on hand-built inputs.
 - [ ] Run the frozen baseline over both splits with real OpenAI (manual). Record every metric, p50/p95 latency, and cost per query.
 - [ ] Record the p95 latency bound the decision layer must stay within, **before** any Jev run.

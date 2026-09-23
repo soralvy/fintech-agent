@@ -233,6 +233,7 @@ Use this structure:
 │   │
 │   ├── db.py
 │   ├── ingestion.py
+│   ├── tokenizer.py
 │   ├── retrieval.py
 │   │
 │   ├── openai_provider.py
@@ -250,10 +251,20 @@ Use this structure:
 │   ├── fakes.py
 │   ├── test_health.py
 │   ├── test_ingestion.py
+│   ├── test_tokenizer.py
+│   ├── test_openai_provider.py
+│   ├── test_config.py
+│   ├── db_safety.py
+│   ├── test_db_safety.py
+│   ├── test_verify_script.py
 │   ├── test_retrieval_db.py
 │   ├── test_graph.py
 │   ├── test_mcp.py
 │   └── test_http.py
+│
+├── scripts/
+│   ├── __init__.py
+│   └── verify.py
 │
 ├── pyproject.toml
 ├── uv.lock
@@ -263,9 +274,22 @@ Use this structure:
 
 Implemented as of Milestone 1: `migrations/001_initial.sql`, `app/__init__.py`, `app/main.py`, `app/config.py`, `app/db.py`, `tests/__init__.py`, `tests/conftest.py`, `tests/test_health.py`, `tests/test_retrieval_db.py`, and `.env.example`. Every other file in the tree is created by the milestone that needs it, not ahead of it.
 
+Added in Milestone 2 (2026-09-23):
+
+- `app/errors.py`, `app/logging.py`, `app/schemas.py`, `app/ingestion.py`, and `app/openai_provider.py`, which holds only the embedding adapter for now. Structured generation joins it in Milestone 4.
+- `app/tokenizer.py`, a module this tree did not originally list. It holds the `Tokenizer` protocol and the tiktoken adapter, so chunking never depends on tiktoken's global state and tests can inject a fake.
+- Tests: `tests/fakes.py`, `tests/test_ingestion.py`, `tests/test_http.py`, `tests/test_tokenizer.py`, `tests/test_openai_provider.py`, and `tests/test_config.py`.
+
+`tests/fixtures/` holds the small TXT file used by the manual smoke test. The PDF test fixtures are generated in code (`tests/fakes.py`).
+
+Added in the Milestone 2 pre-finish cleanup (2026-09-23):
+
+- `tests/db_safety.py` is the single guarded reset of the integration-test database (§5.1). Its tests are in `tests/test_db_safety.py`.
+- `scripts/verify.py` is the canonical full verification gate, standard library only. Its tests are in `tests/test_verify_script.py`. `scripts/` is a package, and mypy checks it.
+
 The optional post-baseline decision layer (§25) would add `app/typesafe_provider.py` and `app/decisions.py` in Milestone 10, and a top-level `evals/` package in Milestone 9 holding the manually invoked evaluation runner (`uv run python -m evals.run`). `evals/` is not collected by pytest (it falls outside `testpaths`) but is added to the mypy `files` setting. All three are deliberately absent from the tree above because they are not part of the MVP baseline.
 
-`app/config.py` currently holds only database configuration; the remaining SPEC §14 values join it with the milestones that consume them.
+`app/config.py` holds the database configuration and, as of Milestone 2, `OPENAI_API_KEY`, `OPENAI_EMBEDDING_MODEL` (which must be unset or exactly `text-embedding-3-small`, the single `PINNED_EMBEDDING_MODEL` constant; §7.6), `OPENAI_EMBEDDING_DIMENSIONS` (which must equal 1536), and `MAX_UPLOAD_BYTES`. The remaining SPEC §14 values join it with the milestones that consume them. `OPENAI_API_KEY` is required at startup: without it the application refuses to start, before any resource is created, because embeddings are a mandatory part of the current slice.
 
 `app/` and `tests/` are both regular packages carrying `__init__.py`. This is deliberate: it gives every module a unique dotted name, so a test module can share a basename with an application module without colliding during mypy's module discovery.
 
@@ -302,7 +326,8 @@ Own:
 - pgvector type registration;
 - document lookup/insert operations;
 - chunk insertion;
-- exact vector retrieval.
+- exact vector retrieval;
+- the database boundary: it is the only module that imports psycopg, knows a constraint name, or translates driver errors (*recorded 2026-09-23*). `pooled_connection` and `pooled_transaction` turn any driver or pool error into `DatabaseUnavailableError`. `insert_document` raises `DuplicateChecksumError` for the checksum constraint only.
 
 No business decisions belong here.
 
@@ -316,6 +341,13 @@ Own:
 - deterministic chunk construction;
 - embedding calls;
 - ingestion transaction coordination.
+
+### `tokenizer.py`
+
+Own:
+
+- the `Tokenizer` protocol that chunking depends on;
+- the tiktoken `cl100k_base` adapter, which loads its encoding lazily and turns any load failure into `TokenizerUnavailableError`.
 
 ### `retrieval.py`
 
@@ -411,6 +443,8 @@ The development machine already ran PostgreSQL 14, which pgvector's Homebrew bot
 ### Test database separation
 
 Integration tests read `TEST_DATABASE_URL`, not `DATABASE_URL`, and skip when it is unset. The fixtures drop and recreate both tables on every test, so the two variables must never point at the same database. Keeping them distinct means pointing the application at a database can never put that database's contents at risk.
+
+*Guarded 2026-09-23:* every reset goes through `tests/db_safety.py::reset_test_schema`. Before any destructive statement runs, it reads `SELECT current_database()` on the live connection and refuses unless the name ends in `_test`. When `DATABASE_URL` is set, it also refuses a connection whose host, port, and database resolve to the same target. Loopback names and unix sockets count as the same local server. A refusal is a test error, not a skip, and never prints a connection string.
 
 ### Reason
 
@@ -530,6 +564,8 @@ The `documents.sha256` unique constraint remains the authority.
 
 If two ingestion requests race after the preliminary duplicate lookup, the loser handles the unique violation by querying the already-created document and returning `already_ingested`.
 
+*Implemented 2026-09-23:* recovery applies only to a `UniqueViolation` on `documents_sha256_key`. Any other database error, including other unique violations, is `503 database_unavailable`. The constraint is named explicitly in `migrations/001_initial.sql`, with the same name PostgreSQL generated for the earlier inline `UNIQUE`, so existing databases already match. `app/db.py` recognizes the name and raises `DuplicateChecksumError`, and `Ingestor._persist` performs the domain recovery. When the winner cannot be read back, the result is `503`, never a phantom duplicate. Ingestion imports no psycopg.
+
 ### Consequence
 
 An embedding request can be performed unnecessarily during a rare concurrent duplicate race. Avoiding that would require holding locks or introducing more coordination than the MVP warrants.
@@ -555,6 +591,24 @@ Supported types:
 
 Extension and MIME validation is defensive, not a claim that MIME metadata proves file safety.
 
+### Allow-lists (recorded 2026-09-23, Milestone 2)
+
+The normalized extension, lower-cased from the final path component, chooses the parser. The declared MIME type, ignoring parameters such as `charset`, must also be in that extension's allow-list:
+
+| Extension | Allowed declared MIME | Stored `content_type` |
+|---|---|---|
+| `.pdf` | `application/pdf`, `application/octet-stream` | `application/pdf` |
+| `.txt` | `text/plain`, `application/octet-stream` | `text/plain` |
+| `.md`, `.markdown` | `text/markdown`, `text/x-markdown`, `text/plain`, `application/octet-stream` | `text/markdown` |
+
+- An unsupported extension is `415 unsupported_file_type`. An absent MIME, or one outside the list, is `415 unsupported_media_type`. `application/octet-stream` never makes an unsupported extension acceptable.
+- The canonical type is stored, never the client's.
+- Only the final path component of the filename is kept.
+
+The file type is checked before the body is read. The body is then read in 64 KiB pieces and rejected as soon as it exceeds `MAX_UPLOAD_BYTES`, so at most `MAX_UPLOAD_BYTES + 1` bytes are read.
+
+The route also rejects a request whose `Content-Length` exceeds the limit plus a 64 KiB multipart allowance before parsing it. Starlette spools the multipart body to a temporary file (in memory up to 1 MiB, then on disk) before the handler reads it. A request without `Content-Length`, such as a chunked upload, is therefore bounded in memory but not on disk. That limit belongs to a reverse proxy, not the MVP.
+
 Uploaded content is never executed.
 
 ---
@@ -577,11 +631,19 @@ Decode as UTF-8.
 
 Invalid UTF-8 or content with no non-whitespace text is rejected as an unparseable/empty document.
 
+*Recorded 2026-09-23:* decoding is strict `utf-8-sig`, so a leading byte-order mark is dropped and nothing else is tolerated. Invalid UTF-8 is `400 unparseable_document`. Empty or whitespace-only text is `400 empty_document`.
+
 `page_number = null`.
 
 ### PDF
 
 Use one page-oriented text PDF parser pinned during repository setup.
+
+*Recorded 2026-09-23:* the parser is `pypdf==6.19.0` (`docs/TECH_BASELINE.md` §3.14), pinned in Milestone 2.
+
+- Before parsing, the bytes must contain the `%PDF-` signature within their first 1024 bytes. Without it, or if pypdf cannot parse the file, the upload is `400 unparseable_document`.
+- Encrypted PDFs are rejected the same way rather than decrypted.
+- `page_count` is the PDF's total page count, including pages that yielded no text.
 
 Extract each page independently and preserve its one-based page number.
 
@@ -619,6 +681,8 @@ Perform only structural normalization:
 - trim leading/trailing whitespace.
 
 Do not summarize, rewrite, lowercase, or otherwise semantically transform source content.
+
+*Recorded 2026-09-23:* NUL characters are also removed, because PostgreSQL `text` cannot store them and one would otherwise fail the whole ingestion.
 
 ---
 
@@ -664,6 +728,16 @@ Do not add:
 
 Chunks are not guaranteed to end on semantic section boundaries.
 
+### Tokenizer and window details (recorded 2026-09-23, Milestone 2)
+
+- **Tokenizer.** The tokenizer is tiktoken `cl100k_base`, the encoding of `text-embedding-3-small` (`docs/TECH_BASELINE.md` §3.15). Chunking depends on a `Tokenizer` protocol (`app/tokenizer.py`), not on tiktoken directly, and tests inject a deterministic fake.
+- **When the encoding loads.** The encoding loads lazily on the first ingestion, never at startup. If it is not cached, tiktoken downloads and hash-verifies it once. A load failure is `503 tokenizer_unavailable`, writes no rows, logs only the exception type, and is retried on the next ingestion.
+- **Load timeout.** tiktoken's own loader has no HTTP timeout, so an unbounded call could stall the event loop and hang every in-flight request, including `/health` (SPEC §13 requires external HTTP timeouts). `TiktokenTokenizer.ensure_ready` runs the load in a worker thread (`asyncio.to_thread`) under a fixed deadline (`asyncio.wait_for`, default 10 seconds), and `Ingestor` awaits it before chunking a non-empty document. A timeout is `503 tokenizer_unavailable`, the same as any other load failure; the worker thread may still be running when the deadline fires, since a Python thread cannot be cancelled, but nothing on the event loop waits for it.
+- **Special tokens.** Special-token text such as `<|endoftext|>` is encoded as plain text (`encode_ordinary`), so it cannot make an upload fail.
+- **Multi-byte characters at window edges.** When a window edge falls inside a multi-byte character, the partial character is dropped rather than replaced with U+FFFD. Chunk text therefore stays a verbatim substring of the normalized source, and the overlap carries the character whole into the neighbouring chunk.
+- **Last window.** A page's last window ends exactly at the page's end. Once a window reaches the end, no further window is emitted, because it would lie entirely inside the previous one. For example, 2000 tokens give windows `[0, 800)`, `[680, 1480)`, and `[1360, 2000)`.
+- **`token_count`.** `token_count` is the number of tokens in the window.
+
 ---
 
 ## 7.6 Embedding
@@ -673,6 +747,10 @@ Pass chunk texts as an array to the embedding provider where batching is straigh
 Every returned vector must contain exactly the configured 1536 dimensions.
 
 A dimension mismatch is a provider/configuration error and aborts ingestion before any database rows are committed.
+
+*Recorded 2026-09-23:* the embedding model is pinned to `text-embedding-3-small` (`PINNED_EMBEDDING_MODEL` in `app/config.py`). A different model can still return 1536 dimensions, for example `text-embedding-3-large` with `dimensions=1536`. No model is recorded per row, so a different model would silently mix embedding spaces. An explicit different `OPENAI_EMBEDDING_MODEL` therefore fails startup. No model column or migration is added.
+
+*Recorded 2026-09-23:* the adapter sends at most 128 inputs per request. It restores the provider's output order by `index`, and rejects a response with a missing vector or a wrong dimension as `502 embedding_provider_error`. An SDK error is logged by type and status code only, never its message or body. The shared `AsyncOpenAI` client uses a 30-second timeout and the SDK's default 2 retries.
 
 ---
 
@@ -701,6 +779,8 @@ JOIN documents ...
 ORDER BY embedding <=> %s
 LIMIT %s;
 ```
+
+*Implemented 2026-09-23:* `search_chunks_by_embedding` orders by `cosine_distance, document_id, chunk_index`. Equal distances are common, because the deterministic test fakes use orthogonal vectors. The tie-break over the stored unique key makes the order, and so the request-local `D1…Dn` labels, fully deterministic.
 
 Application similarity:
 
@@ -1122,11 +1202,27 @@ Known public failures:
 - `400` no extractable content;
 - `413` upload limit;
 - `415` unsupported file/media type;
-- FastAPI/Pydantic `422` malformed request;
+- `422` malformed request (`invalid_request`, raised by the route's own multipart parsing, not FastAPI/Pydantic validation);
 - `502` embedding failure;
 - `503` database failure.
 
 No partial database rows remain after failed persistence.
+
+### Error codes (recorded 2026-09-23, Milestone 2)
+
+Every ingestion failure, including request validation, uses the SPEC §12.1 envelope `{"error": {"code", "message"}}`. Messages are fixed per code and never include an exception message, class name, provider body, database detail, key, full checksum, path, or document text. `GET /health` keeps its `{"detail": ...}` shape until Milestone 7.
+
+| Status | `code` | Cause |
+|---|---|---|
+| 400 | `empty_document` | empty file, or no extractable text |
+| 400 | `unparseable_document` | invalid UTF-8; missing PDF signature; malformed or encrypted PDF |
+| 413 | `file_too_large` | body over `MAX_UPLOAD_BYTES`, or `Content-Length` over it plus the multipart allowance |
+| 415 | `unsupported_file_type` | extension missing or not `.pdf`/`.txt`/`.md`/`.markdown` |
+| 415 | `unsupported_media_type` | declared MIME absent or outside the extension's allow-list |
+| 422 | `invalid_request` | not multipart, no `file` part, more than one file, any extra field, or a malformed multipart body |
+| 502 | `embedding_provider_error` | OpenAI error, or a missing or wrong-dimension vector |
+| 503 | `tokenizer_unavailable` | the `cl100k_base` encoding could not be loaded |
+| 503 | `database_unavailable` | any PostgreSQL or pool error |
 
 ---
 
@@ -1710,6 +1806,9 @@ graph
 retrieval
   -> OpenAI embedding adapter
   -> db
+
+db
+  -> errors   (driver failures become DatabaseUnavailableError)
 
 MCP server
   -> market-data provider adapter

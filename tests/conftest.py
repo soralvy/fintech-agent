@@ -2,20 +2,25 @@
 
 Database tests run against a real PostgreSQL with pgvector; the vector SQL is
 never mocked (docs/DECISIONS.md section 20.2). They are skipped unless
-``TEST_DATABASE_URL`` names a database that is safe to wipe -- a separate
-variable from ``DATABASE_URL`` on purpose, so pointing the application at a
-database never puts that database's contents at risk.
+``TEST_DATABASE_URL`` is set -- a separate variable from ``DATABASE_URL`` on
+purpose. Every reset of that database goes through
+``tests.db_safety.reset_test_schema``, which refuses to drop anything unless
+the live connection is a ``*_test`` database distinct from the application's.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Iterator
+from typing import NoReturn
 
 import pytest
+import tiktoken
+import tiktoken.load
 
 from app.config import DatabaseConfig
-from app.db import Connection, Pool, apply_migration, create_pool
+from app.db import Connection, Pool, create_pool
+from tests.db_safety import reset_test_schema
 
 TEST_DATABASE_URL_ENV = "TEST_DATABASE_URL"
 
@@ -26,6 +31,22 @@ EMBEDDING_DIMENSIONS = 1536
 def anyio_backend() -> str:
     """Run async tests on asyncio via the anyio plugin, which ships with anyio."""
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def _no_tiktoken_encoding_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail loudly if any test reaches tiktoken's encoding loader.
+
+    Loading ``cl100k_base`` can download it, and automated tests must make no
+    network call. Tests use ``FakeTokenizer``, or inject a loader into the
+    tiktoken adapter; reaching the real loader is a test bug.
+    """
+
+    def refuse(*args: object, **kwargs: object) -> NoReturn:
+        raise OSError("tiktoken encoding data is not available to tests")
+
+    monkeypatch.setattr(tiktoken, "get_encoding", refuse)
+    monkeypatch.setattr(tiktoken.load, "read_file", refuse)
 
 
 @pytest.fixture(scope="session")
@@ -48,15 +69,9 @@ async def pool(database_url: str) -> AsyncIterator[Pool]:
 
 @pytest.fixture
 async def db(pool: Pool) -> AsyncIterator[Connection]:
-    """A connection against a freshly migrated, empty schema.
-
-    Dropping lives here rather than in application code: destroying tables is a
-    test concern, and the migration itself only ever creates.
-    """
+    """A connection against a freshly migrated, empty schema."""
     async with pool.connection() as conn:
-        await conn.execute("DROP TABLE IF EXISTS document_chunks, documents CASCADE")
-        await apply_migration(conn)
-        await conn.commit()
+        await reset_test_schema(conn)
         yield conn
 
 

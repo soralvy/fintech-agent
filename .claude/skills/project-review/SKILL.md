@@ -20,10 +20,12 @@ allowed-tools:
   - "Bash(git rev-parse *)"
   - "Bash(git merge-base *)"
   - "Bash(git branch --show-current)"
+  - "Bash(uv run python scripts/verify.py)"
   - "Bash(uv lock --check)"
-  - "Bash(uv run ruff format --check .)"
-  - "Bash(uv run ruff check .)"
-  - "Bash(uv run mypy app tests)"
+  - "Bash(uv run ruff format --check *)"
+  - "Bash(uv run ruff check *)"
+  - "Bash(uv run mypy)"
+  - "Bash(uv run mypy *)"
   - "Bash(uv run pytest)"
   - "Bash(uv run pytest *)"
 disallowed-tools:
@@ -112,21 +114,17 @@ review, return `BLOCKED` and say exactly what is missing.
 
 ## Run the repository gates
 
-Run `uv lock --check` and the quality commands documented in `CLAUDE.md`:
-
-- `uv run ruff format --check .`
-- `uv run ruff check .`
-- `uv run mypy app tests`
-- `uv run pytest`
-
-Report the pytest skip count. Database tests skip without
-`TEST_DATABASE_URL`; a skipped vector path is not evidence that it works.
+Run the canonical full gate named in `CLAUDE.md`:
+`uv run python scripts/verify.py`. It fails when any test is skipped, and when
+`TEST_DATABASE_URL` is unset. Individual Ruff, mypy, or pytest commands may be
+run afterwards only to diagnose a failure; they never replace the full gate.
 
 Do not use real credentials or call live OpenAI, embedding, market-data, or
 other external services.
 
 A failing gate is a P1 finding. Report it once, not one finding per Ruff or
-mypy diagnostic. A gate that cannot run at all makes the review `BLOCKED`.
+mypy diagnostic. A gate that cannot run at all, including a missing
+`TEST_DATABASE_URL`, makes the review `BLOCKED`.
 
 ## Review the whole scope in one pass
 

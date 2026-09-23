@@ -28,11 +28,7 @@ allowed-tools:
   - "Bash(gh pr status *)"
   - "Bash(gh pr view *)"
   - "Bash(gh pr checks *)"
-  - "Bash(uv lock --check)"
-  - "Bash(uv run ruff format --check .)"
-  - "Bash(uv run ruff check .)"
-  - "Bash(uv run mypy app tests)"
-  - "Bash(uv run pytest)"
+  - "Bash(uv run python scripts/verify.py)"
 ---
 
 # Git workflow
@@ -65,7 +61,6 @@ additional approval.
 Every state-changing command must be a separate Bash tool call so the user
 can approve or reject it independently. This includes:
 
-- `git switch -c`
 - `git fetch`
 - `git add`
 - `git commit`
@@ -114,16 +109,13 @@ scope cannot be separated safely.
 
 ## Branch policy
 
-Never commit or push new feature work directly to the repository's default
-branch.
-
-If the user has uncommitted changes on the default branch and no unpushed
-commits there:
-
-1. infer a short branch name such as `feat/<slug>`, `fix/<slug>`,
-   `docs/<slug>`, or `chore/<slug>`;
-2. check that the branch does not already exist;
-3. request approval for `git switch -c <branch>`.
+Protected-branch preflight, for every mode that changes Git state (`commit`,
+`pr`, `publish`, `ready`): run `git branch --show-current`. If it prints
+`main`, `master`, the repository's default branch, or nothing (detached
+`HEAD`), stop before any state change. Tell the user to run
+`/start-task <slug> --carry`, which moves uncommitted work onto a new task
+branch, and to rerun this skill there. This skill never creates or switches
+branches. The edit hook is early protection, not the only one.
 
 If the default branch already contains local-only commits, stop. Do not
 rewrite or move them automatically.
@@ -162,14 +154,10 @@ Before mutation, show the complete proposed commit plan:
 
 Use repository-specific gates from `CLAUDE.md` and project documentation.
 
-For this repository the default full gate is:
-
-1. `uv lock --check`
-2. `uv run ruff format --check .`
-3. `uv run ruff check .`
-4. `uv run mypy app tests`
-5. `uv run pytest`
-6. any milestone-specific live check required by `CLAUDE.md`
+Run the canonical full gate named in `CLAUDE.md`,
+`uv run python scripts/verify.py`, which fails on any skipped test or a
+missing `TEST_DATABASE_URL`. Also confirm any milestone-specific live check
+that `CLAUDE.md` requires was actually run; this skill does not run it.
 
 Do not run auto-fix commands in this skill.
 

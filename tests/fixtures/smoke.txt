@@ -1,0 +1,4 @@
+Acme Corp — FY2025 annual report extract (synthetic sample for the manual smoke test)
+
+European revenue declined 4% year over year, primarily because of currency headwinds and softer demand in Germany.
+The company identified foreign-exchange volatility and regulatory changes in the EU as principal risks to European revenue.

@@ -129,6 +129,8 @@ def test_health_returns_503_within_the_pool_timeout_when_database_is_down(
     monkeypatch.setattr(
         DatabaseConfig, "from_env", classmethod(lambda cls: unreachable)
     )
+    # Startup requires a key; a dummy is enough, since health never calls OpenAI.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-a-secret")
 
     with TestClient(app) as client:
         started = time.monotonic()
