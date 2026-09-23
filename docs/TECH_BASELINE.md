@@ -29,7 +29,7 @@ Use the following baseline:
 - pgvector Python adapter `0.5.0`
 - MCP Python SDK `2.2.0` (the pin in `pyproject.toml`; corrected 2026-09-23, §3.9)
 - OpenAI Python SDK `3.14.1`
-- OpenAI answer/planning model `gpt-5.6-luna`
+- OpenAI answer/planning model `gpt-6-luna` (amended 2026-09-23 from `gpt-5.6-luna`, §3.10)
 - OpenAI embedding model `text-embedding-3-small`, fixed at `1536` dimensions
 - pypdf `6.19.0` (added 2026-09-23, §3.14)
 - tiktoken `0.14.0`, encoding `cl100k_base` (added 2026-09-23, §3.15)
@@ -364,7 +364,7 @@ No HTTP MCP server, remote MCP deployment, sampling, elicitation, or generalized
 
 **Selected SDK version:** `openai==3.14.1`
 
-**Selected model:** `gpt-5.6-luna`
+**Selected model:** `gpt-6-luna` (*amended 2026-09-23 for Milestone 4*; previously `gpt-5.6-luna`, see below)
 
 **Official documentation:**
 
@@ -376,8 +376,8 @@ No HTTP MCP server, remote MCP deployment, sampling, elicitation, or generalized
 
 - one shared `AsyncOpenAI` client;
 - Responses API rather than adding a second generation abstraction;
-- structured model output using the SDK's Responses structured-output support with a Pydantic schema;
-- `gpt-5.6-luna` for both grounded answer generation and the bounded tool-planning decision;
+- structured model output through Responses Structured Outputs with an application-owned strict JSON Schema (`text.format`), validated locally; the SDK's `responses.parse` helper is **not** used (amendment below);
+- `gpt-6-luna` for both grounded answer generation and the bounded tool-planning decision;
 - application-level validation of returned citation/context IDs.
 
 For the structured answer contract, use Structured Outputs / JSON Schema rather than the older JSON-only mode. The Responses API currently documents `json_schema` as the preferred mechanism for models that support it.
@@ -401,6 +401,39 @@ Do not use the deprecated/older JSON object mode where Structured Outputs can en
 The model name is configuration rather than a Python package pin. If the configured model is changed later, verify structured-output support and behavior before accepting the change.
 
 **Verified:** 2026-09-16
+
+### Amendment 2026-09-23 — Milestone 4 answer model and adapter contract
+
+Recorded by the Milestone 4 contract alignment (`docs/changes/M4-query-graph.md` §4, §7.5, §7.6; decisions D6, D10, D11, D12). Implementation is Milestone 4, Stage C; nothing below is built yet.
+
+**Default model: `gpt-6-luna` (D11, user decision 2026-09-23).** No project-specific reason had been recorded for `gpt-5.6-luna`, and no verified evidence on file showed it supports Structured Outputs together with `reasoning.effort="none"`, which Milestone 4 needs. The OpenAI `gpt-6-luna` model page (developers.openai.com, fetched 2026-09-23) lists Responses as a supported endpoint and `structured_outputs` as a supported feature, and states that "`reasoning.effort` supports `none`, `low`, `medium` (default), `high`, `xhigh`, and `max`." `OPENAI_LLM_MODEL` still overrides it (`docs/SPEC.md` §14); any configured model must support Structured Outputs and `effort: "none"`, or the provider rejects the request, which surfaces as a provider failure (`docs/DECISIONS.md` §12).
+
+**Request shape.** Each logical answer call is exactly one `client.responses.create(...)` on the shared `AsyncOpenAI` client:
+
+```text
+model=<OPENAI_LLM_MODEL>, instructions=<fixed instructions>, input=<rendered prompt>,
+text={"format": GROUNDED_ANSWER_FORMAT}, reasoning={"effort": "none"},
+max_output_tokens=1200, store=False
+```
+
+- `GROUNDED_ANSWER_FORMAT` is one application-owned constant: `{"type": "json_schema", "name": "grounded_answer", "strict": True, "schema": ...}`. The schema is an object with exactly `answer` (string), `citation_ids` (array of strings), and `insufficient_context` (boolean), all required, with `additionalProperties: false`.
+- The adapter parses the one usable output text with `json.loads` and validates it with `GroundedAnswer.model_validate`, where `GroundedAnswer` uses `ConfigDict(extra="forbid", strict=True)` with the same three fields. `GroundedAnswer` lives in `app/openai_provider.py`, next to its adapter (`docs/DECISIONS.md` §4).
+- `ANSWER_REASONING_EFFORT = "none"` and `ANSWER_MAX_OUTPUT_TOKENS = 1200` are code constants, not configuration. `effort: "none"` suits this bounded, extraction-style task. `max_output_tokens` bounds the visible output (the JSON answer) plus reasoning tokens. The Milestone 4 live smoke test must confirm the budget from `generation.completed.output_tokens`; changing it later is a recorded decision, not a configuration change.
+- No streaming, no background mode, no stored conversation state, and no JSON object mode.
+
+**Why `responses.create`, not `responses.parse` (D12).** Verified in the installed SDK 3.14.1 on 2026-09-23:
+
+- `responses.parse` → `parse_response` → `parse_text` (`openai/lib/_parsing/_responses.py`) validates every `output_text` before the caller can inspect `status`. A truncated body from an `incomplete` response therefore raises `pydantic.ValidationError` inside the call, indistinguishable from malformed output, so incomplete and invalid outcomes could not be classified separately.
+- `Response.status` is `Literal["completed", "failed", "in_progress", "cancelled", "queued", "incomplete"]` and is optional (`None` possible). `incomplete_details.reason` is one of `max_output_tokens`, `max_messages`, `content_filter`, `steered`.
+- A message's content parts are `output_text` or `refusal`. A message's `phase` is `None`, `commentary`, or `final_answer`; only `None` and `final_answer` are answers. The answer is never assumed to be `response.output[0]`, since a reasoning item may come first.
+- `ReasoningEffort` includes `"none"`. The `max_output_tokens` docstring states that the bound includes "visible output tokens and reasoning tokens".
+- Transport retries (`_should_retry`): 408, 409, 429, ≥500, or `x-should-retry: true`; no retry when `Retry-After` exceeds the SDK maximum; backoff 0.5–8 s. With the project's `max_retries=2`, one logical call may make up to three HTTP attempts, each bounded by the 30 s client timeout.
+
+The outcome classification (incomplete, unexpected status, refusal, invalid structured output with its single retry, valid) and the logical-call budget are architecture and live in `docs/DECISIONS.md` §12.
+
+**Retention (D6).** `store=False` disables stored Responses application state. It does **not** by itself guarantee zero retention: the OpenAI "your data" guide (fetched 2026-09-23) states that abuse-monitoring logs are "retained for up to 30 days", and only the approval-gated Zero Data Retention or Modified Abuse Monitoring controls exclude customer content from them. The project claims no stronger guarantee.
+
+**Tests.** Adapter tests drive the real SDK over `httpx2.MockTransport` at `http://openai.invalid/v1` with a fake key and `max_retries=0`, so they verify logical-call behavior only. Stage C first confirms the minimal Responses JSON bodies for each outcome against the installed SDK and records them here only if they differ from this record. No automated test calls OpenAI.
 
 ---
 
@@ -696,7 +729,7 @@ Do not introduce the following merely as part of dependency setup:
 - SQLAlchemy or another ORM;
 - LangChain high-level agents/chains;
 - LangGraph persistence/checkpoint storage;
-- LangSmith runtime integration;
+- LangSmith runtime integration (and see the no-runtime-tracing invariant below);
 - OpenAI Agents SDK;
 - OpenAI file search/vector stores;
 - a second LLM or embeddings provider;
@@ -710,6 +743,26 @@ Do not introduce the following merely as part of dependency setup:
 - frontend dependencies.
 
 Those additions do not help satisfy the approved MVP and would consume the limited implementation budget.
+
+### No runtime tracing (recorded 2026-09-23, Milestone 4; D25)
+
+LangSmith is not a direct dependency, but it arrives transitively through `langgraph` (`langchain_core` 1.6.3, `langsmith` 0.12.5, both shipping `py.typed`). The application never enables or uses it, so graph state (the question, chunk text, prompts, and answers) never leaves the process through a tracer.
+
+Evidence, verified in the installed packages on 2026-09-23:
+
+- LangGraph configures a `langchain_core` callback manager on every `ainvoke` (`langgraph/_internal/_config.py`, `pregel/main.py`). `langchain_core` attaches a `LangChainTracer` when `langsmith.utils.tracing_is_enabled()` is true, and that tracer then connects to the configured LangSmith endpoint.
+- `tracing_is_enabled()` reads `TRACING_V2`, then `TRACING`, each first under the `LANGSMITH_` prefix and then under `LANGCHAIN_`. Only the exact value `"true"` enables it; whitespace-only counts as unset.
+- `langsmith.utils.get_env_var` is wrapped in `functools.lru_cache`, so the first read in a process fixes the value for the rest of it.
+- `langchain_core` also has a separate v1 check, `env_var_is_set("LANGCHAIN_TRACING") or env_var_is_set("LANGCHAIN_HANDLER")` (`langchain_core/callbacks/manager.py`). `env_var_is_set` (`langchain_core/utils/env.py`) is true when the variable is present and its exact value is not `""`, `"0"`, `"false"`, or `"False"`; it neither trims nor folds case. When that check is set and v2 tracing is off, callback configuration raises `RuntimeError`, which would make every graph run fail outside any node.
+- The only values both packages treat as disabled are therefore: unset, `""`, `"0"`, `"false"`, and `"False"`, exactly.
+
+Invariant:
+
+- `app/config.py` defines `TRACING_ENV_VARS = ("LANGSMITH_TRACING", "LANGSMITH_TRACING_V2", "LANGCHAIN_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_HANDLER")`, `TRACING_DISABLED_VALUES = {"", "0", "false", "False"}`, and `require_tracing_disabled()`. `lifespan` calls it with the other configuration reads, before any resource is created.
+- A protected variable passes only when it is unset or its value, compared exactly as read with no trimming or case folding, is in `TRACING_DISABLED_VALUES`. This deliberately differs from the project's usual rule (blank after trimming means unset), because a whitespace-only value would pass that rule and then make every graph run raise.
+- Any other value, including `"true"`, `"1"`, `"FALSE"`, `" false "`, whitespace-only values, and any other non-empty `LANGCHAIN_HANDLER`, fails startup with `ConfigError("<NAME> must be unset or disabled; LangSmith tracing is not supported")`, naming the first offending variable in `TRACING_ENV_VARS` order and never its value. The application never silently overrides an explicitly set value.
+- `app/` imports neither `langsmith` nor `langchain_core` and never uses `tracing_context` (rejected: it would add a production import of a transitive package and hide the operator's setting instead of refusing it).
+- `tests/conftest.py` removes those five variables from `os.environ` at import, before any graph is built (the `lru_cache` makes that order matter), and an autouse fixture deletes them again for every test.
 
 The optional TypeSafe Jev decision service (§3.13) is not a second LLM or embedding provider. It is a post-baseline, evaluation-gated addition that brings in no package dependency, and the baseline must run without it. It does not reopen any exclusion above.
 

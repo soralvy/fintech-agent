@@ -238,6 +238,7 @@ Use this structure:
 │   │
 │   ├── openai_provider.py
 │   ├── graph.py
+│   ├── citations.py
 │   ├── prompts.py
 │   │
 │   ├── market_data.py
@@ -260,6 +261,8 @@ Use this structure:
 │   ├── test_retrieval.py
 │   ├── test_retrieval_db.py
 │   ├── test_logging.py
+│   ├── test_citations.py
+│   ├── test_prompts.py
 │   ├── test_graph.py
 │   ├── test_mcp.py
 │   └── test_http.py
@@ -292,8 +295,31 @@ Added in the Milestone 2 pre-finish cleanup (2026-09-23):
 Added in Milestone 3 (2026-09-23):
 
 - `app/retrieval.py`: `RetrievedChunk`, the pure `filter_matches`, and `Retriever`, whose `embed_query` and `retrieve` methods match the graph's two nodes (§10.2, §10.3). `db.py` is unchanged: it still returns the raw cosine distance.
-- `RetrievalConfig` in `app/config.py` (`RETRIEVAL_TOP_K`, `MIN_RETRIEVAL_SIMILARITY`). **It is not yet read at startup.** The lifespan does not build it until Milestone 4 wires retrieval into `POST /v1/query`. Until then an invalid retrieval variable does not stop the application from starting; it is rejected only where `RetrievalConfig` is constructed.
+- `RetrievalConfig` in `app/config.py` (`RETRIEVAL_TOP_K`, `MIN_RETRIEVAL_SIMILARITY`). **It is not yet read at startup.** The lifespan does not build it until Milestone 4 wires retrieval into `POST /v1/query`. Until then an invalid retrieval variable does not stop the application from starting; it is rejected only where `RetrievalConfig` is constructed. *(Milestone 4 closes this: see the Milestone 4 entry below.)*
 - Tests: `tests/test_retrieval.py` (pure: filter, query embedding, failure events, and the `KeywordEmbedder` fake's determinism), `tests/test_logging.py` (request-ID binding), and service-level tests added to `tests/test_retrieval_db.py`. Neither new test file was in the tree above; both are added to it here.
+
+Planned for Milestone 4 (*recorded 2026-09-23 by the contract alignment; not yet implemented*, `docs/changes/M4-query-graph.md` §9, §12):
+
+- `app/citations.py` (new): pure code, with no I/O, no logging, and no framework imports. It holds `ContextItem` (a label plus its `RetrievedChunk`), `build_context_items`, `make_excerpt` (§15), the citation-marker rule, and `finalize_answer`, which implements §10.9 and returns the status, answer, citations, unknown IDs, and failure reason. It also defines `DocumentCitation`, `EXCERPT_MAX_CHARS`, and `INSUFFICIENT_CONTEXT_ANSWER`. This module did not exist in the original tree; it closes the Milestone 2 deferral that asked for a pure citation/context module separate from the graph topology (`docs/TASKS.md` Milestone 2, "Accepted deferrals").
+- `app/prompts.py` (new): `GROUNDED_ANSWER_INSTRUCTIONS` and `render_grounded_answer_input(question, items)` (§17).
+- `app/graph.py` (new): `QueryState`, the `QueryRetriever` Protocol (so graph tests run without PostgreSQL), `build_query_graph(*, retriever, answerer)`, node logging, `QueryResult`, and `run_query(...)`. The `finalize` node still owns citation validation and the final result, but delegates the rules to `citations.finalize_answer`.
+- `app/openai_provider.py`: gains `GroundedAnswer`, `GROUNDED_ANSWER_FORMAT`, the `AnswerGenerator` Protocol, `OpenAIAnswerGenerator`, `ANSWER_REASONING_EFFORT`, and `ANSWER_MAX_OUTPUT_TOKENS` (§12; `docs/TECH_BASELINE.md` §3.10).
+- `app/errors.py`: gains `InvalidQueryError` and `AnswerProviderError` (§13), and `ErrorType` with `classify_error(exc)`, the bounded `error_type` classification (§19).
+- `app/schemas.py`: HTTP models only, gaining `QueryRequest`, `QueryCitation`, and `QueryResponse`. LLM structured outputs live beside their adapter (`GroundedAnswer` in `openai_provider.py`), and provider results will live beside theirs. This closes the Milestone 2 schema-split deferral.
+- `app/config.py`: `OpenAIConfig.llm_model` from `OPENAI_LLM_MODEL` (unset or blank means `gpt-6-luna`), and `TRACING_ENV_VARS`, `TRACING_DISABLED_VALUES`, and `require_tracing_disabled()` (`docs/TECH_BASELINE.md` §7). `lifespan` calls `require_tracing_disabled()` and `RetrievalConfig.from_env()` with the other configuration reads, before any resource is created, closing the `RetrievalConfig` startup deferral.
+- `app/main.py`: the lifespan builds one shared `OpenAIEmbedder`, the `Retriever`, and the `OpenAIAnswerGenerator` inside the existing OpenAI client block, and compiles the graph **once** as `app.state.query_graph`. `get_query_graph` exposes it, and tests override it the same way as `get_ingestor`. There is no new teardown. `main.py` also adds the `POST /v1/query` route, the global `RequestValidationError` and `StarletteHTTPException` handlers, and `UnexpectedErrorMiddleware` (§13). It registers no `Exception` or `500` handler.
+- Unchanged: `db.py`, `retrieval.py`, `ingestion.py`, `tokenizer.py`, `logging.py`, and the migration.
+- Tests: `tests/test_citations.py` and `tests/test_prompts.py` (new, and now in the tree above), `tests/test_graph.py` (new; already in the tree). `tests/fakes.py` gains `FakeRetriever` and `ScriptedAnswerGenerator`, and receives the shared corpus helper group moved unchanged as one unit from `tests/test_retrieval_db.py`: `ingest_corpus`, `Corpus`, `SMOKE_FIXTURE`, `LIQUIDITY_MD`, and `GLOBEX_PAGES`. `tests/test_retrieval_db.py` changes only its imports. `tests/conftest.py` clears the tracing variables.
+
+Import confinement after Milestone 4: FastAPI and Starlette only in `main.py` among the touched modules; `langgraph` only in `graph.py`; `openai` only in `openai_provider.py`; psycopg only in `db.py`; `langsmith` and `langchain_core` nowhere in `app/`.
+
+Deferred beyond Milestone 4, or out of its scope (*recorded 2026-09-23*):
+
+- **Milestones 5–6:** `decide_tool`, `call_tool`, `route_tools`, the tool state fields, `T1` labels, MCP citations, non-empty `tools_used`, MCP settings, and `contextlib.AsyncExitStack` in the lifespan. `use_tools=true` is accepted in Milestone 4 but follows the document path with no MCP call (§13).
+- **Milestone 6, flagged and not resolved here:** for MCP citations, `docs/SPEC.md` §6.3 shows an `excerpt` field, while §15 below specifies `fields`.
+- **Milestone 7:** `http.request.started` and `http.request.completed`; `http.request.failed` for failures other than unexpected exceptions; the `/health` error envelope (it keeps `{"detail": ...}`); unifying `Ingestor.ingest`'s own request-ID binding with the middleware's; and the hardening checklist.
+- **Milestone 8:** README, real-PDF smoke test, and MCP smoke test.
+- **Not in Milestone 4:** new dependencies, generic LLM or provider frameworks, LangChain abstractions, dependency-injection frameworks, placeholder modules, persistence of queries or answers, a LangGraph checkpointer, and LangSmith tracing. Milestones 9–12 remain post-baseline.
 
 The optional post-baseline decision layer (§25) would add `app/typesafe_provider.py` and `app/decisions.py` in Milestone 10, and a top-level `evals/` package in Milestone 9 holding the manually invoked evaluation runner (`uv run python -m evals.run`). `evals/` is not collected by pytest (it falls outside `testpaths`) but is added to the mypy `files` setting. All three are deliberately absent from the tree above because they are not part of the MVP baseline.
 
@@ -312,11 +338,22 @@ The modules have the following responsibilities.
 - register the three HTTP routes;
 - map application errors to HTTP responses.
 
+*From Milestone 4 (recorded 2026-09-23):* also compile the query graph once in the lifespan and expose it through the overridable `get_query_graph` dependency; register the global `RequestValidationError` and `StarletteHTTPException` handlers; and install `UnexpectedErrorMiddleware`, which binds the request ID and turns any unexpected exception into the fixed `500` envelope (§13, §19).
+
 ### `config.py`
 
 - parse non-secret configuration and secret environment values;
 - validate required values;
 - never print secret values.
+
+*From Milestone 4 (recorded 2026-09-23):* also refuse to start when LangSmith tracing could be enabled (`require_tracing_disabled()`, `docs/TECH_BASELINE.md` §7).
+
+### `errors.py`
+
+*Recorded 2026-09-23; the module has existed since Milestone 2.*
+
+- application errors with a fixed public `code`, `message`, and HTTP status, imported by every layer and importing no framework;
+- from Milestone 4, `ErrorType` and `classify_error(exc)`, the closed classification logged as `error_type` (§19). Its only third-party import is Pydantic's `ValidationError`.
 
 ### `schemas.py`
 
@@ -325,6 +362,8 @@ Contain Pydantic models for:
 - HTTP request/response schemas;
 - structured LLM outputs;
 - MCP/provider normalized results where useful.
+
+*Amended 2026-09-23 (Milestone 4; closes the Milestone 2 schema-split deferral):* `schemas.py` holds HTTP request/response models only. Structured LLM outputs live beside the adapter that validates them (`GroundedAnswer` in `openai_provider.py`), and normalized provider results will live beside their adapters.
 
 ### `db.py`
 
@@ -376,6 +415,8 @@ Own:
 
 It exposes application-oriented methods rather than leaking raw OpenAI responses.
 
+*From Milestone 4 (recorded 2026-09-23):* it also owns the `GroundedAnswer` schema, the `GROUNDED_ANSWER_FORMAT` constant sent to the provider, the `AnswerGenerator` Protocol, and the outcome classification of §12. The adapter receives only strings (`instructions`, `prompt`); it never renders the prompt.
+
 ### `graph.py`
 
 Own:
@@ -386,12 +427,27 @@ Own:
 - MCP call limit;
 - final citation validation.
 
+*Amended 2026-09-23 (Milestone 4):* the `finalize` node still owns final citation validation and the construction of the final result, but the rules themselves are pure functions in `citations.py`. The `answer` node renders the prompt through `prompts.py`.
+
+### `citations.py`
+
+*Added 2026-09-23 (Milestone 4).*
+
+- request-local context labels (`ContextItem`, `build_context_items`);
+- the finalize rules of §10.9, including citation-marker sanitization;
+- the bounded evidence excerpt of §15;
+- public document-citation construction from trusted `RetrievedChunk` metadata only.
+
+No I/O, no logging, and no framework imports.
+
 ### `prompts.py`
 
 Contains the small fixed prompts for:
 
 - tool decision;
 - grounded answering.
+
+*From Milestone 4:* also `render_grounded_answer_input`, which renders the escaped, delimited data blocks of §17.
 
 ### `market_data.py`
 
@@ -869,6 +925,17 @@ symbol
 
 The allowed tool-name type is restricted to the two registered names rather than arbitrary strings where practical.
 
+### Milestone 4 state (recorded 2026-09-23)
+
+Milestone 4 implements the no-tools subset as `QueryState`, a `TypedDict` with `total=False`:
+
+- `question`, `use_tools`, `query_embedding`, `retrieved_chunks`;
+- `context_items`, `citation_map` (label → `ContextItem`);
+- `model_answer` (the untrusted `GroundedAnswer`);
+- `answer`, `citation_ids` (the final, validated labels), `citations`, `status`.
+
+`tool_plan`, `tool_result`, and `errors` are added in Milestone 6, together with the nodes that write them. The graph depends on a small `QueryRetriever` Protocol matching `Retriever.embed_query` and `Retriever.retrieve`, so graph tests can run with a fake and without PostgreSQL.
+
 ---
 
 # 10. LangGraph nodes
@@ -886,6 +953,8 @@ HTTP validation already handles length constraints. This node maintains a valid 
 Failure:
 
 - invalid state terminates as an application validation error.
+
+*Recorded 2026-09-23 (Milestone 4):* that error is `InvalidQueryError` (`422 invalid_request`, message "The question must be 3 to 2000 characters after trimming."), raised when the trimmed question is outside 3–2000 characters, before any embedding call. Over HTTP, request validation normally rejects such a question first (§13).
 
 ---
 
@@ -1085,6 +1154,33 @@ Rules:
 
 No model-provided filename, page, provider, UUID, tool name, or freshness metadata is trusted.
 
+### Finalize procedure (recorded 2026-09-23, Milestone 4)
+
+`citations.finalize_answer` refines the rules above into this exact order. The `finalize` node runs it and logs the `citation.*` events (§19).
+
+1. **Deduplicate** the model's `citation_ids`, keeping first occurrences.
+2. **Check each label.** A label is *known* only if it exactly equals a key of the citation map: case-sensitive, with no trimming or other normalization, so `d1` and `" D1"` are unknown. Each distinct unknown ID is logged once as `citation.unknown_id`, sanitized (§19).
+3. **Honor the model's flag.** If `insufficient_context=true`, return the fixed insufficient result.
+4. **Build excerpts** for each known label (§15). Drop any citation whose excerpt would be empty. Ingestion never stores a whitespace-only chunk, but the database constraint alone accepts content of only tabs or newlines (PostgreSQL `trim()` strips only spaces), so this stays as a defensive guard. The labels that remain are the **final citation labels**.
+5. **Require a citation.** If no final citation label remains, return insufficient context and log `citation.validation_failed` with reason `no_valid_citations` (rule 5 above).
+6. **Sanitize citation markers** in the answer text:
+   - **Detection.** Every bracketed token matching `\[D[0-9]+\]` is a citation marker, including `[D0]`, `[D01]`, and `[D999]`.
+   - **Keep** a marker only when its label is canonical (`^D[1-9][0-9]*$`) **and** is a final citation label. Unknown, uncited, malformed (`[D0]`), and non-canonical (`[D01]`) markers are removed, even if the non-canonical label was among the returned IDs. Duplicate valid markers all stay.
+   - **Leave alone** anything the detection pattern does not match: `[Q1]`, `[A1]`, other bracketed text, and plain `D9`.
+   - **Clean up only the artifacts a removal creates:**
+     1. A *marker group* is a parenthesis containing only markers separated by `,` or `;`, matching `[ \t]*\(\s*\[D[0-9]+\](?:\s*[,;]\s*\[D[0-9]+\])*\s*\)`. If none of its markers is kept, the whole group and the horizontal whitespace before it are deleted. If some are kept, it becomes that whitespace plus `(` + the kept markers joined by `, ` + `)`. A group whose markers are all kept is unchanged.
+     2. A removed marker outside a group is deleted together with the run of horizontal whitespace before it (`[ \t]*\[D[0-9]+\]`).
+     3. The answer is stripped at both ends.
+
+     For example, `"declined [D9]."` → `"declined."`; `"fell ([D1], [D9])."` → `"fell ([D1])."`; `"[D9] Revenue fell [D1]."` → `"Revenue fell [D1]."`.
+   - **A valid ID without a marker is allowed** and is still cited: `docs/SPEC.md` §10 requires only that `citation_ids` name the IDs actually used, and citations are returned separately from the text.
+7. **Reject a blank answer.** If the answer is blank after step 6, return insufficient context and log `citation.validation_failed` with reason `blank_answer`.
+8. **Build the citations** only from each final label's `RetrievedChunk`: `id`, `source_type="document"`, `document_id`, `chunk_id`, `filename`, `page`, and the application-built `excerpt`. Citations follow the order of the final `citation_ids`.
+
+The insufficient result is the fixed `200` body of §16. It never contains model text. It comes from the no-evidence route (§10.7, no model call) or from steps 3, 5, and 7. An `answered` result therefore always carries at least one final citation.
+
+`docs/SPEC.md` §10 allows either insufficient context or a validation failure for an uncited answer; rule 5 selects insufficient context, and so does step 5.
+
 ---
 
 # 11. LangGraph transitions
@@ -1125,6 +1221,23 @@ build_context:
 There is no edge returning to an earlier node.
 
 Therefore graph topology itself prevents an unbounded tool loop.
+
+### Milestone 4 topology (recorded 2026-09-23)
+
+Milestone 4 compiles the no-tools subset, with seven nodes:
+
+```text
+START -> validate_query -> embed_query -> retrieve -> build_context
+build_context --route_context--> answer -> finalize -> END           (context non-empty)
+                            \--> finalize_insufficient -> END        (context empty)
+```
+
+- `route_context` is the only conditional edge. It uses an explicit `path_map` and logs `graph.route`.
+- `build_context` assigns `D1…Dn` in retrieval order (§8) and builds the citation map.
+- `answer` renders the prompt and makes one `generate_answer` call; the adapter owns the single structured-output retry (§12).
+- An `AppError` raised by a node propagates unchanged through `ainvoke`, and `main.py` maps it (§13). Any other exception also propagates unchanged and is handled by `UnexpectedErrorMiddleware` (§13).
+- The graph is compiled once in the lifespan and has no checkpointer.
+- Milestone 6 replaces the `retrieve -> build_context` edge with `route_tools` as drawn above.
 
 ---
 
@@ -1168,6 +1281,28 @@ Allow at most one immediate structured-output retry/repair using the same eviden
 If it still fails, return `502`.
 
 No general retry loop is introduced.
+
+## Answer-adapter outcomes (recorded 2026-09-23, Milestone 4)
+
+Every answer-model failure surfaces as `AnswerProviderError` (`502 answer_provider_error`, message "The answer model is unavailable or returned an invalid response."). `OpenAIAnswerGenerator.generate_answer(*, instructions, prompt)` classifies the result of each **logical model call** (one `responses.create`, `docs/TECH_BASELINE.md` §3.10) in this order:
+
+| # | Outcome | Detection | Application retry | Result (internal `reason`) |
+|---|---|---|---|---|
+| 1 | SDK or provider exception | `openai.OpenAIError` raised, after the SDK's own transport retries | no | `AnswerProviderError` (`generation.request_failed`) |
+| 2 | Incomplete | `status == "incomplete"`, checked before any parsing | no | `incomplete_max_output_tokens`, `incomplete_content_filter`, or `incomplete_other` |
+| 3 | Unexpected status | any status other than `completed` or `incomplete`, including `None` | no | `unexpected_status` |
+| 4 | Refusal | `completed`, and any `refusal` content part in any message item | no | `refusal` |
+| 5 | Invalid structured output | `completed`, no refusal, and not exactly one usable payload, where a usable payload is an `output_text` part of a message whose `phase` is `None` or `final_answer`. Reasons: `no_output_text`, `multiple_output_text`, `invalid_json` (`json.loads` fails), or `schema_validation` (`GroundedAnswer.model_validate` fails) | **exactly once**, with identical inputs | the retry is classified from row 1 again; a second outcome 5 raises with the second reason |
+| 6 | Valid | `completed`, no refusal, one usable payload that validates | none | returns `GroundedAnswer` (`generation.completed`) |
+
+- An outcome other than 5 on the retry follows its own row; for example, a refusal on the retry raises `refusal` after two logical calls.
+- The adapter never assumes `response.output[0]` is the answer.
+- A refusal is not retried: an explicit refusal would most likely repeat. An incomplete response is not retried with identical inputs: it would most likely truncate again.
+- Refusal text, partial output, the payload, provider bodies, the prompt, and the answer are never logged or returned.
+
+**Logical calls versus HTTP attempts.** Per query there is one query-embedding call and at most **two logical answer-model calls**. Separately, the production SDK setting `max_retries=2` allows up to **three HTTP attempts** per logical call for retryable failures. The worst case is therefore 6 HTTP attempts to `/v1/responses` and 3 to `/v1/embeddings`, each bounded by the 30-second client timeout plus SDK backoff or `Retry-After`. No precise wall-clock bound is promised. Tests that set `max_retries=0` verify logical-call behavior only.
+
+This is the "at most one immediate structured-output retry" allowed above; `docs/SPEC.md` §12.3 and §12.6 permit it. If scope has to be cut, the single retry may be removed, since zero retries is also within "at most one".
 
 ---
 
@@ -1227,7 +1362,7 @@ No partial database rows remain after failed persistence.
 
 ### Error codes (recorded 2026-09-23, Milestone 2)
 
-Every ingestion failure, including request validation, uses the SPEC §12.1 envelope `{"error": {"code", "message"}}`. Messages are fixed per code and never include an exception message, class name, provider body, database detail, key, full checksum, path, or document text. `GET /health` keeps its `{"detail": ...}` shape until Milestone 7.
+Every ingestion failure, including request validation, uses the SPEC §12.1 envelope `{"error": {"code", "message"}}`. Messages are fixed per code (*amended 2026-09-23, Milestone 4: fixed per error class, since `invalid_request` now has three fixed messages; see `POST /v1/query` below*) and never include an exception message, class name, provider body, database detail, key, full checksum, path, or document text. `GET /health` keeps its `{"detail": ...}` shape until Milestone 7.
 
 | Status | `code` | Cause |
 |---|---|---|
@@ -1279,6 +1414,51 @@ Known infrastructure failures:
 - `503` database failure.
 
 Optional MCP/provider failure alone does not produce a 5xx response.
+
+### Request and response details (recorded 2026-09-23, Milestone 4)
+
+- `question` is trimmed, then must be 3–2000 characters.
+- `use_tools` must be a strict JSON boolean: `"true"`, `1`, and other coercible values are rejected.
+- Unknown request fields are rejected.
+- **`use_tools=true` in Milestone 4** is a valid request. It follows the same document path and makes no MCP call. This is compatible with `docs/SPEC.md` §6.3, which defines `use_tools` as a valid boolean, and §5.1, which says the graph *may* call a tool. Milestone 6 adds the tool path.
+- The `200` body contains document citations only, in the order of the final validated `citation_ids`; `page` is `null` for TXT and Markdown sources; `tools_used` is always `[]` until Milestone 6.
+- The insufficient-context body is exactly the fixed body of §16.
+- A query is read-only: it writes no rows, uses no checkpointer, and stores neither the question, the prompt, nor the answer.
+
+### Error mapping (recorded 2026-09-23, Milestone 4)
+
+All errors use the `docs/SPEC.md` §12.1 envelope with a fixed message. No response echoes the submitted input or any exception text. **Messages are fixed per error class**, not per code: several classes may share a code, each with its own fixed message.
+
+| Condition | HTTP | `code` | Message |
+|---|---|---|---|
+| Any FastAPI `RequestValidationError`, on any route (one global handler) | 422 | `invalid_request` | "The request is malformed or failed validation." |
+| A body FastAPI cannot parse into JSON on a route with a declared body field (non-UTF-8 bytes, a `RecursionError` from deep nesting, or any error `Request.json()` raises other than `json.JSONDecodeError`), which FastAPI itself turns into `HTTPException(400, ...)` (one global `StarletteHTTPException` handler, status 400) | 422 | `invalid_request` | "The request is malformed or failed validation." |
+| Graph-boundary question check, `InvalidQueryError` | 422 | `invalid_request` | "The question must be 3 to 2000 characters after trimming." |
+| `/v1/documents` multipart problems | 422 | `invalid_request` | the existing `InvalidRequestError` message, unchanged |
+| Query embedding failure | 502 | `embedding_provider_error` | existing |
+| Answer-model failure (§12), `AnswerProviderError` | 502 | `answer_provider_error` | "The answer model is unavailable or returned an invalid response." |
+| Retrieval database failure | 503 | `database_unavailable` | existing |
+| Any other `Exception`, on any route (`UnexpectedErrorMiddleware`) | 500 | `internal_error` | the `AppError` default, "The request could not be completed." |
+
+**One global `RequestValidationError` handler.** It applies to every route and uses the generic message above; a query-specific message was rejected because the handler is global. `/v1/documents` is unaffected: it declares no FastAPI-validated parameters and reports multipart problems itself through `InvalidRequestError`.
+
+**One global `StarletteHTTPException` handler.** Verified against FastAPI 0.141.1 (`fastapi/routing.py`) and a scratch `TestClient` call on 2026-09-23: for a route with a declared body field, FastAPI calls `await request.json()` itself. A `json.JSONDecodeError` there becomes `RequestValidationError`, but any other exception, including the `UnicodeDecodeError` that `json.loads` raises on a non-UTF-8 body, falls into a bare `except Exception` and is re-raised as `HTTPException(400, "There was an error parsing the body")`. Without a handler, that answers `400 {"detail": "There was an error parsing the body"}`, outside the SPEC envelope; `POST` with `content=b'{"question":"\xff"}'` and `Content-Type: application/json` reproduced it. The handler therefore:
+
+- maps status `400` to the same generic `invalid_request` row as `RequestValidationError`, since both mean FastAPI could not build a valid request;
+- delegates every other status to `fastapi.exception_handlers.http_exception_handler`, so the `{"detail": ...}` shape is unchanged for every other `HTTPException`, including `/health`'s `503` (kept until Milestone 7) and framework `404`/`405` responses. `/v1/documents` catches `StarletteHTTPException` inside its own route body and never lets one reach this handler.
+
+**Unexpected exceptions: `UnexpectedErrorMiddleware`, not an `Exception` handler.** Verified against FastAPI 0.141.1 and Starlette 1.6.0 on 2026-09-23: `FastAPI.build_middleware_stack` orders the stack as `ServerErrorMiddleware`, user middleware, `ExceptionMiddleware`, `AsyncExitStackMiddleware`. Handlers for specific classes (`AppError`, `RequestValidationError`, `StarletteHTTPException`) run in `ExceptionMiddleware`. A handler registered for `Exception` or `500` instead becomes `ServerErrorMiddleware`'s handler, which sends its response and then **always re-raises** (`starlette/middleware/errors.py`), so Uvicorn logs the traceback and `str(exc)`. That would leak the question, prompt, chunk text, model output, or secrets carried in an exception message, so no `Exception` or `500` handler is registered.
+
+Instead `main.py` defines `UnexpectedErrorMiddleware`, a small pure ASGI middleware added once with `app.add_middleware`, which places it inside `ServerErrorMiddleware` and outside `ExceptionMiddleware`:
+
+- **Scope.** Non-HTTP scopes, including `lifespan`, pass through untouched, so a startup `ConfigError` still stops the application.
+- **Request ID.** For each HTTP request it generates `uuid4().hex` and binds it with `bind_request_id` around the downstream call, so every event of the request carries it (§19).
+- **What it catches.** Only an `Exception` escaping the downstream application. Errors with a registered handler never reach it. A `BaseException` that is not an `Exception` (`asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit`) propagates unchanged.
+- **One safe event.** It logs exactly one `http.request.failed` at `ERROR`, with only `request_id`, `status_code=500`, `error_code="internal_error"`, and `error_type` (§19). It never calls `logger.exception`, never passes `exc_info`, and never logs `str(exc)`, `repr(exc)`, traceback text, or provider output.
+- **Response.** If no `http.response.start` has been sent, it sends the fixed `internal_error` envelope with status `500`. If a response has already started, it sends nothing more and returns. No Milestone 4 route streams, so that branch exists only to keep the no-re-raise guarantee.
+- **No re-raise**, in either branch.
+
+It applies to every route, so none of the forbidden data of §19 can reach a log through an unexpected exception.
 
 ---
 
@@ -1406,6 +1586,31 @@ Public form:
 
 Use a bounded excerpt length; the answer model does not write the excerpt.
 
+### Excerpt policy (recorded 2026-09-23, Milestone 4)
+
+`citations.make_excerpt` builds each document excerpt. The excerpt is derived only from the trusted stored chunk, is an **exact substring** of it (no generated ellipsis, no rewriting), is at most `EXCERPT_MAX_CHARS = 400` characters, and is deterministic.
+
+1. **Sentence spans.** Split the chunk into `(start, end)` spans over the original string. A boundary follows `.`, `!`, or `?` when whitespace comes next, and every `\n` is a boundary. Each span is narrowed to exclude surrounding whitespace; empty spans are discarded.
+2. **Query tokens.** Casefold, then take the `[a-z0-9]+` tokens of the question and of the answer. All citation markers `\[D[0-9]+\]` are removed from the answer first, so the excerpt does not depend on marker sanitization (§10.9 step 6).
+3. **Short tokens.** Ignore tokens shorter than 3 characters.
+4. **Score** each span by the number of distinct query tokens it contains, using the same tokenization.
+5. **Best span.** Highest score; ties go to the earliest span.
+6. **Short span.** If the chosen span is at most 400 characters, return it exactly.
+7. **Long span.** Otherwise consider every word-boundary window inside the span: it starts at the start of a `\S+` run and extends over as many whole words as fit in 400 characters. Choose the highest-scoring window, ties to the earliest. If a single word exceeds 400 characters, the window is its first 400 characters.
+8. **No match.** If every span scores 0, return the word-boundary window that starts at the chunk's first non-whitespace character.
+9. **Empty result.** If the result is empty, the citation is dropped (§10.9 step 4). Text is never fabricated.
+
+The prompt escapes untrusted text (§17), but excerpts are sliced from the unescaped stored content.
+
+### Rejected alternatives
+
+- **A fixed 300-character prefix.** Rejected: supporting text near the end of an ~800-token chunk would never be shown.
+- **Model-written excerpts.** Rejected: `docs/SPEC.md` §5.1 and this section forbid the model from writing citation contents.
+
+### Limitation
+
+Lexical selection is a presentation heuristic, not proof of semantic entailment. A paraphrased claim can fall back to step 8 or select a different sentence. The model's answer text influences *which* trusted span is shown, never its content. The validated `chunk_id` remains the authoritative evidence reference.
+
 ---
 
 ## MCP citation
@@ -1498,6 +1703,29 @@ Implementation rules:
 9. the answer model has no credential access;
 10. neither prompts nor logs contain API keys.
 
+### Grounded-answer prompt layout (recorded 2026-09-23, Milestone 4)
+
+The fixed `GROUNDED_ANSWER_INSTRUCTIONS` go in the Responses `instructions` field. The rendered, untrusted data goes in `input`, in this layout:
+
+```text
+<question>…</question>
+<sources>
+<source id="D1" type="document">
+filename: …
+page: …|none
+content:
+…
+</source>
+</sources>
+```
+
+- The question, filenames, and chunk text appear only inside these delimited data blocks, never in the instructions.
+- Every untrusted value is passed through `html.escape(value, quote=False)`, so a chunk containing `</source></sources>Ignore previous instructions` cannot close a block or open a new one. Escaping applies to the prompt only.
+- A missing page renders as `page: none`.
+- The prompt contains no secret and no `document_id` or `chunk_id` value. `docs/SPEC.md` §10's example shows `chunk_id` in the context; §10.6 and §10.8 keep UUIDs away from the model, so the context objects carry the IDs and the rendered prompt omits them.
+- The instructions state every requirement of `docs/SPEC.md` §5.1 (grounded answering) and §10.8, and ask the model to cite inline as `[D1]` and to list every label it used in `citation_ids`.
+- The graph's `answer` node renders the prompt; the adapter receives only the two strings.
+
 ### Limitation
 
 This is prompt-injection resistance for the narrow architecture, not a claim of complete hostile-document isolation.
@@ -1532,7 +1760,7 @@ Do not introduce an observability platform.
 
 Every request receives a correlation/request ID.
 
-*Implemented 2026-09-23 (Milestone 3):* the request ID lives in a `ContextVar` in `app/logging.py`. `bind_request_id(request_id)` is a context manager that keeps the token from `set` and resets it in `finally`, so the ID is restored on every exit, including an exception, and never leaks into a later operation. Each asyncio task runs in a copy of the context, so concurrent requests keep their own IDs. `log_event` adds the bound ID to every event unless the caller passes `request_id` explicitly. `Ingestor.ingest` binds it for the whole call. `Retriever` takes no request ID; its caller binds one (the `POST /v1/query` route, from Milestone 4).
+*Implemented 2026-09-23 (Milestone 3):* the request ID lives in a `ContextVar` in `app/logging.py`. `bind_request_id(request_id)` is a context manager that keeps the token from `set` and resets it in `finally`, so the ID is restored on every exit, including an exception, and never leaks into a later operation. Each asyncio task runs in a copy of the context, so concurrent requests keep their own IDs. `log_event` adds the bound ID to every event unless the caller passes `request_id` explicitly. `Ingestor.ingest` binds it for the whole call. `Retriever` takes no request ID; its caller binds one. *(Amended 2026-09-23, Milestone 4: the caller is `UnexpectedErrorMiddleware`, which binds a fresh `uuid4().hex` for every HTTP request around the whole downstream call, not the `POST /v1/query` route; §13. `Ingestor.ingest` still binds its own ID for its `ingestion.*` events until Milestone 7 unifies the two.)*
 
 Log only metadata necessary to diagnose flow.
 
@@ -1681,6 +1909,39 @@ returned_id
 known_context_count
 ```
 
+## Milestone 4 events and forbidden content (recorded 2026-09-23)
+
+Every event below carries the `request_id` bound by `UnexpectedErrorMiddleware` (§13); the ID is not returned to the client. Fields marked † are new to the lists above; the `generation.*` events are new adapter events.
+
+| Event | Fields |
+|---|---|
+| `graph.started` | `use_tools` |
+| `graph.node.started` | `node` |
+| `graph.node.completed` | `node`, `duration_ms` |
+| `graph.route` | `node`, `route`, `context_count`† |
+| `graph.completed` | `status`, `citation_count`†, `duration_ms` |
+| `graph.failed` | `node`, `error_code`, `error_type`†, `duration_ms` |
+| `citation.unknown_id` | `returned_id`, `malformed`†, `known_context_count` |
+| `citation.validation_failed` | `reason`† (`no_valid_citations` or `blank_answer`), `known_context_count`, `returned_count`† |
+| `generation.completed` | `attempt`, `input_tokens`, `output_tokens`, `duration_ms` |
+| `generation.request_failed` | `attempt`, `error_type`, `status_code` |
+| `generation.invalid_output` | `attempt`, `reason` (§12), `will_retry` |
+| `http.request.failed` | `status_code` (`500`), `error_code` (`internal_error`), `error_type` |
+
+- A wrapper applied in `build_query_graph` emits `graph.node.started` and `graph.node.completed` for every node. When a node raises, it emits `graph.failed` once and re-raises. Its `error_code` is the `AppError` code, or `internal_error` for any other exception. `run_query` emits `graph.started` and `graph.completed`.
+- **`http.request.failed` is emitted early, in Milestone 4, for unexpected exceptions only**, by `UnexpectedErrorMiddleware`. `http.request.started`, `http.request.completed`, and `http.request.failed` for other failures remain Milestone 7 work.
+- **`error_type` in `graph.failed` and `http.request.failed`** is `app.errors.classify_error(exc)`, a closed `ErrorType` literal: `app_error` for an `AppError` (only `graph.failed` can see one), `validation_error` for a `pydantic.ValidationError`, and `unexpected_error` for any other `Exception`. It is never built from `str(exc)`, `repr(exc)`, the exception's class name, traceback text, or provider output. `generation.request_failed` keeps its adapter-owned `error_type`, as `embedding.request_failed` does.
+- **Returned-ID sanitization.** `returned_id` is logged verbatim only when it matches `^[A-Za-z][0-9]{1,4}$`. Otherwise the event logs `returned_id: null` and `malformed: true`, so a model cannot inject arbitrary text into a log through a citation ID.
+
+**Never logged, and never returned in an error:**
+
+- the question, chunk text, or document text;
+- the rendered prompt or the instructions;
+- the model answer, its raw output, refusal text, partial output, or the payload;
+- embeddings;
+- the API key or the `Authorization` header;
+- connection strings, provider bodies, and exception messages.
+
 ---
 
 # 20. Testing boundaries
@@ -1826,6 +2087,7 @@ Keep dependencies pointing inward toward application behavior:
 ```text
 FastAPI
   -> ingestion / compiled graph
+  -> retrieval                     (Milestone 4: the lifespan constructs the Retriever)
 
 ingestion
   -> OpenAI embedding adapter
@@ -1835,6 +2097,17 @@ graph
   -> retrieval
   -> OpenAI structured-generation adapter
   -> MCP client
+  -> citations, prompts            (Milestone 4)
+
+prompts
+  -> citations (ContextItem)       (Milestone 4)
+  -> retrieval types
+
+citations
+  -> retrieval types               (Milestone 4)
+
+errors
+  -> Pydantic (ValidationError)    (Milestone 4, for classify_error)
 
 retrieval
   -> OpenAI embedding adapter
@@ -1846,6 +2119,8 @@ db
 MCP server
   -> market-data provider adapter
 ```
+
+*Recorded 2026-09-23 (Milestone 4):* `main` also depends on `retrieval` directly, because the lifespan now constructs the `Retriever` itself; `FastAPI -> compiled graph` did not previously cover that edge for `main`. The shared `config`, `errors`, and `logging` edges of the composition root stay implied by `FastAPI -> ingestion / compiled graph`, as they already are for `schemas`, `tokenizer`, and `db`. `citations` never imports `prompts`, and neither imports `graph`, `openai_provider`, or `main`. `config` imports only the standard library.
 
 `db.py`, provider adapters, and MCP code must not import FastAPI route objects.
 
