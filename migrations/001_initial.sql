@@ -10,10 +10,14 @@ CREATE TABLE IF NOT EXISTS documents (
     id uuid PRIMARY KEY,
     filename text NOT NULL,
     content_type text NOT NULL,
-    sha256 char(64) NOT NULL UNIQUE,
+    sha256 char(64) NOT NULL,
     page_count integer,
     chunk_count integer NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
+    -- Named explicitly because app/db.py recognizes duplicate uploads by this
+    -- name. It is the name PostgreSQL generated for the earlier inline UNIQUE,
+    -- so databases created from the previous version of this file match it.
+    CONSTRAINT documents_sha256_key UNIQUE (sha256),
     CONSTRAINT documents_chunk_count_non_negative
         CHECK (chunk_count >= 0),
     CONSTRAINT documents_page_count_positive

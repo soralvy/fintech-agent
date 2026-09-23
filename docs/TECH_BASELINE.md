@@ -27,10 +27,12 @@ Use the following baseline:
 - pgvector PostgreSQL extension `0.8.6`
 - Psycopg `3.3.5`, using the binary and pool extras
 - pgvector Python adapter `0.5.0`
-- MCP Python SDK `2.0.0`
+- MCP Python SDK `2.2.0` (the pin in `pyproject.toml`; corrected 2026-09-23, §3.9)
 - OpenAI Python SDK `3.14.1`
 - OpenAI answer/planning model `gpt-5.6-luna`
 - OpenAI embedding model `text-embedding-3-small`, fixed at `1536` dimensions
+- pypdf `6.19.0` (added 2026-09-23, §3.14)
+- tiktoken `0.14.0`, encoding `cl100k_base` (added 2026-09-23, §3.15)
 - pytest `9.1.1`
 
 Direct application dependencies should initially be pinned to these versions. `uv.lock` becomes the authoritative record of the complete resolved dependency graph once generated.
@@ -127,6 +129,13 @@ This directly supports the spec's synchronous ingestion HTTP endpoint and recomm
 Do not implement application lifecycle using the older `startup` / `shutdown` event-handler API. FastAPI documents lifespan handlers as the recommended approach and the alternative event-handler mechanism as deprecated.
 
 File uploads require multipart parsing support. `python-multipart` therefore needs to be present when the ingestion endpoint is implemented; its exact resolved version should be recorded by `uv.lock`.
+
+**Amended 2026-09-23 (Milestone 2).** `python-multipart` is supplied by `fastapi[standard]`, and `uv.lock` resolves it to `0.0.32`. It is not a separate direct dependency. `POST /v1/documents` does not declare an `UploadFile` parameter. It parses the body with `Request.form(max_files=1, max_fields=0)`, which still yields Starlette `UploadFile` objects, for two reasons:
+
+- A declared parameter makes FastAPI parse the whole body before any application check. Parsing in the handler lets the route reject an oversized `Content-Length` first.
+- Validation errors would otherwise use FastAPI's `detail` shape instead of the SPEC §12.1 envelope.
+
+Starlette converts too-many-files and too-many-fields into a 400 `HTTPException`, but lets `python_multipart.exceptions.FormParserError` escape on a malformed body. The route catches both and maps them to `422 invalid_request`. That makes `app/main.py` import `python_multipart` directly.
 
 When HTTP tests need application startup/shutdown behavior, instantiate `TestClient` as a context manager so lifespan executes.
 
@@ -297,7 +306,9 @@ Vector type registration must occur for every usable pooled connection, not just
 
 ## 3.9 Python MCP SDK
 
-**Selected version:** `mcp==2.0.0`
+**Selected version:** `mcp==2.2.0`
+
+**Corrected 2026-09-23.** This section previously named `2.0.0`, but `pyproject.toml` has pinned `mcp==2.2.0` since the dependency set was first committed, and `uv.lock` and the installed package both resolve `2.2.0`. The version is now correct. The API notes below were written against the v2 line in general. They have **not** yet been checked against the installed 2.2.0 package or exercised by any implementation. Milestone 5 re-verifies them against 2.2.0 before any MCP code is written (`docs/TASKS.md` Milestone 5, first task), and records any difference here.
 
 **Official documentation:**
 
@@ -329,7 +340,7 @@ This supports exactly the two read-only tools and bounded one-tool path specifie
 
 **Compatibility and migration notes:**
 
-MCP Python SDK v2 became the stable major line in July 2026. Version 2.0.0 is deliberately pinned because this is a recently stabilized major API.
+MCP Python SDK v2 became the stable major line in July 2026. An exact version (`2.2.0`) is deliberately pinned because this is a recently stabilized major API.
 
 Use v2 documentation and APIs. In particular, do not copy v1 examples built around:
 
@@ -420,6 +431,8 @@ The model's default embedding length is 1536, matching the approved `vector(1536
 **Compatibility and data-model notes:**
 
 Embedding identity and dimensions are persistence-level compatibility decisions, not interchangeable runtime configuration.
+
+*Enforced 2026-09-23:* `app/config.py` pins the model in one constant, `PINNED_EMBEDDING_MODEL`. An unset or blank `OPENAI_EMBEDDING_MODEL` resolves to it, and any other explicit value stops startup before any resource is created, exactly as a dimension other than 1536 does. The check matters because a different model can still return 1536 dimensions: `text-embedding-3-large` accepts `dimensions=1536`, and its vectors would pass every dimension check while lying in a different embedding space. No model is recorded per row, so the pin is what keeps stored and query vectors comparable.
 
 Changing either the model or vector dimensions after documents have been ingested requires deliberate migration/re-embedding. Do not permit ingestion with one embedding configuration and retrieval with another.
 
@@ -528,6 +541,90 @@ Both reinforce two design rules: thresholds must be tuned per question type on p
 
 ---
 
+## 3.14 pypdf — PDF text extraction
+
+**Added 2026-09-23 for Milestone 2.** This fills the "one page-oriented text PDF parser pinned during repository setup" that `docs/DECISIONS.md` §7.3 required but no earlier milestone pinned.
+
+**Selected version:** `pypdf==6.19.0`
+
+**Official sources:**
+
+- [pypdf documentation](https://pypdf.readthedocs.io/en/latest/)
+- [pypdf source repository](https://github.com/py-pdf/pypdf)
+- [pypdf on PyPI](https://pypi.org/project/pypdf/6.19.0/)
+
+**Purpose:** extract text from text-based PDFs page by page, so each chunk keeps a truthful one-based page number.
+
+**API/features used:**
+
+- `PdfReader` over an in-memory `io.BytesIO`, with the default non-strict parsing;
+- `PdfReader.is_encrypted`, so encrypted files are rejected rather than decrypted;
+- `PdfReader.pages` and `PageObject.extract_text()` for per-page text;
+- `pypdf.errors.PyPdfError` as the library's error base. pypdf also lets built-in errors escape on malformed input, so ingestion maps a fixed set of both to `400 unparseable_document`.
+
+**Compatibility notes:**
+
+- Pure-Python wheel (`py3-none-any`), `Requires-Python >=3.9`, with a Python 3.12 classifier. Installed and exercised under Python 3.12.14.
+- It adds no required transitive dependency on Python 3.12: `typing_extensions` is required only below 3.11.
+- No optional extra is installed. `cryptography`/`PyCryptodome` (decryption), `Pillow` (images) and `fonttools` are not needed, because encrypted PDFs are rejected and no OCR or image extraction is in scope.
+- The package ships `py.typed`, so it is checked under mypy `strict`.
+
+**Not used:** writing PDFs in application code, OCR, image extraction, decryption. Tests build their PDF fixtures as raw bytes rather than through pypdf's writer.
+
+**Verified:** 2026-09-23. The version was resolved and installed by `uv add pypdf==6.19.0`. The API was confirmed by introspecting the installed package and by the ingestion tests.
+
+---
+
+## 3.15 tiktoken — token counting for chunk windows
+
+**Added 2026-09-23 for Milestone 2.** This fills the "one deterministic tokenizer matching the OpenAI-compatible tokenization" required by `docs/DECISIONS.md` §7.5.
+
+**Selected version:** `tiktoken==0.14.0`
+
+**Official sources:**
+
+- [tiktoken source repository (OpenAI)](https://github.com/openai/tiktoken)
+- [tiktoken on PyPI](https://pypi.org/project/tiktoken/0.14.0/)
+
+**Purpose:** measure and cut ~800-token chunk windows with ~120-token overlap, using the `cl100k_base` encoding of `text-embedding-3-small` (§3.11).
+
+**API/features used:**
+
+- `tiktoken.get_encoding("cl100k_base")`, called lazily on the first ingestion and never at startup;
+- `Encoding.encode_ordinary`, so special-token text such as `<|endoftext|>` inside an upload is encoded as plain text instead of raising;
+- `Encoding.decode_bytes`, decoded as UTF-8 ignoring errors, so a window edge that falls inside a multi-byte character drops that partial character instead of inserting U+FFFD.
+
+**Operational behavior: encoding data.** The encoding's BPE ranks are not in the wheel. On first use, tiktoken reads them from its cache: `TIKTOKEN_CACHE_DIR`, else `DATA_GYM_CACHE_DIR`, else `<system temp>/data-gym-cache`. On a cache miss it downloads the file once from `openaipublic.blob.core.windows.net`, verifies it against a SHA-256 pinned inside tiktoken, and writes it to the cache. So:
+
+- The application starts without the file and without network access. The first ingestion on a machine with an empty cache needs outbound HTTPS.
+- If the load fails, for example no network, an unwritable cache, or a hash mismatch, the request returns `503 tokenizer_unavailable` and writes no rows. The next ingestion retries the load. Only the exception type is logged, never the path or response.
+- For offline or locked-down deployments, pre-populate the cache and point `TIKTOKEN_CACHE_DIR` at it. The BPE file is deliberately not vendored into this repository.
+- Automated tests never load the encoding. Ingestion depends on a `Tokenizer` protocol, tests inject a deterministic fake, and `tests/conftest.py` replaces `tiktoken.get_encoding` for every test so that any accidental load fails instead of downloading.
+
+**Compatibility notes:**
+
+- Installed as the `cp312-cp312-macosx_11_0_arm64` wheel, `Requires-Python >=3.9`. The package metadata carries no per-version classifiers. Python 3.12 compatibility is established by the published cp312 wheel being installed, imported, and type-checked under Python 3.12.14.
+- It brings two transitive dependencies, both now in `uv.lock`: `regex` (newly added, `2026.9.10`) and `requests` (already present). `requests` is what performs the one-time encoding download.
+- The package ships `py.typed`.
+
+**Not used:** the `blobfile` extra, `encoding_for_model` (the encoding is named explicitly), and any other encoding.
+
+**Verified:** 2026-09-23. The version was resolved and installed by `uv add tiktoken==0.14.0`. The load path, cache lookup, and hash check were read from the installed `tiktoken/load.py`. At verification time the `cl100k_base` file was not yet in the local cache. It was downloaded, hash-verified, and cached during the Milestone 2 manual smoke test (`docs/TASKS.md` Milestone 2), which recorded its size on disk.
+
+*Amended 2026-09-23:* tiktoken's own loader has no HTTP timeout. `TiktokenTokenizer.ensure_ready` bounds it with `asyncio.wait_for` around `asyncio.to_thread`, and `Ingestor` awaits it before chunking, so a stalled download cannot block the event loop (`docs/DECISIONS.md` §7.5).
+
+---
+
+## 3.16 Ruff and mypy — static gates (development only)
+
+**Recorded 2026-09-23.** Development dependencies: `ruff==0.16.7`, `mypy==2.3.1`.
+
+- Ruff runs its default rule set plus the stable families that `[tool.ruff.lint] extend-select` in `pyproject.toml` lists: `ASYNC` (blocking calls inside `async` code), `B` (bugbear), and the complexity checks `C901`, `PLR0911`, `PLR0912`, and `PLR0915`. Each runs at Ruff's default threshold; `pyproject.toml` is the only place the list lives. No preview rules, no per-file ignores, and no raised thresholds. At adoption, application and test code passed with no suppression.
+- mypy runs `strict = true` over the `[tool.mypy] files` setting (`app`, `tests`, `scripts`). The canonical gate invokes a bare `uv run mypy`, so adding a package to that setting is the only change needed to type-check it.
+- Both run inside `scripts/verify.py`, the single full gate (`CLAUDE.md`).
+
+---
+
 # 4. Compatibility result
 
 The selected stack is compatible with the approved MVP:
@@ -540,6 +637,7 @@ The selected stack is compatible with the approved MVP:
 - LangGraph provides the explicit conditional `StateGraph` required without requiring an agent loop or persistence layer.
 - OpenAI's current Responses API supports schema-constrained structured output needed for the grounded-answer and tool-plan contracts.
 - FastAPI lifespan can own the asynchronous PostgreSQL, OpenAI, and MCP resources.
+- pypdf 6.19.0 and tiktoken 0.14.0 install and type-check under Python 3.12 (§3.14, §3.15).
 
 No architectural workaround or additional subsystem is required.
 
@@ -638,7 +736,7 @@ This stack satisfies the required technical demonstration without expanding the 
 
 The most version-sensitive decisions for implementation are:
 
-- MCP Python SDK **v2.0.0**, using the v2 `MCPServer`/`Client` APIs rather than v1 examples;
+- MCP Python SDK **v2.2.0**, using the v2 `MCPServer`/`Client` APIs rather than v1 examples (to be re-verified against 2.2.0 in Milestone 5);
 - LangGraph **1.2.11**, using an explicit `StateGraph`;
 - OpenAI Python **3.14.1**, using the Responses API and Structured Outputs;
 - pgvector extension **0.8.6** with exact cosine search;

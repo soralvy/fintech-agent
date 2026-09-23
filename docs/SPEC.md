@@ -957,6 +957,8 @@ The optional post-baseline decision layer has its own configuration, listed in ย
 
 Secrets must not have hard-coded defaults.
 
+`OPENAI_EMBEDDING_MODEL` and `OPENAI_EMBEDDING_DIMENSIONS` describe stored vectors, not tunables. The MVP supports exactly `text-embedding-3-small` at 1536 dimensions. Unset or blank values resolve to those, and any other value fails startup (*recorded 2026-09-23*; `docs/TECH_BASELINE.md` ยง3.11).
+
 Tests should replace external clients with deterministic fakes and therefore must not require real API keys.
 
 ---

@@ -1,8 +1,16 @@
 """PostgreSQL access: pool lifecycle, pgvector registration, and repository functions.
 
-This module owns SQL and nothing else. It makes no business decisions and must
-never import FastAPI route objects, so ingestion and retrieval stay runnable in
-tests without an HTTP server (docs/DECISIONS.md section 21).
+This module owns SQL and the database boundary: it is the only module that
+imports psycopg, knows constraint names, or translates driver errors. It makes
+no business decisions and must never import FastAPI route objects, so ingestion
+and retrieval stay runnable in tests without an HTTP server (docs/DECISIONS.md
+section 21).
+
+Callers borrow connections through ``pooled_connection`` or
+``pooled_transaction``, which turn any driver or pool failure into
+``DatabaseUnavailableError``. The driver's message can carry the connection
+string, so it is never kept (docs/SPEC.md section 13). The one database outcome
+callers act on is a checksum duplicate, surfaced as ``DuplicateChecksumError``.
 
 All statements use bound parameters. Vectors bind through ``pgvector.Vector``;
 every pooled connection registers the pgvector types in the pool's configure
@@ -11,12 +19,15 @@ hook (docs/DECISIONS.md section 6).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
+import psycopg
+import psycopg.errors
 from pgvector import Vector
 from pgvector.psycopg import register_vector_async
 from psycopg import AsyncConnection
@@ -24,11 +35,17 @@ from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool
 
 from app.config import DatabaseConfig
+from app.errors import DatabaseUnavailableError
 
 type Connection = AsyncConnection[TupleRow]
 type Pool = AsyncConnectionPool[Connection]
 
 EMBEDDING_DIMENSIONS = 1536
+
+# Named explicitly in migrations/001_initial.sql; the name matches what
+# PostgreSQL generated for the earlier unnamed constraint, so existing
+# databases need no change.
+SHA256_CONSTRAINT = "documents_sha256_key"
 
 MIGRATION_PATH = (
     Path(__file__).resolve().parent.parent / "migrations" / "001_initial.sql"
@@ -94,6 +111,14 @@ class EmbeddingDimensionError(ValueError):
     """An embedding did not have exactly ``EMBEDDING_DIMENSIONS`` dimensions."""
 
 
+class DuplicateChecksumError(Exception):
+    """A document with this SHA-256 already exists.
+
+    The ``documents.sha256`` unique constraint, not a preliminary lookup, is
+    the authority on duplicates (docs/DECISIONS.md section 6).
+    """
+
+
 def _to_vector(embedding: Sequence[float]) -> Vector:
     """Convert an embedding to a bindable pgvector value.
 
@@ -145,9 +170,48 @@ async def apply_migration(conn: Connection) -> None:
     await conn.execute(sql.encode("utf-8"))
 
 
+@asynccontextmanager
+async def pooled_connection(pool: Pool) -> AsyncIterator[Connection]:
+    """Borrow a pooled connection for reads outside an explicit transaction.
+
+    Raises:
+        DatabaseUnavailableError: acquiring the connection or any statement run
+            on it failed at the driver or pool level.
+    """
+    try:
+        async with pool.connection() as conn:
+            yield conn
+    except psycopg.Error:
+        raise DatabaseUnavailableError from None
+
+
+@asynccontextmanager
+async def pooled_transaction(pool: Pool) -> AsyncIterator[Connection]:
+    """Borrow a pooled connection and run the block in one transaction.
+
+    The transaction commits when the block exits normally and rolls back on
+    any exception, so a failure leaves no partial rows.
+
+    Raises:
+        DuplicateChecksumError: ``insert_document`` hit the checksum constraint.
+            It passes through unchanged after the rollback.
+        DatabaseUnavailableError: any other driver or pool failure, including
+            every other constraint violation.
+    """
+    try:
+        async with pool.connection() as conn, conn.transaction():
+            yield conn
+    except psycopg.Error:
+        raise DatabaseUnavailableError from None
+
+
 async def check_database(pool: Pool) -> None:
-    """Run the health query. Raises ``psycopg.Error`` if the database is unreachable."""
-    async with pool.connection() as conn:
+    """Run the health query.
+
+    Raises:
+        DatabaseUnavailableError: the database is unreachable.
+    """
+    async with pooled_connection(pool) as conn:
         await conn.execute("SELECT 1")
 
 
@@ -155,25 +219,30 @@ async def insert_document(conn: Connection, document: NewDocument) -> None:
     """Insert one document row.
 
     Raises:
-        psycopg.errors.UniqueViolation: a document with this checksum exists.
-            The unique constraint, not the preliminary lookup, is the authority
-            on duplicates (docs/DECISIONS.md section 6).
+        DuplicateChecksumError: a document with this checksum exists. Any other
+            constraint violation stays a driver error, which the enclosing
+            ``pooled_transaction`` reports as the database being unavailable.
     """
-    await conn.execute(
-        """
-        INSERT INTO documents
-            (id, filename, content_type, sha256, page_count, chunk_count)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        (
-            document.id,
-            document.filename,
-            document.content_type,
-            document.sha256,
-            document.page_count,
-            document.chunk_count,
-        ),
-    )
+    try:
+        await conn.execute(
+            """
+            INSERT INTO documents
+                (id, filename, content_type, sha256, page_count, chunk_count)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                document.id,
+                document.filename,
+                document.content_type,
+                document.sha256,
+                document.page_count,
+                document.chunk_count,
+            ),
+        )
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name != SHA256_CONSTRAINT:
+            raise
+        raise DuplicateChecksumError from None
 
 
 async def find_document_by_sha256(
@@ -238,7 +307,9 @@ async def search_chunks_by_embedding(
     """Return the ``limit`` nearest chunks by exact cosine distance.
 
     Exact search, no ANN index: the corpus is deliberately small
-    (docs/SPEC.md section 8.2).
+    (docs/SPEC.md section 8.2). Equal distances are ordered by
+    ``(document_id, chunk_index)``, the stored unique key, so the result order
+    is fully defined and request-local citation labels are deterministic.
     """
     query_vector = _to_vector(embedding)
     cursor = await conn.execute(
@@ -251,10 +322,10 @@ async def search_chunks_by_embedding(
                c.embedding <=> %s AS cosine_distance
         FROM document_chunks AS c
         JOIN documents AS d ON d.id = c.document_id
-        ORDER BY c.embedding <=> %s
+        ORDER BY cosine_distance, c.document_id, c.chunk_index
         LIMIT %s
         """,
-        (query_vector, query_vector, limit),
+        (query_vector, limit),
     )
     rows = await cursor.fetchall()
     return [
