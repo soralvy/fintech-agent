@@ -472,10 +472,14 @@ def test_tokenizer_failure_is_503_without_details(
     events = [
         json.loads(r.getMessage()) for r in caplog.records if r.name.startswith("app.")
     ]
+    (started,) = [e for e in events if e["event"] == "ingestion.started"]
+    # The adapter passes no request ID; the ingestion-scoped binding adds it,
+    # even though the load ran in a worker thread.
     assert {
         "event": "tokenizer.load_failed",
         "encoding": "cl100k_base",
         "error_type": "OSError",
+        "request_id": started["request_id"],
     } in events
     assert any(
         e["event"] == "ingestion.failed" and e["error_code"] == "tokenizer_unavailable"

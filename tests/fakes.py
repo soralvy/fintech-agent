@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
+import re
 from collections.abc import Sequence
 
 from app.errors import AppError
@@ -64,6 +66,82 @@ class FakeEmbedder:
 def _stable_index(text: str) -> int:
     digest = hashlib.sha256(text.encode("utf-8")).digest()
     return int.from_bytes(digest[:4], "big")
+
+
+# Common question words that would otherwise make unrelated texts look similar.
+KEYWORD_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "by",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "s",
+        "the",
+        "to",
+        "was",
+        "were",
+        "what",
+        "when",
+        "which",
+        "who",
+        "why",
+        "with",
+    }
+)
+
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+class KeywordEmbedder:
+    """A bag-of-words embedder, so a question lands near the chunk it is about.
+
+    Each lower-cased word outside ``KEYWORD_STOPWORDS`` adds one to the
+    dimension its BLAKE2b digest selects, and the vector is then normalized.
+    The digest, unlike ``hash()``, is not salted per process, so the same text
+    gives the same vector in every process and on every machine. Text with no
+    counted words gives the zero vector, which pgvector's cosine distance turns
+    into NaN.
+    """
+
+    def __init__(self, *, dimensions: int = EMBEDDING_DIMENSIONS) -> None:
+        self.dimensions = dimensions
+        self.calls: list[list[str]] = []
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        return [self.vector(text) for text in texts]
+
+    def vector(self, text: str) -> list[float]:
+        values = [0.0] * self.dimensions
+        for word in _WORD.findall(text.casefold()):
+            if word not in KEYWORD_STOPWORDS:
+                values[keyword_dimension(word, self.dimensions)] += 1.0
+        norm = math.sqrt(sum(value * value for value in values))
+        if norm == 0.0:
+            return values
+        return [value / norm for value in values]
+
+
+def keyword_dimension(word: str, dimensions: int = EMBEDDING_DIMENSIONS) -> int:
+    """The dimension ``KeywordEmbedder`` assigns to ``word``."""
+    digest = hashlib.blake2b(word.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % dimensions
 
 
 class FakeUpload:

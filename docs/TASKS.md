@@ -137,7 +137,8 @@ The Milestone 2 architecture audit found these gaps and deliberately deferred th
 
 | Deferred change | Do it at |
 |---|---|
-| Request-ID `ContextVar` in `app/logging.py`, so adapter events carry `request_id` without threading it through every signature; list the adapter events (`embedding.*`, `tokenizer.load_failed`) in `docs/DECISIONS.md` §19 | The first Milestone 3 `retrieval.*` event; no later than Milestone 4 |
+| ~~Request-ID `ContextVar` in `app/logging.py`, so adapter events carry `request_id` without threading it through every signature; list the adapter events (`embedding.*`, `tokenizer.load_failed`) in `docs/DECISIONS.md` §19~~ | **Done in Milestone 3** (2026-09-23; `docs/DECISIONS.md` §19) |
+| Build `RetrievalConfig` in the lifespan, so an invalid `RETRIEVAL_TOP_K` or `MIN_RETRIEVAL_SIMILARITY` stops startup. *Added 2026-09-23 by Milestone 3.* Until then these variables are validated only where `RetrievalConfig` is constructed, **not** at application startup | Milestone 4, when `POST /v1/query` first uses retrieval |
 | Catch-all `internal_error` envelope, and a `RequestValidationError` handler that keeps JSON-body validation in the SPEC §12.1 envelope | Milestone 4, with `POST /v1/query` |
 | Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change | Milestone 4 |
 | `contextlib.AsyncExitStack` in the lifespan | Milestone 5, when the MCP client becomes the third lifespan resource |
@@ -150,14 +151,33 @@ The Milestone 2 architecture audit found these gaps and deliberately deferred th
 
 Target: ~1 hour.
 
-- [ ] Implement query embedding.
-- [ ] Implement top-6 cosine retrieval.
-- [ ] Return content plus trusted document/chunk/page metadata internally.
-- [ ] Implement configurable weak-result filtering.
-- [ ] Add retrieval tests against deterministic PostgreSQL vectors.
-- [ ] Verify no ANN index is required for the demo corpus.
+- [x] Implement query embedding.
+- [x] Implement top-6 cosine retrieval.
+- [x] Return content plus trusted document/chunk/page metadata internally.
+- [x] Implement configurable weak-result filtering.
+- [x] Add retrieval tests against deterministic PostgreSQL vectors.
+- [x] Verify no ANN index is required for the demo corpus.
 
 **Exit condition:** a known fixture question retrieves the intended fixture chunk.
+
+**Verified 2026-09-23.** The exit condition is met: `test_fixture_question_retrieves_the_intended_chunk` ingests three fixture documents (`tests/fixtures/smoke.txt`, a Markdown file, and a two-page PDF) through the real `Ingestor` into PostgreSQL, and "Why did Acme's European revenue decline?" retrieves exactly the `smoke.txt` chunk at the default 0.30 threshold. The related Acme liquidity chunk scores below it and is discarded.
+
+Embeddings come from `KeywordEmbedder` (`tests/fakes.py`), a bag-of-words fake whose word-to-dimension map uses BLAKE2b, not the per-process-salted `hash()`. Tests pin three of its dimensions and compare its output across subprocesses with different `PYTHONHASHSEED` values. No OpenAI call was made and no real key was used; the approved scope skipped a real-provider retrieval check.
+
+Automated verification:
+
+- `DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py`: exit 0.
+  - `uv lock --check`: passed.
+  - `uv run ruff format --check .`: 39 files already formatted.
+  - `uv run ruff check .`: passed.
+  - `uv run mypy` (strict; `app`, `tests`, `scripts`): no issues in 28 source files.
+  - `uv run pytest`: 225 passed, 0 skipped.
+- Without `TEST_DATABASE_URL`, `uv run pytest` reports 163 passed and 62 skipped, so 62 tests need PostgreSQL and every one of them ran in the gate.
+- `git diff --check`: passed. The new, untracked files were checked separately for trailing whitespace and a final newline.
+
+ANN measurement: see `docs/DECISIONS.md` §8. With 2,000 random 1536-dimension chunks, exact search is a sequential scan plus top-N heapsort at about 5 ms.
+
+No live HTTP smoke test was run, and none is required: this milestone changes no route, the lifespan, the migration, or `db.py` (CLAUDE.md). `app/ingestion.py` changed only to propagate `request_id` into its existing logging, through `bind_request_id`. No HTTP contract, route, lifespan wiring, or externally observable ingestion behavior changed, so no additional live HTTP smoke test was required. `RetrievalConfig` is **not** validated at startup yet; see the deferral table above.
 
 ---
 

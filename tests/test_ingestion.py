@@ -52,6 +52,7 @@ from app.ingestion import (
     read_bounded,
     resolve_file_kind,
 )
+from app.logging import current_request_id, log_event
 from app.tokenizer import TiktokenTokenizer, Tokenizer
 from tests.fakes import FakeEmbedder, FakeTokenizer, FakeUpload, build_pdf
 
@@ -726,3 +727,36 @@ async def test_logs_carry_safe_fields_only(
     for record in caplog.records:
         fields: dict[str, object] = getattr(record, "event_fields", {})
         assert all(not isinstance(v, list | dict | bytes) for v in fields.values())
+
+
+class _LoggingFailingEmbedder:
+    """Logs the way ``OpenAIEmbedder`` does on failure: no ``request_id`` passed."""
+
+    async def embed(self, texts: object) -> list[list[float]]:
+        log_event(logging.getLogger("app.openai_provider"), "embedding.request_failed")
+        raise EmbeddingProviderError
+
+
+@pytest.mark.anyio
+async def test_adapter_events_carry_the_request_id_without_leaking_it(
+    pool: Pool, db: Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    ingestor = Ingestor(
+        pool=pool,
+        embedder=_LoggingFailingEmbedder(),
+        tokenizer=FakeTokenizer(),
+        config=IngestionConfig(),
+    )
+
+    with pytest.raises(EmbeddingProviderError):
+        await ingestor.ingest(
+            FakeUpload("a.txt", "text/plain", b"Some text."), request_id="req-embed"
+        )
+    log_event(logging.getLogger("app.later"), "later.operation")
+
+    events = {event["event"]: event for event in _events(caplog)}
+    assert events["embedding.request_failed"]["request_id"] == "req-embed"
+    assert events["ingestion.failed"]["request_id"] == "req-embed"
+    assert "request_id" not in events["later.operation"]
+    assert current_request_id() is None

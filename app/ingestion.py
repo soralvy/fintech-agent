@@ -51,7 +51,7 @@ from app.errors import (
     UnsupportedMediaTypeError,
     UploadTooLargeError,
 )
-from app.logging import log_event
+from app.logging import bind_request_id, log_event
 from app.openai_provider import Embedder
 from app.tokenizer import Tokenizer
 
@@ -341,31 +341,36 @@ class Ingestor:
         Raises:
             AppError: a controlled failure; no rows were written.
         """
-        started = time.monotonic()
-        filename = normalize_filename(upload.filename)
-        log_event(logger, "ingestion.started", request_id=request_id, filename=filename)
-        try:
-            return await self._ingest(upload, filename, request_id, started)
-        except AppError as exc:
+        # Bound for the whole call so the adapters' own events (``embedding.*``,
+        # ``tokenizer.*``) carry the request ID too.
+        with bind_request_id(request_id):
+            started = time.monotonic()
+            filename = normalize_filename(upload.filename)
             log_event(
-                logger,
-                "ingestion.failed",
-                level=logging.WARNING if exc.status_code < 500 else logging.ERROR,
-                request_id=request_id,
-                error_code=exc.code,
-                duration_ms=_elapsed_ms(started),
+                logger, "ingestion.started", request_id=request_id, filename=filename
             )
-            raise
-        except Exception:
-            log_event(
-                logger,
-                "ingestion.failed",
-                level=logging.ERROR,
-                request_id=request_id,
-                error_code="internal_error",
-                duration_ms=_elapsed_ms(started),
-            )
-            raise
+            try:
+                return await self._ingest(upload, filename, request_id, started)
+            except AppError as exc:
+                log_event(
+                    logger,
+                    "ingestion.failed",
+                    level=logging.WARNING if exc.status_code < 500 else logging.ERROR,
+                    request_id=request_id,
+                    error_code=exc.code,
+                    duration_ms=_elapsed_ms(started),
+                )
+                raise
+            except Exception:
+                log_event(
+                    logger,
+                    "ingestion.failed",
+                    level=logging.ERROR,
+                    request_id=request_id,
+                    error_code="internal_error",
+                    duration_ms=_elapsed_ms(started),
+                )
+                raise
 
     async def _ingest(
         self, upload: Upload, filename: str, request_id: str, started: float

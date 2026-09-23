@@ -1,16 +1,23 @@
 """Integration tests against a real PostgreSQL with pgvector.
 
-These cover the Milestone 1 exit condition: chunks carrying vectors can be
-inserted and the expected nearest vector retrieved.
+These cover the Milestone 1 exit condition (chunks carrying vectors can be
+inserted and the expected nearest vector retrieved) and the Milestone 3 one: a
+known fixture question, embedded by a deterministic keyword fake, retrieves the
+intended fixture chunk through the retrieval service.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 
+from app.config import IngestionConfig, RetrievalConfig
 from app.db import (
     SHA256_CONSTRAINT,
     Connection,
@@ -28,7 +35,11 @@ from app.db import (
     search_chunks_by_embedding,
 )
 from app.errors import DatabaseUnavailableError
+from app.ingestion import Ingestor
+from app.logging import bind_request_id
+from app.retrieval import RetrievedChunk, Retriever
 from tests.conftest import embedding
+from tests.fakes import FakeTokenizer, FakeUpload, KeywordEmbedder, build_pdf
 
 pytestmark = pytest.mark.anyio
 
@@ -391,3 +402,194 @@ async def test_check_database_succeeds_through_a_real_pooled_connection(
 ) -> None:
     """The health query against real PostgreSQL, not the HTTP tests' fake."""
     await check_database(pool)
+
+
+async def test_no_ann_index_exists_on_document_chunks(db: Connection) -> None:
+    """Exact search only (docs/DECISIONS.md section 22): every index on the
+    chunk table is a B-tree, none is HNSW or IVFFlat."""
+    cursor = await db.execute(
+        """
+        SELECT am.amname
+        FROM pg_index AS i
+        JOIN pg_class AS c ON c.oid = i.indexrelid
+        JOIN pg_am AS am ON am.oid = c.relam
+        WHERE i.indrelid = 'document_chunks'::regclass
+        """
+    )
+    access_methods = {row[0] for row in await cursor.fetchall()}
+
+    assert access_methods == {"btree"}
+
+
+# ---------------------------------------------------------------------------
+# Retrieval service against real pgvector (Milestone 3)
+# ---------------------------------------------------------------------------
+
+SMOKE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "smoke.txt"
+
+LIQUIDITY_MD = (
+    "# Acme liquidity\n\n"
+    "Acme ended the fiscal year with cash and equivalents of 1.2 billion dollars "
+    "and an undrawn revolving credit facility."
+)
+GLOBEX_PAGES = [
+    "Globex Holdings annual report. Letter from the chief executive to shareholders.",
+    (
+        "Globex operating margin expanded to 18 percent, driven by pricing actions "
+        "in North America."
+    ),
+]
+
+
+@dataclass(frozen=True)
+class Corpus:
+    acme_report: UUID
+    acme_liquidity: UUID
+    globex_report: UUID
+
+
+async def ingest_corpus(pool: Pool) -> Corpus:
+    """Ingest the fixture corpus through the real ingestion path."""
+    ingestor = Ingestor(
+        pool=pool,
+        embedder=KeywordEmbedder(),
+        tokenizer=FakeTokenizer(),
+        config=IngestionConfig(),
+    )
+    uploads = [
+        FakeUpload("acme-fy2025.txt", "text/plain", SMOKE_FIXTURE.read_bytes()),
+        FakeUpload("acme-liquidity.md", "text/markdown", LIQUIDITY_MD.encode()),
+        FakeUpload("globex-2025.pdf", "application/pdf", build_pdf(GLOBEX_PAGES)),
+    ]
+    ids = [(await ingestor.ingest(u, request_id="seed")).document_id for u in uploads]
+    return Corpus(*ids)
+
+
+def make_retriever(
+    pool: Pool, *, top_k: int = 6, min_similarity: float = 0.30
+) -> Retriever:
+    return Retriever(
+        pool=pool,
+        embedder=KeywordEmbedder(),
+        config=RetrievalConfig(top_k=top_k, min_similarity=min_similarity),
+    )
+
+
+async def ask(retriever: Retriever, question: str) -> list[RetrievedChunk]:
+    return await retriever.retrieve(await retriever.embed_query(question))
+
+
+async def test_fixture_question_retrieves_the_intended_chunk(
+    pool: Pool, db: Connection
+) -> None:
+    """The Milestone 3 exit condition, with the default threshold of 0.30."""
+    corpus = await ingest_corpus(pool)
+
+    chunks = await ask(make_retriever(pool), "Why did Acme's European revenue decline?")
+
+    assert len(chunks) == 1, "the related liquidity chunk scores below 0.30"
+    (chunk,) = chunks
+    assert chunk.document_id == corpus.acme_report
+    assert chunk.filename == "acme-fy2025.txt"
+    assert chunk.page_number is None
+    assert "European revenue declined 4%" in chunk.content
+    assert chunk.similarity == pytest.approx(1 - chunk.cosine_distance)
+    assert chunk.similarity >= 0.30
+    await db.commit()
+    stored = await (
+        await db.execute(
+            "SELECT document_id, content FROM document_chunks WHERE id = %s",
+            (chunk.chunk_id,),
+        )
+    ).fetchone()
+    assert stored == (chunk.document_id, chunk.content)
+
+
+async def test_pdf_chunk_carries_its_page_number(pool: Pool, db: Connection) -> None:
+    corpus = await ingest_corpus(pool)
+
+    (chunk,) = await ask(
+        make_retriever(pool), "What happened to Globex operating margin?"
+    )
+
+    assert chunk.document_id == corpus.globex_report
+    assert chunk.filename == "globex-2025.pdf"
+    assert chunk.page_number == 2
+
+
+async def test_lower_threshold_admits_weaker_chunks_in_similarity_order(
+    pool: Pool, db: Connection
+) -> None:
+    corpus = await ingest_corpus(pool)
+
+    chunks = await ask(
+        make_retriever(pool, min_similarity=0.1),
+        "Why did Acme's European revenue decline?",
+    )
+
+    assert [chunk.document_id for chunk in chunks] == [
+        corpus.acme_report,
+        corpus.acme_liquidity,
+    ]
+    assert chunks[0].similarity > chunks[1].similarity >= 0.1
+
+
+async def test_unrelated_question_retrieves_nothing(pool: Pool, db: Connection) -> None:
+    """Candidates always exist; weak ones must not count as evidence."""
+    await ingest_corpus(pool)
+
+    assert await ask(make_retriever(pool), "What is Initech's dividend policy?") == []
+
+
+async def test_zero_query_vector_is_rejected_as_non_finite(
+    pool: Pool, db: Connection
+) -> None:
+    """pgvector returns NaN cosine distance for a zero-norm vector; even a
+    threshold of 0 must not accept it."""
+    await ingest_corpus(pool)
+
+    assert await ask(make_retriever(pool, min_similarity=0.0), "What was it?") == []
+
+
+async def test_top_k_bounds_the_candidates(pool: Pool, db: Connection) -> None:
+    await ingest_corpus(pool)
+
+    chunks = await ask(
+        make_retriever(pool, top_k=2, min_similarity=0.0), "Acme Globex revenue"
+    )
+
+    assert len(chunks) == 2
+
+
+async def test_empty_corpus_retrieves_nothing(pool: Pool, db: Connection) -> None:
+    assert await ask(make_retriever(pool), "Why did revenue decline?") == []
+
+
+async def test_retrieval_events_carry_counts_but_no_content(
+    pool: Pool, db: Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    await ingest_corpus(pool)
+    caplog.set_level(logging.DEBUG)
+    retriever = make_retriever(pool)
+
+    with bind_request_id("req-retrieve"):
+        await ask(retriever, "Why did Acme's European revenue decline?")
+
+    events = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "app.retrieval"
+    ]
+    assert [event["event"] for event in events] == [
+        "retrieval.started",
+        "retrieval.completed",
+    ]
+    completed = events[1]
+    assert completed["request_id"] == "req-retrieve"
+    assert (completed["top_k"], completed["minimum_similarity"]) == (6, 0.30)
+    assert (completed["candidate_count"], completed["accepted_count"]) == (4, 1)
+    assert completed["top_similarity"] >= 0.30
+    assert "duration_ms" in completed
+    everything = "\n".join(record.getMessage() for record in caplog.records)
+    assert "currency headwinds" not in everything
+    assert "European revenue" not in everything

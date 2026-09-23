@@ -7,6 +7,7 @@ logged or placed in an error message (docs/SPEC.md section 13).
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -15,6 +16,8 @@ OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_EMBEDDING_MODEL_ENV = "OPENAI_EMBEDDING_MODEL"
 OPENAI_EMBEDDING_DIMENSIONS_ENV = "OPENAI_EMBEDDING_DIMENSIONS"
 MAX_UPLOAD_BYTES_ENV = "MAX_UPLOAD_BYTES"
+RETRIEVAL_TOP_K_ENV = "RETRIEVAL_TOP_K"
+MIN_RETRIEVAL_SIMILARITY_ENV = "MIN_RETRIEVAL_SIMILARITY"
 
 DEFAULT_MIN_POOL_SIZE = 1
 DEFAULT_MAX_POOL_SIZE = 10
@@ -44,6 +47,11 @@ DEFAULT_OPENAI_MAX_RETRIES = 2
 DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 DEFAULT_CHUNK_TOKENS = 800
 DEFAULT_CHUNK_OVERLAP_TOKENS = 120
+
+# docs/SPEC.md sections 9 and 14. The minimum similarity is a demo heuristic
+# for discarding obviously weak chunks, not a calibrated probability.
+DEFAULT_RETRIEVAL_TOP_K = 6
+DEFAULT_MIN_RETRIEVAL_SIMILARITY = 0.30
 
 
 class ConfigError(RuntimeError):
@@ -84,6 +92,21 @@ def _positive_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be a positive integer") from None
     if value <= 0:
         raise ConfigError(f"{name} must be a positive integer")
+    return value
+
+
+def _unit_interval_float(name: str, default: float) -> float:
+    """Read an optional finite number in [0, 1], naming the variable (not its value) on error."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    message = f"{name} must be a number between 0 and 1"
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(message) from None
+    if not (math.isfinite(value) and 0.0 <= value <= 1.0):
+        raise ConfigError(message)
     return value
 
 
@@ -161,4 +184,41 @@ class IngestionConfig:
             max_upload_bytes=_positive_int(
                 MAX_UPLOAD_BYTES_ENV, DEFAULT_MAX_UPLOAD_BYTES
             )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalConfig:
+    """Candidate count and weak-result threshold (docs/DECISIONS.md section 8).
+
+    Not yet read at startup: nothing in the running application retrieves
+    until ``POST /v1/query`` exists, so the lifespan builds this in Milestone 4
+    (docs/TASKS.md). Until then an invalid value is rejected only where this
+    class is constructed, not when the application starts.
+    """
+
+    top_k: int = DEFAULT_RETRIEVAL_TOP_K
+    min_similarity: float = DEFAULT_MIN_RETRIEVAL_SIMILARITY
+
+    def __post_init__(self) -> None:
+        if self.top_k <= 0:
+            raise ConfigError("top_k must be positive")
+        if not (
+            math.isfinite(self.min_similarity) and 0.0 <= self.min_similarity <= 1.0
+        ):
+            raise ConfigError("min_similarity must be a finite number in [0, 1]")
+
+    @classmethod
+    def from_env(cls) -> RetrievalConfig:
+        """Read ``RETRIEVAL_TOP_K`` and ``MIN_RETRIEVAL_SIMILARITY``.
+
+        Raises:
+            ConfigError: a value is malformed or out of range. The message
+                names the variable, never the supplied value.
+        """
+        return cls(
+            top_k=_positive_int(RETRIEVAL_TOP_K_ENV, DEFAULT_RETRIEVAL_TOP_K),
+            min_similarity=_unit_interval_float(
+                MIN_RETRIEVAL_SIMILARITY_ENV, DEFAULT_MIN_RETRIEVAL_SIMILARITY
+            ),
         )
