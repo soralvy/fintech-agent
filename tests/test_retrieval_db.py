@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 
-from app.config import IngestionConfig, RetrievalConfig
+from app.config import RetrievalConfig
 from app.db import (
     SHA256_CONSTRAINT,
     Connection,
@@ -35,11 +33,10 @@ from app.db import (
     search_chunks_by_embedding,
 )
 from app.errors import DatabaseUnavailableError
-from app.ingestion import Ingestor
 from app.logging import bind_request_id
 from app.retrieval import RetrievedChunk, Retriever
 from tests.conftest import embedding
-from tests.fakes import FakeTokenizer, FakeUpload, KeywordEmbedder, build_pdf
+from tests.fakes import KeywordEmbedder, ingest_corpus
 
 pytestmark = pytest.mark.anyio
 
@@ -424,45 +421,6 @@ async def test_no_ann_index_exists_on_document_chunks(db: Connection) -> None:
 # ---------------------------------------------------------------------------
 # Retrieval service against real pgvector (Milestone 3)
 # ---------------------------------------------------------------------------
-
-SMOKE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "smoke.txt"
-
-LIQUIDITY_MD = (
-    "# Acme liquidity\n\n"
-    "Acme ended the fiscal year with cash and equivalents of 1.2 billion dollars "
-    "and an undrawn revolving credit facility."
-)
-GLOBEX_PAGES = [
-    "Globex Holdings annual report. Letter from the chief executive to shareholders.",
-    (
-        "Globex operating margin expanded to 18 percent, driven by pricing actions "
-        "in North America."
-    ),
-]
-
-
-@dataclass(frozen=True)
-class Corpus:
-    acme_report: UUID
-    acme_liquidity: UUID
-    globex_report: UUID
-
-
-async def ingest_corpus(pool: Pool) -> Corpus:
-    """Ingest the fixture corpus through the real ingestion path."""
-    ingestor = Ingestor(
-        pool=pool,
-        embedder=KeywordEmbedder(),
-        tokenizer=FakeTokenizer(),
-        config=IngestionConfig(),
-    )
-    uploads = [
-        FakeUpload("acme-fy2025.txt", "text/plain", SMOKE_FIXTURE.read_bytes()),
-        FakeUpload("acme-liquidity.md", "text/markdown", LIQUIDITY_MD.encode()),
-        FakeUpload("globex-2025.pdf", "application/pdf", build_pdf(GLOBEX_PAGES)),
-    ]
-    ids = [(await ingestor.ingest(u, request_id="seed")).document_id for u in uploads]
-    return Corpus(*ids)
 
 
 def make_retriever(

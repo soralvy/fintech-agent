@@ -6,7 +6,10 @@ The adapter returns plain float lists and never leaks raw SDK responses or
 errors: a provider failure surfaces as ``EmbeddingProviderError``, whose public
 message is fixed, and only the failure's type and status code are logged.
 
-Structured generation joins this module in Milestone 4.
+The answering graph depends on ``AnswerGenerator`` the same way and receives
+an untrusted ``GroundedAnswer``, whose citation labels the application still
+validates (docs/DECISIONS.md section 10.9). The OpenAI answer adapter joins
+this module in Milestone 4, Stage C.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from typing import NoReturn, Protocol
 
 import openai
 from openai import AsyncOpenAI
+from pydantic import BaseModel, ConfigDict
 
 from app.config import OpenAIConfig
 from app.errors import EmbeddingProviderError
@@ -33,6 +37,32 @@ class Embedder(Protocol):
     """Turns texts into vectors, one per input, in input order."""
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+
+class GroundedAnswer(BaseModel):
+    """The answer model's structured output: untrusted until ``finalize``.
+
+    Strict and closed, so a string ``"true"`` or an extra field is rejected
+    rather than coerced (docs/TECH_BASELINE.md section 3.10).
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    answer: str
+    citation_ids: list[str]
+    insufficient_context: bool
+
+
+class AnswerGenerator(Protocol):
+    """Produces one grounded answer from fixed instructions and a rendered prompt.
+
+    The graph renders the prompt; implementations receive only the two
+    strings (docs/DECISIONS.md section 4).
+    """
+
+    async def generate_answer(
+        self, *, instructions: str, prompt: str
+    ) -> GroundedAnswer: ...
 
 
 def create_openai_client(config: OpenAIConfig) -> AsyncOpenAI:

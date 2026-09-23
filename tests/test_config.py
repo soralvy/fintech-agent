@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import pytest
 
@@ -11,10 +12,13 @@ from app.config import (
     DEFAULT_MAX_UPLOAD_BYTES,
     PINNED_EMBEDDING_MODEL,
     SCHEMA_EMBEDDING_DIMENSIONS,
+    TRACING_DISABLED_VALUES,
+    TRACING_ENV_VARS,
     ConfigError,
     IngestionConfig,
     OpenAIConfig,
     RetrievalConfig,
+    require_tracing_disabled,
 )
 
 SECRET = "sk-live-must-never-be-rendered"
@@ -174,3 +178,81 @@ def test_retrieval_config_rejects_invalid_direct_values(
 ) -> None:
     with pytest.raises(ConfigError, match="must be"):
         RetrievalConfig(top_k=top_k, min_similarity=min_similarity)
+
+
+# ---------------------------------------------------------------------------
+# LangSmith tracing refusal (AC14; docs/TECH_BASELINE.md section 7)
+# ---------------------------------------------------------------------------
+
+REJECTED_TRACING_VALUES = ["true", "1", "FALSE", "   ", " false ", "yes-sentinel-7f3"]
+ACCEPTED_TRACING_VALUES = ["", "0", "false", "False"]
+
+
+def tracing_error(name: str) -> str:
+    return f"{name} must be unset or disabled; LangSmith tracing is not supported"
+
+
+def test_the_protected_tracing_set_is_exact() -> None:
+    assert TRACING_ENV_VARS == (
+        "LANGSMITH_TRACING",
+        "LANGSMITH_TRACING_V2",
+        "LANGCHAIN_TRACING",
+        "LANGCHAIN_TRACING_V2",
+        "LANGCHAIN_HANDLER",
+    )
+    assert TRACING_DISABLED_VALUES == {"", "0", "false", "False"}
+
+
+def test_tracing_variables_are_cleared_for_every_test() -> None:
+    """``tests/conftest.py`` removes them at import and again per test."""
+    assert not [name for name in TRACING_ENV_VARS if name in os.environ]
+
+
+@pytest.mark.parametrize("value", REJECTED_TRACING_VALUES)
+@pytest.mark.parametrize("name", TRACING_ENV_VARS)
+def test_each_tracing_variable_alone_refuses_a_non_disabled_value(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ConfigError) as caught:
+        require_tracing_disabled()
+
+    assert str(caught.value) == tracing_error(name)
+
+
+def test_a_non_empty_langchain_handler_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGCHAIN_HANDLER", "langchain")
+
+    with pytest.raises(ConfigError) as caught:
+        require_tracing_disabled()
+
+    assert str(caught.value) == tracing_error("LANGCHAIN_HANDLER")
+
+
+def test_the_first_offender_in_order_is_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGCHAIN_HANDLER", "true")
+    monkeypatch.setenv("LANGSMITH_TRACING_V2", "1")
+
+    with pytest.raises(ConfigError) as caught:
+        require_tracing_disabled()
+
+    assert str(caught.value) == tracing_error("LANGSMITH_TRACING_V2")
+
+
+def test_all_tracing_variables_unset_is_accepted() -> None:
+    require_tracing_disabled()
+
+
+@pytest.mark.parametrize("value", ACCEPTED_TRACING_VALUES)
+@pytest.mark.parametrize("name", TRACING_ENV_VARS)
+def test_each_exact_disabled_value_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    require_tracing_disabled()
