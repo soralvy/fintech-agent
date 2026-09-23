@@ -257,7 +257,9 @@ Use this structure:
 │   ├── db_safety.py
 │   ├── test_db_safety.py
 │   ├── test_verify_script.py
+│   ├── test_retrieval.py
 │   ├── test_retrieval_db.py
+│   ├── test_logging.py
 │   ├── test_graph.py
 │   ├── test_mcp.py
 │   └── test_http.py
@@ -286,6 +288,12 @@ Added in the Milestone 2 pre-finish cleanup (2026-09-23):
 
 - `tests/db_safety.py` is the single guarded reset of the integration-test database (§5.1). Its tests are in `tests/test_db_safety.py`.
 - `scripts/verify.py` is the canonical full verification gate, standard library only. Its tests are in `tests/test_verify_script.py`. `scripts/` is a package, and mypy checks it.
+
+Added in Milestone 3 (2026-09-23):
+
+- `app/retrieval.py`: `RetrievedChunk`, the pure `filter_matches`, and `Retriever`, whose `embed_query` and `retrieve` methods match the graph's two nodes (§10.2, §10.3). `db.py` is unchanged: it still returns the raw cosine distance.
+- `RetrievalConfig` in `app/config.py` (`RETRIEVAL_TOP_K`, `MIN_RETRIEVAL_SIMILARITY`). **It is not yet read at startup.** The lifespan does not build it until Milestone 4 wires retrieval into `POST /v1/query`. Until then an invalid retrieval variable does not stop the application from starting; it is rejected only where `RetrievalConfig` is constructed.
+- Tests: `tests/test_retrieval.py` (pure: filter, query embedding, failure events, and the `KeywordEmbedder` fake's determinism), `tests/test_logging.py` (request-ID binding), and service-level tests added to `tests/test_retrieval_db.py`. Neither new test file was in the tree above; both are added to it here.
 
 The optional post-baseline decision layer (§25) would add `app/typesafe_provider.py` and `app/decisions.py` in Milestone 10, and a top-level `evals/` package in Milestone 9 holding the manually invoked evaluation runner (`uv run python -m evals.run`). `evals/` is not collected by pytest (it falls outside `testpaths`) but is added to the mypy `files` setting. All three are deliberately absent from the tree above because they are not part of the MVP baseline.
 
@@ -796,6 +804,15 @@ minimum similarity = 0.30
 ```
 
 The minimum is a configurable heuristic, not a confidence probability.
+
+*Implemented 2026-09-23 (Milestone 3):*
+
+- The threshold is **inclusive**: a chunk is kept when `similarity >= MIN_RETRIEVAL_SIMILARITY`, because SPEC §9.1 discards only candidates *below* it.
+- A **non-finite** similarity is always discarded, checked with `math.isfinite` before the threshold. pgvector returns NaN cosine distance for a zero-norm vector (verified on 0.8.6: `'[0,0]'::vector <=> '[1,0]'` is `NaN`), and a distance of `-inf` would give a similarity of `+inf` that a bare `>=` would accept.
+- `filter_matches` never re-sorts. Accepted chunks keep `db.py`'s `(cosine_distance, document_id, chunk_index)` order, which Milestone 4 turns into `D1…Dn`.
+- `RETRIEVAL_TOP_K` must be a positive integer. `MIN_RETRIEVAL_SIMILARITY` must be a finite number in `[0, 1]`: cosine similarity can be negative, but a negative threshold would accept every candidate and defeat the insufficient-context route. Errors name the variable, never the value.
+- `embed_query` rejects a blank question as a caller error (`ValueError`), and anything other than exactly one 1536-dimensional vector as `EmbeddingProviderError` (502). A database failure in `retrieve` is `DatabaseUnavailableError` (503). No results is an empty list, not an error (§10.3).
+- **No ANN index is required.** Measured 2026-09-23 on PostgreSQL 18.6 / pgvector 0.8.6 with 2,000 random 1536-dimension chunks, far above the demo corpus: the plan is a sequential scan with a top-N heapsort, 5.2 ms execution, and `search_chunks_by_embedding` took a median of 4.7 ms over 20 queries. `tests/test_retrieval_db.py` asserts that every index on `document_chunks` is a B-tree.
 
 Every retrieved result carries:
 
@@ -1515,6 +1532,8 @@ Do not introduce an observability platform.
 
 Every request receives a correlation/request ID.
 
+*Implemented 2026-09-23 (Milestone 3):* the request ID lives in a `ContextVar` in `app/logging.py`. `bind_request_id(request_id)` is a context manager that keeps the token from `set` and resets it in `finally`, so the ID is restored on every exit, including an exception, and never leaks into a later operation. Each asyncio task runs in a copy of the context, so concurrent requests keep their own IDs. `log_event` adds the bound ID to every event unless the caller passes `request_id` explicitly. `Ingestor.ingest` binds it for the whole call. `Retriever` takes no request ID; its caller binds one (the `POST /v1/query` route, from Milestone 4).
+
 Log only metadata necessary to diagnose flow.
 
 ## Events
@@ -1589,6 +1608,20 @@ error_code
 ```
 
 Do not log full retrieved chunks.
+
+*Implemented 2026-09-23:* `retrieval.started` carries `top_k` and `minimum_similarity`; `retrieval.completed` adds `candidate_count`, `accepted_count`, `top_similarity` (the raw nearest candidate's, `null` when there is none or it is not finite), and `duration_ms`; `retrieval.failed` carries `error_code` and `duration_ms`. The question and chunk text are never logged. An embedding failure is reported by the adapter's own `embedding.*` event, not by `retrieval.failed`.
+
+### Adapters
+
+*Recorded 2026-09-23.* These are emitted by the provider adapters, and carry the bound `request_id`:
+
+```text
+embedding.request_failed    error_type, status_code
+embedding.invalid_response  reason
+tokenizer.load_failed       encoding, error_type
+```
+
+Never the exception message or the provider body.
 
 ### Graph
 
