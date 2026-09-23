@@ -1202,7 +1202,7 @@ Known public failures:
 - `400` no extractable content;
 - `413` upload limit;
 - `415` unsupported file/media type;
-- FastAPI/Pydantic `422` malformed request;
+- `422` malformed request (`invalid_request`, raised by the route's own multipart parsing, not FastAPI/Pydantic validation);
 - `502` embedding failure;
 - `503` database failure.
 
