@@ -9,6 +9,7 @@ import pytest
 
 from app import db
 from app.config import (
+    DEFAULT_LLM_MODEL,
     DEFAULT_MAX_UPLOAD_BYTES,
     PINNED_EMBEDDING_MODEL,
     SCHEMA_EMBEDDING_DIMENSIONS,
@@ -178,6 +179,32 @@ def test_retrieval_config_rejects_invalid_direct_values(
 ) -> None:
     with pytest.raises(ConfigError, match="must be"):
         RetrievalConfig(top_k=top_k, min_similarity=min_similarity)
+
+
+@pytest.mark.parametrize("value", [None, "", "   "], ids=["unset", "empty", "blank"])
+def test_unset_or_blank_llm_model_resolves_to_the_default(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", SECRET)
+    if value is None:
+        monkeypatch.delenv("OPENAI_LLM_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_LLM_MODEL", value)
+
+    assert OpenAIConfig.from_env().llm_model == DEFAULT_LLM_MODEL
+    assert DEFAULT_LLM_MODEL == "gpt-6-luna"
+
+
+def test_an_explicit_llm_model_is_kept_as_an_opaque_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", SECRET)
+    monkeypatch.setenv("OPENAI_LLM_MODEL", "  some-other-model-2026  ")
+
+    config = OpenAIConfig.from_env()
+
+    assert config.llm_model == "some-other-model-2026"
+    assert config.embedding_model == PINNED_EMBEDDING_MODEL
 
 
 # ---------------------------------------------------------------------------

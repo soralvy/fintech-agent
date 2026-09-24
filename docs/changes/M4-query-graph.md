@@ -267,6 +267,7 @@ max_output_tokens=1200, store=False
 | # | Outcome | Detection | App retry | Result, internal `reason` | Logical calls |
 |---|---|---|---|---|---|
 | 1 | SDK or provider exception | `openai.OpenAIError` raised, after the SDK's own transport retries | no | `AnswerProviderError` (`generation.request_failed`) | 1 |
+| 1a | Malformed response (*added 2026-09-24, Stage C review; `DECISIONS.md` §12*) | a 200 body the SDK did not turn into a usable `Response`: a JSON-labelled body the SDK cannot decode (it raises `ValueError` or `RecursionError`), not a `Response` object, `output` not a list, `incomplete_details` neither null nor an `IncompleteDetails` object, a message's `content` not a list, or an `output_text` whose `text` is not a string. Checked before row 2. A non-integer `usage` count is logged as `null` and never rejects a valid answer | no | `malformed_response` | 1 |
 | 2 | Incomplete | `status == "incomplete"`, checked before any parsing | no (R3) | `incomplete_max_output_tokens`, `incomplete_content_filter`, or `incomplete_other` | 1 |
 | 3 | Unexpected status | any status other than `completed` or `incomplete`, including `None` | no | `unexpected_status` | 1 |
 | 4 | Refusal | `completed`, and any `refusal` content part in **any** message item of the output | no (R2) | `refusal` | 1 |
@@ -670,6 +671,8 @@ Work proceeds in this order:
 | incomplete, `max_output_tokens` | 1 | error |
 | incomplete, `content_filter` | 1 | error |
 | status `failed` | 1 | `unexpected_status` |
+| malformed 200 body: non-JSON, undecodable JSON-labelled (invalid JSON, empty, invalid UTF-8, deep nesting), missing or null `output`, non-object `incomplete_details`, missing `content`, null `text` (row 1a) | 1 | `malformed_response` |
+| valid answer with a malformed `usage` or non-integer token counts | 1 | returns; counts logged as `null` |
 | no output text, then valid | 2 | returns |
 | two usable payloads, twice | 2 | `multiple_output_text` |
 | invalid JSON, then valid | 2 | returns |

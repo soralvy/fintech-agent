@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 DATABASE_URL_ENV = "DATABASE_URL"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_EMBEDDING_MODEL_ENV = "OPENAI_EMBEDDING_MODEL"
+OPENAI_LLM_MODEL_ENV = "OPENAI_LLM_MODEL"
 OPENAI_EMBEDDING_DIMENSIONS_ENV = "OPENAI_EMBEDDING_DIMENSIONS"
 MAX_UPLOAD_BYTES_ENV = "MAX_UPLOAD_BYTES"
 RETRIEVAL_TOP_K_ENV = "RETRIEVAL_TOP_K"
@@ -39,6 +40,12 @@ PINNED_EMBEDDING_MODEL = "text-embedding-3-small"
 # changing it requires a schema migration and re-embedding
 # (docs/TECH_BASELINE.md section 3.11).
 SCHEMA_EMBEDDING_DIMENSIONS = 1536
+
+# The default answer model (docs/SPEC.md section 14). Unlike the embedding
+# model it is not a persistence decision, so ``OPENAI_LLM_MODEL`` may name any
+# model, which must support Structured Outputs and ``reasoning.effort="none"``
+# (docs/TECH_BASELINE.md section 3.10).
+DEFAULT_LLM_MODEL = "gpt-6-luna"
 
 # Bounds each embedding request; the SDK's own retries still apply within it.
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 30.0
@@ -147,7 +154,7 @@ def _unit_interval_float(name: str, default: float) -> float:
 
 @dataclass(frozen=True, slots=True)
 class OpenAIConfig:
-    """Credentials and model identity for the embedding provider.
+    """Credentials and model identity for the embedding and answer models.
 
     ``api_key`` is excluded from ``repr`` so the dataclass can never render it.
     """
@@ -155,6 +162,7 @@ class OpenAIConfig:
     api_key: str = field(repr=False)
     embedding_model: str = PINNED_EMBEDDING_MODEL
     embedding_dimensions: int = SCHEMA_EMBEDDING_DIMENSIONS
+    llm_model: str = DEFAULT_LLM_MODEL
     timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_OPENAI_MAX_RETRIES
 
@@ -166,7 +174,9 @@ class OpenAIConfig:
         current vertical slice, so the application refuses to start without it.
 
         An unset or blank ``OPENAI_EMBEDDING_MODEL`` resolves to the pinned
-        model; any other explicit value is rejected.
+        model; any other explicit value is rejected. An unset or blank
+        ``OPENAI_LLM_MODEL`` resolves to ``DEFAULT_LLM_MODEL``; any other
+        value is kept as an opaque model name.
 
         Raises:
             ConfigError: the key is unset or empty, the model is not the pinned
@@ -193,8 +203,14 @@ class OpenAIConfig:
                 f"{OPENAI_EMBEDDING_DIMENSIONS_ENV} must be "
                 f"{SCHEMA_EMBEDDING_DIMENSIONS} to match the vector column"
             )
+        llm_model = (
+            os.environ.get(OPENAI_LLM_MODEL_ENV, "").strip() or DEFAULT_LLM_MODEL
+        )
         return cls(
-            api_key=api_key, embedding_model=model, embedding_dimensions=dimensions
+            api_key=api_key,
+            embedding_model=model,
+            embedding_dimensions=dimensions,
+            llm_model=llm_model,
         )
 
 
