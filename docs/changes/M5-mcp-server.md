@@ -2,7 +2,9 @@
 
 ## 1. Status
 
-- **Status:** Approved, revision 3. The final independent review passed on 2026-09-24. Revision 3 applies the independently verified findings of the revision-2 review. Step 1 (contract alignment, §19) is the only work authorized so far. Implementation (Stages A–D) has not started, and no implementation code exists.
+- **Status:** Approved, revision 3. The final independent review passed on 2026-09-24.
+- **Implementation:** complete 2026-09-24 on `feat/milestone-5-mcp-server`, in step 1 and Stages A–D (`ddc34f4`, `31ed823`, `361338e`, `5758dae`, and the Stage D/completion commit). Stages A, B, and C each passed their own scoped `project-review` with a CLEAN verdict before being committed. Evidence is in `docs/TASKS.md` Milestone 5.
+- Revision 3 applies the independently verified findings of the revision-2 review.
 - **Revision 3 changes** (each finding was checked against the repository before it was applied):
   - **F1, direct `httpx` pin.** `httpx` is only transitive: `pyproject.toml` and the lock's root `requires-dist` do not declare it, and it is locked through `fastapi`, `fastapi-cloud-cli`, `langchain-core`, and `langgraph-sdk`, not `openai`. Importing it directly from `app/market_data.py` makes it a direct dependency, which `docs/TECH_BASELINE.md` §5 requires to be pinned exactly. Stage B therefore adds `httpx==0.28.1` to `pyproject.toml` and updates `uv.lock` (D19, §5.2 item 11, §19, §21, §24).
   - **F2, quote numbers are strings.** The `Decimal` label is replaced by a constrained `str` alias (§10.2, D10).
@@ -635,6 +637,8 @@ Concurrent calls are not tested (AC14 withdrawn, §15).
   - after the `async with` block exits, the child has exited;
   - the captured stderr does not contain the sentinel.
 
+*Revision 3, corrected during Stage D completion (2026-09-24).* `mcp` 2.2.0's `stdio_client` binds its `errlog` parameter to `sys.stderr` as a default argument, fixed at import time (`mcp/client/stdio.py`), not to the process's current fd 2. Under pytest, `capfd` captures fd 2 but not that bound object, so a plain `Client(StdioServerParameters(...))` cannot see the child's stderr at all: the "does not contain the sentinel" assertion above was vacuously true regardless of what the child wrote. The test therefore connects with `Client(stdio_client(params, errlog=<file under tmp_path>), mode="auto", cache=None)` instead of passing `params` directly, and reads the file after the connection closes. A second, separate test proves the mechanism itself: a `python -c` subprocess (not the server) is spawned the same way, writes a known marker to stderr, and the marker is confirmed present in the file — the positive control the single stdio test's negative assertion relies on. This does not add a second server-boundary test; the `python -c` process is not the MCP server, and D17's "exactly one offline stdio subprocess test" against the server definition is unchanged.
+
 There is no in-process legacy-mode test (D17).
 
 ## 19. Staged implementation order
@@ -759,7 +763,7 @@ grep -nE 'raise_for_status|AsyncExitStack' app/market_data.py app/mcp_server.py 
 git diff --stat main -- app/main.py app/graph.py
 ```
 
-No command in this section contacts a provider or downloads a package. None of them has been run against Milestone 5 code, which does not exist yet.
+No command in this section contacts a provider or downloads a package. They were run against the complete Milestone 5 implementation during Stage D completion; results are recorded in `docs/TASKS.md` Milestone 5, not in this specification.
 
 ## 22. Decision register
 

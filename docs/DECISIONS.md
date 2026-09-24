@@ -324,13 +324,14 @@ Deferred beyond Milestone 4, or out of its scope (*recorded 2026-09-23*):
 - **Milestone 8:** README, real-PDF smoke test, and MCP smoke test.
 - **Not in Milestone 4:** new dependencies, generic LLM or provider frameworks, LangChain abstractions, dependency-injection frameworks, placeholder modules, persistence of queries or answers, a LangGraph checkpointer, and LangSmith tracing. Milestones 9–12 remain post-baseline.
 
-Planned for Milestone 5 (*recorded 2026-09-24* by the step-1 contract alignment; `docs/changes/M5-mcp-server.md`, approved revision 3). **Not yet implemented.**
+Added in Milestone 5 (*recorded 2026-09-24* by the step-1 contract alignment, implemented and verified 2026-09-24; `docs/changes/M5-mcp-server.md`, approved revision 3; evidence in `docs/TASKS.md` Milestone 5):
 
 - `app/symbols.py` (new): a pure, standard-library-only module owning `SYMBOL_PATTERN`, `InvalidSymbolError`, and `normalize_symbol` (§14). It has three consumers: the MCP server, the application client, and, in Milestone 6, the planner validation. This module did not exist in the original tree. It replaces putting the validator in `market_data.py`, which would make the graph import an httpx module, or duplicating it at each boundary.
-- `app/market_data.py`, `app/mcp_server.py`, and `app/mcp_client.py`, with the responsibilities below. The stdio entry point is `python -m app.mcp_server`.
+- `app/market_data.py`, `app/mcp_server.py`, and `app/mcp_client.py`, with the responsibilities below. The stdio entry point is `python -m app.mcp_server`. `app/mcp_client.py` names that module from the package (`f"{app.__name__}.mcp_server"`) rather than importing it, and derives the child's working directory from `app.__file__`.
+- `pyproject.toml` declares `httpx==0.28.1` directly, at the version `uv.lock` already resolved; only `app/market_data.py` imports it (`docs/TECH_BASELINE.md` §3.17).
 - **The Milestone 5 MCP client is standalone.** Nothing else in `app/` calls it, and `main.py` and `graph.py` do not import it. `main.py`, the lifespan, and the HTTP contract are unchanged in Milestone 5.
 - `app/config.py` gains `MarketDataConfig` (`ALPHA_VANTAGE_API_KEY`, `MCP_TOOL_TIMEOUT_SECONDS`). In Milestone 5 only the stdio MCP server entry point reads it. The API process does not, so the API still starts without an Alpha Vantage key.
-- Tests: `tests/test_symbols.py` and `tests/test_market_data.py` (new; now in the tree above), and `tests/test_mcp.py` (already in the tree).
+- Tests: `tests/test_symbols.py` and `tests/test_market_data.py` (new; now in the tree above), and `tests/test_mcp.py` (already in the tree). `tests/fixtures/alpha_vantage/` holds the provisional provider payloads, and `tests/fakes.py` gains `alpha_vantage_transport` and `ScriptedMarketDataProvider`.
 - **Milestone 6 owns** FastAPI lifespan wiring of the MCP client, `contextlib.AsyncExitStack` in the lifespan, `app.state` MCP handles, the startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server fails to start, and all graph integration.
 
 The optional post-baseline decision layer (§25) would add `app/typesafe_provider.py` and `app/decisions.py` in Milestone 10, and a top-level `evals/` package in Milestone 9 holding the manually invoked evaluation runner (`uv run python -m evals.run`). `evals/` is not collected by pytest (it falls outside `testpaths`) but is added to the mypy `files` setting. All three are deliberately absent from the tree above because they are not part of the MVP baseline.

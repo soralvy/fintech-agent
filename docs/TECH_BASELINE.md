@@ -33,7 +33,7 @@ Use the following baseline:
 - OpenAI embedding model `text-embedding-3-small`, fixed at `1536` dimensions
 - pypdf `6.19.0` (added 2026-09-23, §3.14)
 - tiktoken `0.14.0`, encoding `cl100k_base` (added 2026-09-23, §3.15)
-- httpx `0.28.1`, for the Alpha Vantage adapter (selected 2026-09-24, §3.17). This version is already resolved transitively in `uv.lock`. It is **not yet declared** in `pyproject.toml`; Milestone 5 Stage B declares it as a direct pin.
+- httpx `0.28.1`, for the Alpha Vantage adapter (selected 2026-09-24, §3.17; declared directly in `pyproject.toml` by Milestone 5 Stage B, `361338e`).
 - pytest `9.1.1`
 
 Direct application dependencies should initially be pinned to these versions. `uv.lock` becomes the authoritative record of the complete resolved dependency graph once generated.
@@ -558,7 +558,7 @@ Do not add pytest plugins unless an implemented test actually requires them.
 
 **Selected model ID:** `jev-1.13.0` (pinned versioned ID; the aliases `jev-latest` and `jev-preview` are not used — see `docs/DECISIONS.md` §25.6)
 
-**Selected integration:** direct REST over the `httpx` client already present through `fastapi[standard]`. The official `typesafe-sdk` is not added (`docs/DECISIONS.md` §25.3).
+**Selected integration:** direct REST over the `httpx` client, a direct dependency since Milestone 5 Stage B (§3.17). The official `typesafe-sdk` is not added (`docs/DECISIONS.md` §25.3). *(Amended 2026-09-24: this previously said httpx arrived only transitively through `fastapi[standard]`, before Milestone 5 declared it directly.)*
 
 **Official sources** (all read 2026-09-21):
 
@@ -704,9 +704,9 @@ Both reinforce two design rules: thresholds must be tuned per question type on p
 
 **Selected version:** `httpx==0.28.1`
 
-**Current repository state.** `httpx` is **not** declared in `pyproject.toml`. `uv.lock` already resolves 0.28.1 transitively, through `fastapi` (its `standard` extra), `fastapi-cloud-cli`, `langchain-core`, and `langgraph-sdk`. `openai` 3.14.1 and `mcp` 2.2.0 depend on `httpx2`, a separate distribution, not on `httpx`.
+**State before Stage B.** `httpx` was not declared in `pyproject.toml`. `uv.lock` already resolved 0.28.1 transitively, through `fastapi` (its `standard` extra), `fastapi-cloud-cli`, `langchain-core`, and `langgraph-sdk`. `openai` 3.14.1 and `mcp` 2.2.0 depend on `httpx2`, a separate distribution, not on `httpx`.
 
-**Why it becomes direct.** `app/market_data.py` will import `httpx` directly. §5 requires exact pins for direct third-party dependencies, so Milestone 5 Stage B declares `httpx==0.28.1` in `pyproject.toml` before that import exists, then runs `UV_OFFLINE=1 uv lock` and `UV_OFFLINE=1 uv lock --check`.
+**Why it became direct.** `app/market_data.py` imports `httpx` directly. §5 requires exact pins for direct third-party dependencies, so Milestone 5 Stage B (`361338e`, 2026-09-24) declared `httpx==0.28.1` in `pyproject.toml` before that import existed, then ran `UV_OFFLINE=1 uv lock` and `UV_OFFLINE=1 uv lock --check`. `httpx` is now a direct dependency, declared between `fastapi[standard]` and `langgraph` in `pyproject.toml`.
 
 - This is **not** an upgrade and adds no newly resolved distribution: 0.28.1 is the version already locked.
 - The expected lock change is exactly the root package's two `httpx` entries, and the resolved package count stays at 104. Any other lock change stops Stage B for review.
