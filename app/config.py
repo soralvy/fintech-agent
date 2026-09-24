@@ -242,10 +242,8 @@ class IngestionConfig:
 class RetrievalConfig:
     """Candidate count and weak-result threshold (docs/DECISIONS.md section 8).
 
-    Not yet read at startup: nothing in the running application retrieves
-    until ``POST /v1/query`` exists, so the lifespan builds this in Milestone 4
-    (docs/TASKS.md). Until then an invalid value is rejected only where this
-    class is constructed, not when the application starts.
+    Read at startup: the lifespan builds it with the other configuration, so
+    an invalid value stops the application before any resource is created.
     """
 
     top_k: int = DEFAULT_RETRIEVAL_TOP_K
