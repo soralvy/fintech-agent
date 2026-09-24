@@ -11,10 +11,12 @@ import hashlib
 import math
 import re
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
+
+import httpx
 
 from app.config import IngestionConfig
 from app.db import Pool
@@ -316,3 +318,28 @@ async def ingest_corpus(pool: Pool) -> Corpus:
     ]
     ids = [(await ingestor.ingest(u, request_id="seed")).document_id for u in uploads]
     return Corpus(*ids)
+
+
+@dataclass
+class RecordingTransport:
+    """An ``httpx.MockTransport`` plus every request it received, in order."""
+
+    transport: httpx.MockTransport
+    requests: list[httpx.Request]
+
+
+def alpha_vantage_transport(
+    respond: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
+) -> RecordingTransport:
+    """Build a socket-free transport that records each request, then answers it.
+
+    ``respond`` may raise to simulate a transport failure, or sleep to
+    simulate a stalled provider. No request ever leaves the process.
+    """
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return await respond(request)
+
+    return RecordingTransport(httpx.MockTransport(handler), requests)

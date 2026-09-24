@@ -1,0 +1,19 @@
+{
+  "Symbol": "MSFT",
+  "AssetType": "Common Stock",
+  "Name": "Example Corp",
+  "Description": "Example Corp designs example products and services.",
+  "CIK": "0000000000",
+  "Exchange": "NASDAQ",
+  "Currency": "USD",
+  "Country": "USA",
+  "Sector": "TECHNOLOGY",
+  "Industry": "SERVICES-PREPACKAGED SOFTWARE",
+  "Address": "1 EXAMPLE WAY, EXAMPLE, US",
+  "FiscalYearEnd": "June",
+  "LatestQuarter": "2026-06-30",
+  "MarketCapitalization": "3100000000000",
+  "EBITDA": "150000000000",
+  "PERatio": "35.20",
+  "DividendYield": "0.0072"
+}
