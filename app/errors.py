@@ -5,10 +5,21 @@ provider body, a path, or document content, so nothing sensitive can reach a
 client through an error (docs/SPEC.md sections 12 and 13). ``main.py`` renders
 these as the SPEC section 12.1 envelope.
 
-This module imports nothing from FastAPI; the status is a plain integer.
+This module imports nothing from FastAPI; the status is a plain integer. Its
+only third-party import is Pydantic's ``ValidationError``, for
+``classify_error`` (docs/DECISIONS.md section 21).
 """
 
 from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import ValidationError
+
+# The closed classification logged as ``error_type`` by ``graph.failed`` and
+# ``http.request.failed`` (docs/DECISIONS.md section 19). It is never built
+# from an exception's message, repr, class name, or traceback.
+type ErrorType = Literal["app_error", "validation_error", "unexpected_error"]
 
 
 class AppError(Exception):
@@ -20,6 +31,15 @@ class AppError(Exception):
 
     def __init__(self) -> None:
         super().__init__(self.code)
+
+
+def classify_error(exc: Exception) -> ErrorType:
+    """Classify ``exc`` into the bounded ``ErrorType`` used in failure events."""
+    if isinstance(exc, AppError):
+        return "app_error"
+    if isinstance(exc, ValidationError):
+        return "validation_error"
+    return "unexpected_error"
 
 
 class InvalidRequestError(AppError):
@@ -58,10 +78,24 @@ class EmptyDocumentError(AppError):
     message = "The document contains no extractable text."
 
 
+class InvalidQueryError(AppError):
+    """The graph-boundary question check (docs/DECISIONS.md section 10.1)."""
+
+    status_code = 422
+    code = "invalid_request"
+    message = "The question must be 3 to 2000 characters after trimming."
+
+
 class EmbeddingProviderError(AppError):
     status_code = 502
     code = "embedding_provider_error"
     message = "The embedding provider is unavailable or returned an invalid response."
+
+
+class AnswerProviderError(AppError):
+    status_code = 502
+    code = "answer_provider_error"
+    message = "The answer model is unavailable or returned an invalid response."
 
 
 class TokenizerUnavailableError(AppError):

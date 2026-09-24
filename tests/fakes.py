@@ -1,4 +1,5 @@
-"""Deterministic stand-ins for external services and uploads.
+"""Deterministic stand-ins for external services and uploads, and the shared
+fixture corpus.
 
 Nothing here touches the network, tiktoken's encoding data, or OpenAI.
 """
@@ -9,9 +10,18 @@ import asyncio
 import hashlib
 import math
 import re
+from collections import deque
 from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from uuid import UUID
 
+from app.config import IngestionConfig
+from app.db import Pool
 from app.errors import AppError
+from app.ingestion import Ingestor
+from app.openai_provider import GroundedAnswer
+from app.retrieval import RetrievedChunk
 from tests.conftest import EMBEDDING_DIMENSIONS, embedding
 
 
@@ -206,3 +216,103 @@ def build_pdf(pages: Sequence[str | None]) -> bytes:
         f"startxref\n{xref_offset}\n%%EOF\n"
     ).encode()
     return bytes(out)
+
+
+class FakeRetriever:
+    """A ``QueryRetriever`` with a fixed vector and scripted chunks.
+
+    It records every question it embeds and every retrieve call.
+    ``embed_error`` or ``retrieve_error`` makes that step raise instead.
+    """
+
+    def __init__(
+        self,
+        chunks: Sequence[RetrievedChunk] = (),
+        *,
+        embed_error: Exception | None = None,
+        retrieve_error: Exception | None = None,
+    ) -> None:
+        self.chunks = list(chunks)
+        self.embed_error = embed_error
+        self.retrieve_error = retrieve_error
+        self.questions: list[str] = []
+        self.retrieve_calls = 0
+
+    async def embed_query(self, question: str) -> list[float]:
+        self.questions.append(question)
+        if self.embed_error is not None:
+            raise self.embed_error
+        return embedding(hot_index=0)
+
+    async def retrieve(self, query_embedding: Sequence[float]) -> list[RetrievedChunk]:
+        self.retrieve_calls += 1
+        if self.retrieve_error is not None:
+            raise self.retrieve_error
+        return list(self.chunks)
+
+
+class ScriptedAnswerGenerator:
+    """An ``AnswerGenerator`` that returns or raises queued outcomes in order.
+
+    Every call is recorded as ``(instructions, prompt)``. A call with nothing
+    left in the queue fails the test.
+    """
+
+    def __init__(self, *outcomes: GroundedAnswer | Exception) -> None:
+        self._outcomes = deque(outcomes)
+        self.calls: list[tuple[str, str]] = []
+
+    async def generate_answer(
+        self, *, instructions: str, prompt: str
+    ) -> GroundedAnswer:
+        self.calls.append((instructions, prompt))
+        if not self._outcomes:
+            raise AssertionError("unexpected answer-model call")
+        outcome = self._outcomes.popleft()
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+# ---------------------------------------------------------------------------
+# Shared fixture corpus, ingested through the real ingestion path
+# ---------------------------------------------------------------------------
+
+SMOKE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "smoke.txt"
+
+LIQUIDITY_MD = (
+    "# Acme liquidity\n\n"
+    "Acme ended the fiscal year with cash and equivalents of 1.2 billion dollars "
+    "and an undrawn revolving credit facility."
+)
+GLOBEX_PAGES = [
+    "Globex Holdings annual report. Letter from the chief executive to shareholders.",
+    (
+        "Globex operating margin expanded to 18 percent, driven by pricing actions "
+        "in North America."
+    ),
+]
+
+
+@dataclass(frozen=True)
+class Corpus:
+    acme_report: UUID
+    acme_liquidity: UUID
+    globex_report: UUID
+
+
+async def ingest_corpus(pool: Pool) -> Corpus:
+    """Ingest the fixture corpus through the real ingestion path."""
+    ingestor = Ingestor(
+        pool=pool,
+        embedder=KeywordEmbedder(),
+        tokenizer=FakeTokenizer(),
+        config=IngestionConfig(),
+    )
+    uploads = [
+        FakeUpload("acme-fy2025.txt", "text/plain", SMOKE_FIXTURE.read_bytes()),
+        FakeUpload("acme-liquidity.md", "text/markdown", LIQUIDITY_MD.encode()),
+        FakeUpload("globex-2025.pdf", "application/pdf", build_pdf(GLOBEX_PAGES)),
+    ]
+    ids = [(await ingestor.ingest(u, request_id="seed")).document_id for u in uploads]
+    return Corpus(*ids)

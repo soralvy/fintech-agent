@@ -6,6 +6,10 @@ never mocked (docs/DECISIONS.md section 20.2). They are skipped unless
 purpose. Every reset of that database goes through
 ``tests.db_safety.reset_test_schema``, which refuses to drop anything unless
 the live connection is a ``*_test`` database distinct from the application's.
+
+LangSmith tracing variables are removed from the environment at import, before
+any test module is collected or any graph is built: LangSmith caches its first
+read of them for the whole process (docs/TECH_BASELINE.md section 7).
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import pytest
 import tiktoken
 import tiktoken.load
 
-from app.config import DatabaseConfig
+from app.config import TRACING_ENV_VARS, DatabaseConfig
 from app.db import Connection, Pool, create_pool
 from tests.db_safety import reset_test_schema
 
@@ -26,11 +30,21 @@ TEST_DATABASE_URL_ENV = "TEST_DATABASE_URL"
 
 EMBEDDING_DIMENSIONS = 1536
 
+for _name in TRACING_ENV_VARS:
+    os.environ.pop(_name, None)
+
 
 @pytest.fixture(scope="session")
 def anyio_backend() -> str:
     """Run async tests on asyncio via the anyio plugin, which ships with anyio."""
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def _no_tracing_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset every tracing variable per test, so none leaks into the next."""
+    for name in TRACING_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

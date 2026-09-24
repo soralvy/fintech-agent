@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 DATABASE_URL_ENV = "DATABASE_URL"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_EMBEDDING_MODEL_ENV = "OPENAI_EMBEDDING_MODEL"
+OPENAI_LLM_MODEL_ENV = "OPENAI_LLM_MODEL"
 OPENAI_EMBEDDING_DIMENSIONS_ENV = "OPENAI_EMBEDDING_DIMENSIONS"
 MAX_UPLOAD_BYTES_ENV = "MAX_UPLOAD_BYTES"
 RETRIEVAL_TOP_K_ENV = "RETRIEVAL_TOP_K"
@@ -40,6 +41,12 @@ PINNED_EMBEDDING_MODEL = "text-embedding-3-small"
 # (docs/TECH_BASELINE.md section 3.11).
 SCHEMA_EMBEDDING_DIMENSIONS = 1536
 
+# The default answer model (docs/SPEC.md section 14). Unlike the embedding
+# model it is not a persistence decision, so ``OPENAI_LLM_MODEL`` may name any
+# model, which must support Structured Outputs and ``reasoning.effort="none"``
+# (docs/TECH_BASELINE.md section 3.10).
+DEFAULT_LLM_MODEL = "gpt-6-luna"
+
 # Bounds each embedding request; the SDK's own retries still apply within it.
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 30.0
 DEFAULT_OPENAI_MAX_RETRIES = 2
@@ -52,6 +59,22 @@ DEFAULT_CHUNK_OVERLAP_TOKENS = 120
 # for discarding obviously weak chunks, not a calibrated probability.
 DEFAULT_RETRIEVAL_TOP_K = 6
 DEFAULT_MIN_RETRIEVAL_SIMILARITY = 0.30
+
+# LangSmith arrives transitively through langgraph, and the application never
+# enables it (docs/TECH_BASELINE.md section 7). These are every variable that
+# LangSmith's ``tracing_is_enabled`` or langchain_core's v1 tracing check
+# reads, in the order ``require_tracing_disabled`` reports them.
+TRACING_ENV_VARS = (
+    "LANGSMITH_TRACING",
+    "LANGSMITH_TRACING_V2",
+    "LANGCHAIN_TRACING",
+    "LANGCHAIN_TRACING_V2",
+    "LANGCHAIN_HANDLER",
+)
+# The only values both packages treat as disabled, compared exactly as read:
+# no trimming and no case folding, since langchain_core's ``env_var_is_set``
+# treats "FALSE" or " false " as set and would then fail every graph run.
+TRACING_DISABLED_VALUES = frozenset({"", "0", "false", "False"})
 
 
 class ConfigError(RuntimeError):
@@ -79,6 +102,25 @@ class DatabaseConfig:
         if not url:
             raise ConfigError(f"{DATABASE_URL_ENV} is not set")
         return cls(url=url)
+
+
+def require_tracing_disabled() -> None:
+    """Refuse to run when any LangSmith tracing variable could enable tracing.
+
+    A protected variable passes only when it is unset or its exact value is in
+    ``TRACING_DISABLED_VALUES``. An explicitly set value is refused, never
+    silently overridden.
+
+    Raises:
+        ConfigError: the first offending variable in ``TRACING_ENV_VARS``
+            order. The message names the variable, never its value.
+    """
+    for name in TRACING_ENV_VARS:
+        value = os.environ.get(name)
+        if value is not None and value not in TRACING_DISABLED_VALUES:
+            raise ConfigError(
+                f"{name} must be unset or disabled; LangSmith tracing is not supported"
+            )
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -112,7 +154,7 @@ def _unit_interval_float(name: str, default: float) -> float:
 
 @dataclass(frozen=True, slots=True)
 class OpenAIConfig:
-    """Credentials and model identity for the embedding provider.
+    """Credentials and model identity for the embedding and answer models.
 
     ``api_key`` is excluded from ``repr`` so the dataclass can never render it.
     """
@@ -120,6 +162,7 @@ class OpenAIConfig:
     api_key: str = field(repr=False)
     embedding_model: str = PINNED_EMBEDDING_MODEL
     embedding_dimensions: int = SCHEMA_EMBEDDING_DIMENSIONS
+    llm_model: str = DEFAULT_LLM_MODEL
     timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_OPENAI_MAX_RETRIES
 
@@ -131,7 +174,9 @@ class OpenAIConfig:
         current vertical slice, so the application refuses to start without it.
 
         An unset or blank ``OPENAI_EMBEDDING_MODEL`` resolves to the pinned
-        model; any other explicit value is rejected.
+        model; any other explicit value is rejected. An unset or blank
+        ``OPENAI_LLM_MODEL`` resolves to ``DEFAULT_LLM_MODEL``; any other
+        value is kept as an opaque model name.
 
         Raises:
             ConfigError: the key is unset or empty, the model is not the pinned
@@ -158,8 +203,14 @@ class OpenAIConfig:
                 f"{OPENAI_EMBEDDING_DIMENSIONS_ENV} must be "
                 f"{SCHEMA_EMBEDDING_DIMENSIONS} to match the vector column"
             )
+        llm_model = (
+            os.environ.get(OPENAI_LLM_MODEL_ENV, "").strip() or DEFAULT_LLM_MODEL
+        )
         return cls(
-            api_key=api_key, embedding_model=model, embedding_dimensions=dimensions
+            api_key=api_key,
+            embedding_model=model,
+            embedding_dimensions=dimensions,
+            llm_model=llm_model,
         )
 
 
@@ -191,10 +242,8 @@ class IngestionConfig:
 class RetrievalConfig:
     """Candidate count and weak-result threshold (docs/DECISIONS.md section 8).
 
-    Not yet read at startup: nothing in the running application retrieves
-    until ``POST /v1/query`` exists, so the lifespan builds this in Milestone 4
-    (docs/TASKS.md). Until then an invalid value is rejected only where this
-    class is constructed, not when the application starts.
+    Read at startup: the lifespan builds it with the other configuration, so
+    an invalid value stops the application before any resource is created.
     """
 
     top_k: int = DEFAULT_RETRIEVAL_TOP_K

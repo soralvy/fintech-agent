@@ -138,9 +138,9 @@ The Milestone 2 architecture audit found these gaps and deliberately deferred th
 | Deferred change | Do it at |
 |---|---|
 | ~~Request-ID `ContextVar` in `app/logging.py`, so adapter events carry `request_id` without threading it through every signature; list the adapter events (`embedding.*`, `tokenizer.load_failed`) in `docs/DECISIONS.md` §19~~ | **Done in Milestone 3** (2026-09-23; `docs/DECISIONS.md` §19) |
-| Build `RetrievalConfig` in the lifespan, so an invalid `RETRIEVAL_TOP_K` or `MIN_RETRIEVAL_SIMILARITY` stops startup. *Added 2026-09-23 by Milestone 3.* Until then these variables are validated only where `RetrievalConfig` is constructed, **not** at application startup | Milestone 4, when `POST /v1/query` first uses retrieval |
-| Catch-all `internal_error` envelope, and a `RequestValidationError` handler that keeps JSON-body validation in the SPEC §12.1 envelope | Milestone 4, with `POST /v1/query` |
-| Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change | Milestone 4 |
+| ~~Build `RetrievalConfig` in the lifespan, so an invalid `RETRIEVAL_TOP_K` or `MIN_RETRIEVAL_SIMILARITY` stops startup. *Added 2026-09-23 by Milestone 3.* Until then these variables are validated only where `RetrievalConfig` is constructed, **not** at application startup~~ | **Done in Milestone 4** (2026-09-24; `app/main.py` lifespan; `tests/test_http.py`) |
+| ~~Catch-all `internal_error` envelope, and a `RequestValidationError` handler that keeps JSON-body validation in the SPEC §12.1 envelope~~ | **Done in Milestone 4** (2026-09-24; `UnexpectedErrorMiddleware` and the `RequestValidationError` and `StarletteHTTPException` handlers; `docs/DECISIONS.md` §13) |
+| ~~Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change~~ | **Done in Milestone 4** (2026-09-24; `app/schemas.py`, `GroundedAnswer` in `app/openai_provider.py`, `app/citations.py`; `docs/DECISIONS.md` §4) |
 | `contextlib.AsyncExitStack` in the lifespan | Milestone 5, when the MCP client becomes the third lifespan resource |
 | Single-flight tokenizer load, so a stalled download cannot pile up worker threads; level and timestamp in JSON log lines | Milestone 7 |
 | Move PDF extraction off the event loop (`asyncio.to_thread`) | Only if the Milestone 8 real-PDF measurement shows the event loop stalling (`docs/DECISIONS.md` §22) |
@@ -187,28 +187,77 @@ Target: ~2–2.5 hours.
 
 Implement the no-tools path first.
 
-- [ ] Define graph state.
-- [ ] Add `validate_query`.
-- [ ] Add `embed_query`.
-- [ ] Add `retrieve`.
-- [ ] Add `build_context`.
-- [ ] Add `answer`.
-- [ ] Add `finalize`.
-- [ ] Compile the `StateGraph`.
-- [ ] Implement grounded-answer prompt.
-- [ ] Implement structured model response:
+- [x] Define graph state.
+- [x] Add `validate_query`.
+- [x] Add `embed_query`.
+- [x] Add `retrieve`.
+- [x] Add `build_context`.
+- [x] Add `answer`.
+- [x] Add `finalize`.
+- [x] Compile the `StateGraph`.
+- [x] Implement grounded-answer prompt.
+- [x] Implement structured model response:
   - `answer`
   - `citation_ids`
   - `insufficient_context`
-- [ ] Map model citation labels back to application-owned metadata.
-- [ ] Reject/drop nonexistent citation IDs.
-- [ ] Add explicit insufficient-context route.
-- [ ] Add graph tests with deterministic fake LLM/embeddings.
-- [ ] Add `POST /v1/query` with `use_tools=false`.
+- [x] Map model citation labels back to application-owned metadata.
+- [x] Reject/drop nonexistent citation IDs.
+- [x] Add explicit insufficient-context route.
+- [x] Add graph tests with deterministic fake LLM/embeddings.
+- [x] Add `POST /v1/query` with `use_tools=false`.
 
 **Vertical-slice checkpoint:** ingest document -> ask question -> retrieve -> grounded answer -> verified citation.
 
 This is the most important checkpoint in the project.
+
+**Verified 2026-09-24.** The checkpoint is met. The change was specified in `docs/changes/M4-query-graph.md` and built in four reviewed stages on `feat/milestone-4-implementation`: A, the pure citation and prompt rules; B, the compiled graph over fakes; C, the OpenAI answer adapter; D, composition, `POST /v1/query`, and the error envelopes. The decisions it relies on were recorded by the step-1 alignment commit (`0df1abd`) in `docs/SPEC.md` §2 and §14, `docs/TECH_BASELINE.md` §2, §3.10 and §7, and `docs/DECISIONS.md` §4, §9–§13, §15, §17, §19, and §21. Stage C's review added the `malformed_response` outcome to `docs/DECISIONS.md` §12.
+
+Exit condition, automated (AC1): `test_query_answers_from_an_ingested_document_with_a_verified_citation` (`tests/test_http.py`) runs the real lifespan against PostgreSQL. It uploads `tests/fixtures/smoke.txt` and asks "Why did Acme's European revenue decline?". The answer is `answered`, with one `D1` citation whose `document_id`, `chunk_id`, filename, and `null` page match the stored row, and whose excerpt is an exact substring of the stored content. The model's unknown `D9` is dropped from the citations and the answer. An unrelated question gives the exact insufficient-context body with no model call, and both queries leave the row counts unchanged. The embedder and the answer model are deterministic fakes.
+
+Automated verification:
+
+- `DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py`: exit 0.
+  - `uv lock --check`: passed.
+  - `uv run ruff format --check .`: 46 files already formatted.
+  - `uv run ruff check .`: passed.
+  - `uv run mypy` (strict; `app`, `tests`, `scripts`): no issues in 34 source files.
+  - `uv run pytest`: 535 passed, 0 skipped.
+- Without `TEST_DATABASE_URL`, `uv run pytest` reports 450 passed and 85 skipped, so 85 tests need PostgreSQL and every one of them ran in the gate.
+- `git diff --check`: passed.
+- Import boundaries (`docs/changes/M4-query-graph.md` §19): FastAPI and Starlette appear in none of `graph.py`, `citations.py`, `prompts.py`, or `openai_provider.py`; `langgraph` and `openai` appear in neither `citations.py` nor `prompts.py`; psycopg appears only in `db.py`; `langsmith` and `langchain_core` appear nowhere in `app/`; no `exception_handler(Exception)` or `(500)` is registered.
+
+Offline live HTTP smoke, `uv run uvicorn app.main:app` against the `fintech` database with a dummy key, sending no valid query:
+
+1. With `RETRIEVAL_TOP_K=0`, startup fails with `ConfigError: RETRIEVAL_TOP_K must be a positive integer` (exit 3). With `LANGSMITH_TRACING=true`, it fails with `LANGSMITH_TRACING must be unset or disabled; LangSmith tracing is not supported` (exit 3), and the value does not appear in the log. Starlette's lifespan handling logs a traceback for these two deliberate failures, so their logs, kept separately, are not part of the scan in step 5.
+2. A fresh server with every tracing variable unset: `/health` returned `200`.
+3. `/v1/query` returned `422` with the generic `invalid_request` body, without echoing the question, for a 2-character question, an extra field, malformed JSON, `use_tools: "true"`, and a non-UTF-8 JSON body.
+4. `/v1/documents` still returned `415 unsupported_file_type` for `run.exe`, and its multipart `422` message for a request with no file.
+5. The log of steps 2–4 contained 0 occurrences of the dummy key, `postgresql://`, `Traceback`, and the question sentinel.
+
+**Real-provider smoke test (approved 2026-09-24).**
+
+Setup:
+
+- A new, isolated database, `fintech_smoke_m4`, created only after checking that it did not exist, migrated, and confirmed empty. No other database was dropped, reset, or modified. It is left in place.
+- The server started from an empty environment (`env -i`) with only `PATH`, `HOME`, the key read from the gitignored `.env` (never printed), `DATABASE_URL` pointing at the smoke database, and `OPENAI_LOG=info`, which logs the SDK's retry notices but no request or response bodies. The server's environment was checked and held none of the five tracing variables.
+- The upload was a copy of `smoke.txt` with a unique run-marker line, built in memory.
+- The client printed only status codes, booleans, counts, and latencies: no answer, excerpt, prompt, or document text.
+
+Results:
+
+1. The upload returned `201 ingested`, with `chunk_count 1` and `page_count null`.
+2. "Why did Acme's European revenue decline?" returned `200 answered`, `tools_used []`, and one citation, `D1`. Its `document_id` is the uploaded document, its `chunk_id` exists in `fintech_smoke_m4` under that document, its excerpt (114 characters) is an exact substring of the stored content and contains "European revenue declined 4%", and the answer's only marker is `[D1]`.
+3. An unrelated question returned exactly the fixed insufficient-context body, with no answer-model call.
+4. The answerable question with `use_tools: true` returned `200 answered` with `tools_used []` and the same verified `D1` citation.
+5. Calls, from the application's events and the SDK's retry notices:
+   - 4 logical embedding calls to `text-embedding-3-small`, one for the document's single chunk and one per query, with no `embedding.*` failure events;
+   - 2 logical answer calls to `gpt-6-luna`, both `attempt 1`, with no `generation.invalid_output` or `generation.request_failed` events, so no structured-output retry;
+   - 0 SDK transport retries, so 6 HTTP requests to the OpenAI API in total.
+6. The two answer calls each used 393 input and 55 output tokens, well within the 1200-token output budget, and took 3114 ms and 2082 ms. The full requests took 4044 ms and 2201 ms; the unrelated question took 121 ms.
+7. The server log (124 lines) contained 0 occurrences of the real key, `sk-`, `Authorization`, `postgresql://`, `Traceback`, either question, the document text, the run marker, and the prompt tags.
+8. The smoke database holds 1 document and 1 chunk.
+
+One call outside the approved list was made. Because `env -i` dropped `TMPDIR`, tiktoken looked for its cache in `/tmp/data-gym-cache` rather than the per-user temporary directory, found nothing, and downloaded the public `cl100k_base` encoding file (1,681,126 bytes) during the upload. That is an unauthenticated download of a public file that carries no key and none of the application's data, but it is a network request the approval did not list. A future clean-environment smoke run should pass `TMPDIR` or `TIKTOKEN_CACHE_DIR` through.
 
 ---
 
