@@ -32,7 +32,13 @@ from app.errors import (
     ErrorType,
     InvalidQueryError,
 )
-from app.graph import QueryGraph, QueryResult, build_query_graph, run_query
+from app.graph import (
+    QueryGraph,
+    QueryResult,
+    QueryRetriever,
+    build_query_graph,
+    run_query,
+)
 from app.logging import bind_request_id
 from app.openai_provider import GroundedAnswer
 from app.prompts import GROUNDED_ANSWER_INSTRUCTIONS, render_grounded_answer_input
@@ -90,7 +96,9 @@ def grounded(
     )
 
 
-def graph_over(retriever: Any, answerer: ScriptedAnswerGenerator) -> QueryGraph:
+def graph_over(
+    retriever: QueryRetriever, answerer: ScriptedAnswerGenerator
+) -> QueryGraph:
     return build_query_graph(retriever=retriever, answerer=answerer)
 
 
