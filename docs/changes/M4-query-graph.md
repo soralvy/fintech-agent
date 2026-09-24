@@ -6,8 +6,8 @@
 - **Milestone:** 4, Minimal LangGraph grounded answer (`docs/TASKS.md` Milestone 4).
 - **Branch:** `feat/milestone-4-query-graph`, created from `origin/main` at `c86b8e6`.
 - **Date:** 2026-09-23.
-- **Implementation:** not started; no acceptance criterion is met.
-- **Step 1 (contract alignment, §11):** applied to the working tree on 2026-09-23 and awaiting user review; not yet committed. It amends `docs/SPEC.md` §2 and §14; `docs/TECH_BASELINE.md` §2, §3.10, and §7; and `docs/DECISIONS.md` §4, §9, §10.1, §10.9, §11, §12, §13, §15, §17, §19, and §21. The §9, §10.1, and §11 entries record the state, node boundary, and topology of §10 of this spec, beyond the sections step 1 lists. `docs/TASKS.md` and `CLAUDE.md` are untouched until Stage D.
+- **Implementation:** complete 2026-09-24 on `feat/milestone-4-implementation`, in Stages A–D; every §13 row is met. Evidence is in `docs/TASKS.md` Milestone 4.
+- **Step 1 (contract alignment, §11):** committed as `0df1abd` on 2026-09-23, before any code commit. It amends `docs/SPEC.md` §2 and §14; `docs/TECH_BASELINE.md` §2, §3.10, and §7; and `docs/DECISIONS.md` §4, §9, §10.1, §10.9, §11, §12, §13, §15, §17, §19, and §21. The §9, §10.1, and §11 entries record the state, node boundary, and topology of §10 of this spec, beyond the sections step 1 lists. `docs/TASKS.md` and `CLAUDE.md` are untouched until Stage D.
 
 **Precedence.** `docs/SPEC.md` > `docs/DECISIONS.md` > `docs/TECH_BASELINE.md` > `docs/TASKS.md` (`CLAUDE.md`). This spec refines those documents; it does not override them.
 

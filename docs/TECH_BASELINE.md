@@ -430,7 +430,7 @@ max_output_tokens=1200, store=False
 - `ReasoningEffort` includes `"none"`. The `max_output_tokens` docstring states that the bound includes "visible output tokens and reasoning tokens".
 - Transport retries (`_should_retry`): 408, 409, 429, ≥500, or `x-should-retry: true`; no retry when `Retry-After` exceeds the SDK maximum; backoff 0.5–8 s. With the project's `max_retries=2`, one logical call may make up to three HTTP attempts, each bounded by the 30 s client timeout.
 
-The outcome classification (incomplete, unexpected status, refusal, invalid structured output with its single retry, valid) and the logical-call budget are architecture and live in `docs/DECISIONS.md` §12.
+The outcome classification (malformed response, incomplete, unexpected status, refusal, invalid structured output with its single retry, valid) and the logical-call budget are architecture and live in `docs/DECISIONS.md` §12.
 
 **Retention (D6).** `store=False` disables stored Responses application state. It does **not** by itself guarantee zero retention: the OpenAI "your data" guide (fetched 2026-09-23) states that abuse-monitoring logs are "retained for up to 30 days", and only the approval-gated Zero Data Retention or Modified Abuse Monitoring controls exclude customer content from them. The project claims no stronger guarantee.
 
