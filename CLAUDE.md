@@ -10,6 +10,15 @@ A FinTech research agent: upload financial documents, ask questions, get answers
 
 Treat `docs/` as the source of truth and build against it. `README.md` is empty.
 
+## Project status maintenance
+
+`docs/PROJECT_STATUS.md` is a derived navigation document for starting a session: completed milestones, the latest recorded verification, open decisions, and the next action. It is never authoritative. Code, tests, configuration, and the canonical documents take precedence, and a contradiction is resolved by correcting `PROJECT_STATUS.md`, never by treating it as the source.
+
+- Update it as part of every milestone's final changes, and whenever an approved scope change or blocker materially changes the next action. Update the "Project status" paragraph above in the same change, since it is a second milestone-status summary and not itself a canonical source.
+- Record completion only from repository evidence — checked tasks and verification records in `docs/TASKS.md`, code, and Git history — never from a plan or a chat message.
+- Keep detailed evidence (commands, counts, smoke-test steps) in `docs/TASKS.md`; `PROJECT_STATUS.md` summarizes and links to it. Leave out volatile state such as the current branch, PR state, or a commit hash of the change that contains the update.
+- Run the full gate after status or documentation updates, not before them.
+
 ## Workflow
 
 - When the user asks to begin or implement a new milestone, feature, fix, refactor, documentation task, test task, CI task, or issue, invoke `start-task` before the first repository mutation. It runs as a blocking forked subagent, so its tool restrictions do not carry over to the implementation. Do not create a new branch for read-only work or when continuing the matching current task branch.
