@@ -22,6 +22,7 @@ from app.config import IngestionConfig
 from app.db import Pool
 from app.errors import AppError
 from app.ingestion import Ingestor
+from app.market_data import CompanyOverview, MarketQuote
 from app.openai_provider import GroundedAnswer
 from app.retrieval import RetrievedChunk
 from tests.conftest import EMBEDDING_DIMENSIONS, embedding
@@ -343,3 +344,38 @@ def alpha_vantage_transport(
         return await respond(request)
 
     return RecordingTransport(httpx.MockTransport(handler), requests)
+
+
+class ScriptedMarketDataProvider:
+    """A ``MarketDataProvider`` that returns or raises scripted outcomes.
+
+    Each method returns its scripted model or raises its scripted exception,
+    which may be a ``MarketDataError`` or any other exception. Every call is
+    recorded as ``(method, symbol)``. It performs no network access.
+    """
+
+    def __init__(
+        self,
+        *,
+        quote: MarketQuote | Exception | None = None,
+        overview: CompanyOverview | Exception | None = None,
+    ) -> None:
+        self.quote = quote
+        self.overview = overview
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_quote(self, symbol: str) -> MarketQuote:
+        self.calls.append(("get_quote", symbol))
+        if isinstance(self.quote, Exception):
+            raise self.quote
+        if self.quote is None:
+            raise AssertionError("no quote scripted")
+        return self.quote
+
+    async def get_overview(self, symbol: str) -> CompanyOverview:
+        self.calls.append(("get_overview", symbol))
+        if isinstance(self.overview, Exception):
+            raise self.overview
+        if self.overview is None:
+            raise AssertionError("no overview scripted")
+        return self.overview
