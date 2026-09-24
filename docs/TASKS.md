@@ -141,7 +141,7 @@ The Milestone 2 architecture audit found these gaps and deliberately deferred th
 | ~~Build `RetrievalConfig` in the lifespan, so an invalid `RETRIEVAL_TOP_K` or `MIN_RETRIEVAL_SIMILARITY` stops startup. *Added 2026-09-23 by Milestone 3.* Until then these variables are validated only where `RetrievalConfig` is constructed, **not** at application startup~~ | **Done in Milestone 4** (2026-09-24; `app/main.py` lifespan; `tests/test_http.py`) |
 | ~~Catch-all `internal_error` envelope, and a `RequestValidationError` handler that keeps JSON-body validation in the SPEC §12.1 envelope~~ | **Done in Milestone 4** (2026-09-24; `UnexpectedErrorMiddleware` and the `RequestValidationError` and `StarletteHTTPException` handlers; `docs/DECISIONS.md` §13) |
 | ~~Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change~~ | **Done in Milestone 4** (2026-09-24; `app/schemas.py`, `GroundedAnswer` in `app/openai_provider.py`, `app/citations.py`; `docs/DECISIONS.md` §4) |
-| `contextlib.AsyncExitStack` in the lifespan | Milestone 5, when the MCP client becomes the third lifespan resource |
+| `contextlib.AsyncExitStack` in the lifespan | ~~Milestone 5~~ Milestone 6, when the MCP client becomes the third lifespan resource (*moved 2026-09-24*: the Milestone 5 client is standalone; `docs/changes/M5-mcp-server.md` §15) |
 | Single-flight tokenizer load, so a stalled download cannot pile up worker threads; level and timestamp in JSON log lines | Milestone 7 |
 | Move PDF extraction off the event loop (`asyncio.to_thread`) | Only if the Milestone 8 real-PDF measurement shows the event loop stalling (`docs/DECISIONS.md` §22) |
 
@@ -267,7 +267,9 @@ Target: ~1.5–2 hours.
 
 Do this only after the RAG-only path works.
 
-- [ ] Verify installed MCP SDK major version against current official documentation. The pin is `mcp==2.2.0`; re-verify every API note in `docs/TECH_BASELINE.md` §3.9 against the installed 2.2.0 package before writing MCP code, and record any difference there.
+Change specification: `docs/changes/M5-mcp-server.md`, approved revision 3 (final independent review passed 2026-09-24). The Milestone 5 MCP client is **standalone**: it is not wired into the FastAPI lifespan, and `main.py`, `graph.py`, and the HTTP contract do not change. Lifespan wiring and `contextlib.AsyncExitStack` belong to Milestone 6.
+
+- [x] Verify installed MCP SDK major version against current official documentation. The pin is `mcp==2.2.0`; re-verify every API note in `docs/TECH_BASELINE.md` §3.9 against the installed 2.2.0 package before writing MCP code, and record any difference there. *Verified 2026-09-24.* Evidence: `docs/changes/M5-mcp-server.md` §5 covers the installed package source, the offline in-process and stdio probes, and the official SDK documentation (PyPI latest: 2.2.0). §11.1 covers the Alpha Vantage documentation read, with no API call. The findings are recorded in `docs/TECH_BASELINE.md` §3.9 (amendment 2026-09-24), §3.17, and §3.18.
 - [ ] Create local MCP server.
 - [ ] Implement strict ticker validator.
 - [ ] Implement `get_market_quote`.
@@ -301,6 +303,7 @@ Target: ~1–1.5 hours.
 - [ ] Include provider/freshness metadata in MCP citations.
 - [ ] Ensure failed tool output never becomes grounding context.
 - [ ] Continue with document evidence when an optional tool fails.
+- [ ] Wire the MCP client into the FastAPI lifespan with `contextlib.AsyncExitStack` (moved from Milestone 5 on 2026-09-24), and decide the startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server child fails to start.
 - [ ] Add graph tests for:
   - tools disabled;
   - tools enabled/no tool selected;

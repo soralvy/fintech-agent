@@ -566,9 +566,12 @@ Tool errors must distinguish:
 - provider rate limit;
 - provider authentication failure;
 - provider timeout;
-- malformed upstream response.
+- malformed upstream response;
+- provider unavailable (*added 2026-09-24, Milestone 5*): a transport failure, an HTTP redirect (redirects are not followed), a 5xx or other unexpected HTTP status, or any other unexpected provider failure or unknown MCP error. It carries no provider or MCP error text.
 
 Errors must never contain the API key.
+
+The codes are the closed set `invalid_input`, `no_data`, `rate_limited`, `authentication_failed`, `timeout`, `malformed_provider_response`, and `provider_unavailable` (`docs/DECISIONS.md` §14).
 
 The answering graph treats tool errors as unavailable optional evidence, not as factual context.
 
@@ -950,7 +953,7 @@ ALPHA_VANTAGE_API_KEY
 MAX_UPLOAD_BYTES=10485760
 RETRIEVAL_TOP_K=6
 MIN_RETRIEVAL_SIMILARITY=0.30
-MCP_TOOL_TIMEOUT_SECONDS=<small bounded value>
+MCP_TOOL_TIMEOUT_SECONDS=5.0
 ```
 
 The optional post-baseline decision layer has its own configuration, listed in §18.7. None of it is required for the baseline.
@@ -960,6 +963,8 @@ Secrets must not have hard-coded defaults.
 `OPENAI_LLM_MODEL` defaults to `gpt-6-luna` (*amended 2026-09-23*; previously `gpt-5.6-luna`). Unset or blank resolves to that default. Any other value is an opaque model name, which must support the Responses API with Structured Outputs and `reasoning.effort="none"`; the provider rejects any other model at request time (`docs/TECH_BASELINE.md` §3.10).
 
 `OPENAI_EMBEDDING_MODEL` and `OPENAI_EMBEDDING_DIMENSIONS` describe stored vectors, not tunables. The MVP supports exactly `text-embedding-3-small` at 1536 dimensions. Unset or blank values resolve to those, and any other value fails startup (*recorded 2026-09-23*; `docs/TECH_BASELINE.md` §3.11).
+
+`MCP_TOOL_TIMEOUT_SECONDS` (*recorded 2026-09-24, Milestone 5*) bounds each market-data provider request. It defaults to `5.0`; unset or blank resolves to that default. A configured value must be a finite number with `0 < value <= 30`. Any other value fails startup of the process that constructs `MarketDataConfig`, with a message that names the variable but never its value. In Milestone 5 that process is the stdio MCP server; the API process does not read the setting until Milestone 6. `ALPHA_VANTAGE_API_KEY` has no default.
 
 Tests should replace external clients with deterministic fakes and therefore must not require real API keys.
 
