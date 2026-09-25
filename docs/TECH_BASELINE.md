@@ -27,12 +27,13 @@ Use the following baseline:
 - pgvector PostgreSQL extension `0.8.6`
 - Psycopg `3.3.5`, using the binary and pool extras
 - pgvector Python adapter `0.5.0`
-- MCP Python SDK `2.2.0` (the pin in `pyproject.toml`; corrected 2026-09-23, §3.9)
+- MCP Python SDK `2.2.0` (the pin in `pyproject.toml`; corrected 2026-09-23, and its API notes verified against the installed package on 2026-09-24, §3.9)
 - OpenAI Python SDK `3.14.1`
 - OpenAI answer/planning model `gpt-6-luna` (amended 2026-09-23 from `gpt-5.6-luna`, §3.10)
 - OpenAI embedding model `text-embedding-3-small`, fixed at `1536` dimensions
 - pypdf `6.19.0` (added 2026-09-23, §3.14)
 - tiktoken `0.14.0`, encoding `cl100k_base` (added 2026-09-23, §3.15)
+- httpx `0.28.1`, for the Alpha Vantage adapter (selected 2026-09-24, §3.17; declared directly in `pyproject.toml` by Milestone 5 Stage B, `361338e`).
 - pytest `9.1.1`
 
 Direct application dependencies should initially be pinned to these versions. `uv.lock` becomes the authoritative record of the complete resolved dependency graph once generated.
@@ -308,12 +309,12 @@ Vector type registration must occur for every usable pooled connection, not just
 
 **Selected version:** `mcp==2.2.0`
 
-**Corrected 2026-09-23.** This section previously named `2.0.0`, but `pyproject.toml` has pinned `mcp==2.2.0` since the dependency set was first committed, and `uv.lock` and the installed package both resolve `2.2.0`. The version is now correct. The API notes below were written against the v2 line in general. They have **not** yet been checked against the installed 2.2.0 package or exercised by any implementation. Milestone 5 re-verifies them against 2.2.0 before any MCP code is written (`docs/TASKS.md` Milestone 5, first task), and records any difference here.
+**Corrected 2026-09-23.** This section previously named `2.0.0`, but `pyproject.toml` has pinned `mcp==2.2.0` since the dependency set was first committed, and `uv.lock` and the installed package both resolve `2.2.0`. The version is now correct. The API notes below were first written against the v2 line in general. They were verified against the installed 2.2.0 package and the official documentation on 2026-09-24; see the amendment at the end of this section. No implementation has exercised them yet.
 
 **Official documentation:**
 
-[MCP Python SDK documentation](https://py.sdk.modelcontextprotocol.io/?utm_source=chatgpt.com)  
-[MCP Python SDK v2 repository documentation](https://github.com/modelcontextprotocol/python-sdk?utm_source=chatgpt.com)
+[MCP Python SDK documentation](https://py.sdk.modelcontextprotocol.io/)\
+[MCP Python SDK v2 repository documentation](https://github.com/modelcontextprotocol/python-sdk)
 
 **API/features used:**
 
@@ -356,7 +357,45 @@ A tool call may return a protocol result marked as an error rather than necessar
 
 No HTTP MCP server, remote MCP deployment, sampling, elicitation, or generalized tool discovery is needed.
 
-**Verified:** 2026-09-16
+**Verified:** 2026-09-16; re-verified against the installed 2.2.0 package on 2026-09-24 (amendment below).
+
+### Amendment 2026-09-24 — verification against the installed `mcp==2.2.0` (Milestone 5)
+
+**Method.** The findings come from three sources: the installed source of `mcp` 2.2.0 and `mcp-types` 2.2.0; offline probe scripts, which ran an in-process `MCPServer` through `Client` and a real stdio subprocess with no network call; and the official documentation at `py.sdk.modelcontextprotocol.io`, read on 2026-09-24 (the index, "Testing", "Handling errors", "Structured output", "Protocol versions", and "Client transports"). PyPI lists 2.2.0 as the latest release. The detailed evidence is in `docs/changes/M5-mcp-server.md` §5.
+
+**Confirmed.** Every API note above holds:
+
+- `from mcp.server import MCPServer` and `@mcp.tool()`, with `name`, `description`, `annotations`, and `structured_output` keywords;
+- type annotations become the input schema;
+- `from mcp import Client, StdioServerParameters`, and `async with Client(...)`;
+- `call_tool(name, arguments)` returns a `CallToolResult` with `is_error`, `content`, and `structured_content`;
+- a tool failure is an `is_error=True` result, not a client exception;
+- in-process `Client(server)` works for tests;
+- `Client.__aenter__` performs discovery or the handshake itself, so there is no v1 choreography.
+
+**Differences and additions:**
+
+1. **Protocol modes.** `Client.mode` defaults to `"auto"`.
+   - With an in-process server, `"auto"` uses a direct dispatcher: no JSON-RPC framing and no `initialize` handshake, protocol `2026-07-28`.
+   - Over stdio, `"auto"` negotiates `2026-07-28` with JSON-RPC newline framing. Subprocess startup took about 280 ms in the probe.
+   - `mode="legacy"` forces the `initialize` handshake (`2025-11-25`). The application does not use it.
+   - An in-process test therefore exercises the request handlers but not wire serialization; only a stdio test covers serialization.
+2. **Structured output.** A Pydantic return annotation, with `extra="forbid"`, publishes an `output_schema` with `additionalProperties: false`. The server validates the return value before sending it. On the first `call_tool`, the client lists the tools and re-validates `structured_content` against the output schema with `jsonschema`. A mismatch raises `RuntimeError` whose message embeds the offending content.
+3. **Error handling and message safety.**
+   - Raising `mcp.server.mcpserver.exceptions.ToolError("x")` produces exactly one text block, `"Error executing tool <name>: x"`, and one `INFO` log line.
+   - Any other exception produces only `"Error executing tool <name>"` on the wire, but the server logs the full traceback **including the exception's message** at `ERROR`.
+   - An argument-validation failure returns pydantic's error text, which echoes the rejected input.
+   - An unknown tool name returns `"Unknown tool: <name>"`.
+   - On the client, a read timeout raises `MCPError(code=REQUEST_TIMEOUT)` (−32001), and a closed connection raises `MCPError(code=CONNECTION_CLOSED)` (−32000).
+
+   Consequence: a tool must raise only `ToolError` with a safe message, and a client must map error text against a closed set and never log it (`docs/DECISIONS.md` §14).
+4. **Unknown arguments are ignored (a limitation of the pinned SDK).** The generated input schema has no `additionalProperties: false`, and unknown argument keys are silently dropped. For example, `{"symbol": "MSFT", "url": "http://x"}` succeeds. The application client enforces exact argument keys itself (`docs/DECISIONS.md` §14).
+5. **Response cache.** The default `CacheConfig()` caches only the four list verbs, including `tools/list`, never `tools/call`.
+6. **Logging side effect.** `MCPServer.__init__` calls `logging.basicConfig(level=log_level, handlers=[RichHandler(stderr)])`. `rich` arrives through `fastapi[standard]`. This is a no-op when the root logger already has handlers. A process that constructs the server should configure logging first.
+7. **Stdio environment.** The child inherits only `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, and `USER`, plus `StdioServerParameters.env`. `DATABASE_URL`, `OPENAI_API_KEY`, and `TMPDIR` are not inherited. Any variable the server needs must be passed explicitly.
+8. **Structured concurrency.** `Client` holds an `AsyncExitStack` and anyio task groups. It must be entered and exited in the same task.
+9. **Annotations.** `mcp.types.ToolAnnotations` has `read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint`, and `title`, and they remain hints only.
+10. **Dependencies.** `mcp` 2.2.0 depends on `httpx2`, a separate distribution, not on `httpx`.
 
 ---
 
@@ -519,7 +558,7 @@ Do not add pytest plugins unless an implemented test actually requires them.
 
 **Selected model ID:** `jev-1.13.0` (pinned versioned ID; the aliases `jev-latest` and `jev-preview` are not used — see `docs/DECISIONS.md` §25.6)
 
-**Selected integration:** direct REST over the `httpx` client already present through `fastapi[standard]`. The official `typesafe-sdk` is not added (`docs/DECISIONS.md` §25.3).
+**Selected integration:** direct REST over the `httpx` client, a direct dependency since Milestone 5 Stage B (§3.17). The official `typesafe-sdk` is not added (`docs/DECISIONS.md` §25.3). *(Amended 2026-09-24: this previously said httpx arrived only transitively through `fastapi[standard]`, before Milestone 5 declared it directly.)*
 
 **Official sources** (all read 2026-09-21):
 
@@ -659,6 +698,65 @@ Both reinforce two design rules: thresholds must be tuned per question type on p
 
 ---
 
+## 3.17 httpx — Alpha Vantage HTTP client (selected; declared in Milestone 5 Stage B)
+
+**Recorded 2026-09-24 for Milestone 5** (`docs/changes/M5-mcp-server.md` D19).
+
+**Selected version:** `httpx==0.28.1`
+
+**State before Stage B.** `httpx` was not declared in `pyproject.toml`. `uv.lock` already resolved 0.28.1 transitively, through `fastapi` (its `standard` extra), `fastapi-cloud-cli`, `langchain-core`, and `langgraph-sdk`. `openai` 3.14.1 and `mcp` 2.2.0 depend on `httpx2`, a separate distribution, not on `httpx`.
+
+**Why it became direct.** `app/market_data.py` imports `httpx` directly. §5 requires exact pins for direct third-party dependencies, so Milestone 5 Stage B (`361338e`, 2026-09-24) declared `httpx==0.28.1` in `pyproject.toml` before that import existed, then ran `UV_OFFLINE=1 uv lock` and `UV_OFFLINE=1 uv lock --check`. `httpx` is now a direct dependency, declared between `fastapi[standard]` and `langgraph` in `pyproject.toml`.
+
+- This is **not** an upgrade and adds no newly resolved distribution: 0.28.1 is the version already locked.
+- The expected lock change is exactly the root package's two `httpx` entries, and the resolved package count stays at 104. Any other lock change stops Stage B for review.
+- A scratch-copy dry run on 2026-09-24 showed exactly that result. The repository lockfile was not modified.
+
+**API/features used:** `httpx.AsyncClient` with `follow_redirects=False`, `httpx.Timeout`, `AsyncClient.stream` with `Response.aiter_bytes`, `httpx.HTTPError`, and `httpx.TimeoutException`. Tests use `httpx.MockTransport`.
+
+**Security-relevant behavior** (verified offline against 0.28.1 on 2026-09-24):
+
+- At `INFO`, the `httpx` logger records every request as `HTTP Request: GET <full URL> …`, including the query string.
+- `httpx.HTTPStatusError`'s message contains the full URL.
+- A timeout exception's `request.url` carries the URL.
+
+Alpha Vantage requires the key as a query parameter (§3.18), so the adapter holds the `httpx` and `httpcore` loggers at `WARNING`, never calls `raise_for_status`, and never lets an `httpx` exception or its text escape (`docs/DECISIONS.md` §19).
+
+**Confinement:** `httpx` is imported only by `app/market_data.py`.
+
+---
+
+## 3.18 Alpha Vantage API — documentation record (no package dependency)
+
+**Recorded 2026-09-24 for Milestone 5.**
+
+**Sources read (documentation pages only):** `https://www.alphavantage.co/documentation/`, sections "Quote Endpoint" (`#latestprice`) and "Company Overview" (`#company-overview`), and `https://www.alphavantage.co/support/`.
+
+**No API call was made:** no `/query` URL was requested, no key was used, and the "click for JSON output" example links were not followed.
+
+**Documented:**
+
+- **Quote:** `GET https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=<symbol>&apikey=<key>`.
+  - `function`, `symbol`, and `apikey` are required.
+  - `datatype` is optional: `json` by default, or `csv`.
+  - `entitlement` is optional: unset returns historical data; `realtime` and `delayed` are premium US data.
+  - "By default, the quote endpoint is updated at the end of each trading day for all users."
+- **Company overview:** `GET https://www.alphavantage.co/query?function=OVERVIEW&symbol=<symbol>&apikey=<key>`, with `function`, `symbol`, and `apikey` required.
+  - "Data is generally refreshed on the same day a company reports its latest earnings and financials."
+- **Key:** the key is passed only as the `apikey` query parameter.
+- **Limits:** the free service allows 25 requests per day. Premium plans allow 150, 300, 600, or 1200 requests per minute.
+
+**Not documented:**
+
+- the response JSON field names;
+- any error-response shape (no `"Error Message"`, `"Information"`, or `"Note"` envelope is described);
+- rate-limit-exceeded behavior;
+- HTTP status codes.
+
+**Consequence:** the adapter's field mapping and error-envelope classification are provisional, and they fail closed (`docs/DECISIONS.md` §14). Actual provider behavior is checked only by the separately authorized Milestone 8 smoke test. The adapter sends neither `datatype` nor `entitlement`, and describes the data as provider data that may be end-of-day, never as real-time.
+
+---
+
 # 4. Compatibility result
 
 The selected stack is compatible with the approved MVP:
@@ -790,7 +888,7 @@ This stack satisfies the required technical demonstration without expanding the 
 
 The most version-sensitive decisions for implementation are:
 
-- MCP Python SDK **v2.2.0**, using the v2 `MCPServer`/`Client` APIs rather than v1 examples (to be re-verified against 2.2.0 in Milestone 5);
+- MCP Python SDK **v2.2.0**, using the v2 `MCPServer`/`Client` APIs rather than v1 examples (verified against the installed 2.2.0 package on 2026-09-24, §3.9);
 - LangGraph **1.2.11**, using an explicit `StateGraph`;
 - OpenAI Python **3.14.1**, using the Responses API and Structured Outputs;
 - pgvector extension **0.8.6** with exact cosine search;

@@ -11,12 +11,14 @@ from app import db
 from app.config import (
     DEFAULT_LLM_MODEL,
     DEFAULT_MAX_UPLOAD_BYTES,
+    DEFAULT_MCP_TOOL_TIMEOUT_SECONDS,
     PINNED_EMBEDDING_MODEL,
     SCHEMA_EMBEDDING_DIMENSIONS,
     TRACING_DISABLED_VALUES,
     TRACING_ENV_VARS,
     ConfigError,
     IngestionConfig,
+    MarketDataConfig,
     OpenAIConfig,
     RetrievalConfig,
     require_tracing_disabled,
@@ -283,3 +285,141 @@ def test_each_exact_disabled_value_is_accepted(
     monkeypatch.setenv(name, value)
 
     require_tracing_disabled()
+
+
+# ---------------------------------------------------------------------------
+# MarketDataConfig
+# ---------------------------------------------------------------------------
+
+AV_SECRET = "AV-SENTINEL-KEY-7f3a"
+TIMEOUT_ERROR = (
+    "MCP_TOOL_TIMEOUT_SECONDS must be a number greater than 0 and at most 30"
+)
+
+
+def test_market_data_config_reads_and_trims_the_key_with_the_default_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", f"  {AV_SECRET}\n")
+    monkeypatch.delenv("MCP_TOOL_TIMEOUT_SECONDS", raising=False)
+
+    config = MarketDataConfig.from_env()
+
+    assert config.api_key == AV_SECRET
+    assert config.timeout_seconds == 5.0
+    assert DEFAULT_MCP_TOOL_TIMEOUT_SECONDS == 5.0
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "\t\n"])
+def test_market_data_key_is_required(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("ALPHA_VANTAGE_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", value)
+
+    with pytest.raises(ConfigError) as raised:
+        MarketDataConfig.from_env()
+
+    assert str(raised.value) == "ALPHA_VANTAGE_API_KEY is not set"
+
+
+def test_market_data_repr_never_renders_the_key() -> None:
+    config = MarketDataConfig(api_key=AV_SECRET, timeout_seconds=7.5)
+
+    assert AV_SECRET not in repr(config)
+    assert AV_SECRET not in str(config)
+    assert "timeout_seconds=7.5" in repr(config)
+
+
+@pytest.mark.parametrize("value", ["", "   "], ids=["empty", "blank"])
+def test_blank_timeout_resolves_to_the_default(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", AV_SECRET)
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT_SECONDS", value)
+
+    assert MarketDataConfig.from_env().timeout_seconds == 5.0
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("30", 30.0), ("30.0", 30.0), (" 2.5 ", 2.5), ("0.001", 0.001), ("1e1", 10.0)],
+)
+def test_valid_timeouts_are_read(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: float
+) -> None:
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", AV_SECRET)
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT_SECONDS", value)
+
+    assert MarketDataConfig.from_env().timeout_seconds == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0",
+        "0.0",
+        "-0",
+        "-1",
+        "-0.5",
+        "30.0001",
+        "31",
+        "1e9",
+        "nan",
+        "NaN",
+        "inf",
+        "-inf",
+        "Infinity",
+        "five",
+        "5s",
+        "5,0",
+        "0x5",
+        "AV-SENTINEL-KEY-7f3a",
+    ],
+)
+def test_invalid_timeouts_are_rejected_without_echoing_them(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", AV_SECRET)
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(ConfigError) as raised:
+        MarketDataConfig.from_env()
+
+    # An exact fixed message proves the rejected value is not echoed.
+    assert str(raised.value) == TIMEOUT_ERROR
+    assert AV_SECRET not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [0.0, -1.0, 30.0001, 31.0, math.nan, math.inf, -math.inf],
+)
+def test_direct_construction_enforces_the_same_timeout_bounds(timeout: float) -> None:
+    with pytest.raises(ConfigError) as raised:
+        MarketDataConfig(api_key=AV_SECRET, timeout_seconds=timeout)
+
+    assert str(raised.value) == TIMEOUT_ERROR
+
+
+@pytest.mark.parametrize("timeout", [0.001, 5.0, 30.0])
+def test_direct_construction_accepts_the_valid_range(timeout: float) -> None:
+    assert (
+        MarketDataConfig(api_key=AV_SECRET, timeout_seconds=timeout).timeout_seconds
+        == timeout
+    )
+
+
+def test_the_key_error_is_checked_before_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ALPHA_VANTAGE_API_KEY", raising=False)
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT_SECONDS", "nan")
+
+    with pytest.raises(ConfigError) as raised:
+        MarketDataConfig.from_env()
+
+    assert str(raised.value) == "ALPHA_VANTAGE_API_KEY is not set"

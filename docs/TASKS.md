@@ -141,7 +141,7 @@ The Milestone 2 architecture audit found these gaps and deliberately deferred th
 | ~~Build `RetrievalConfig` in the lifespan, so an invalid `RETRIEVAL_TOP_K` or `MIN_RETRIEVAL_SIMILARITY` stops startup. *Added 2026-09-23 by Milestone 3.* Until then these variables are validated only where `RetrievalConfig` is constructed, **not** at application startup~~ | **Done in Milestone 4** (2026-09-24; `app/main.py` lifespan; `tests/test_http.py`) |
 | ~~Catch-all `internal_error` envelope, and a `RequestValidationError` handler that keeps JSON-body validation in the SPEC §12.1 envelope~~ | **Done in Milestone 4** (2026-09-24; `UnexpectedErrorMiddleware` and the `RequestValidationError` and `StarletteHTTPException` handlers; `docs/DECISIONS.md` §13) |
 | ~~Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change~~ | **Done in Milestone 4** (2026-09-24; `app/schemas.py`, `GroundedAnswer` in `app/openai_provider.py`, `app/citations.py`; `docs/DECISIONS.md` §4) |
-| `contextlib.AsyncExitStack` in the lifespan | Milestone 5, when the MCP client becomes the third lifespan resource |
+| `contextlib.AsyncExitStack` in the lifespan | ~~Milestone 5~~ Milestone 6, when the MCP client becomes the third lifespan resource (*moved 2026-09-24*: the Milestone 5 client is standalone; `docs/changes/M5-mcp-server.md` §15) |
 | Single-flight tokenizer load, so a stalled download cannot pile up worker threads; level and timestamp in JSON log lines | Milestone 7 |
 | Move PDF extraction off the event loop (`asyncio.to_thread`) | Only if the Milestone 8 real-PDF measurement shows the event loop stalling (`docs/DECISIONS.md` §22) |
 
@@ -267,20 +267,51 @@ Target: ~1.5–2 hours.
 
 Do this only after the RAG-only path works.
 
-- [ ] Verify installed MCP SDK major version against current official documentation. The pin is `mcp==2.2.0`; re-verify every API note in `docs/TECH_BASELINE.md` §3.9 against the installed 2.2.0 package before writing MCP code, and record any difference there.
-- [ ] Create local MCP server.
-- [ ] Implement strict ticker validator.
-- [ ] Implement `get_market_quote`.
-- [ ] Implement `get_company_overview`.
-- [ ] Use a single provider adapter.
-- [ ] Add bounded HTTP timeout.
-- [ ] Normalize provider payloads into small schemas.
-- [ ] Detect provider error/rate-limit payloads.
-- [ ] Ensure error strings cannot contain API keys.
-- [ ] Add MCP unit tests with mocked provider HTTP.
-- [ ] Add at least one test crossing the real MCP protocol boundary using in-process transport if supported by the resolved SDK.
+Change specification: `docs/changes/M5-mcp-server.md`, approved revision 3 (final independent review passed 2026-09-24). The Milestone 5 MCP client is **standalone**: it is not wired into the FastAPI lifespan, and `main.py`, `graph.py`, and the HTTP contract do not change. Lifespan wiring and `contextlib.AsyncExitStack` belong to Milestone 6.
+
+- [x] Verify installed MCP SDK major version against current official documentation. The pin is `mcp==2.2.0`; re-verify every API note in `docs/TECH_BASELINE.md` §3.9 against the installed 2.2.0 package before writing MCP code, and record any difference there. *Verified 2026-09-24.* Evidence: `docs/changes/M5-mcp-server.md` §5 covers the installed package source, the offline in-process and stdio probes, and the official SDK documentation (PyPI latest: 2.2.0). §11.1 covers the Alpha Vantage documentation read, with no API call. The findings are recorded in `docs/TECH_BASELINE.md` §3.9 (amendment 2026-09-24), §3.17, and §3.18.
+- [x] Create local MCP server. `app/mcp_server.py`: `build_mcp_server(provider)` registers exactly `get_market_quote` and `get_company_overview` on `MCPServer("fintech-market-data", version="0.1.0", log_level="WARNING")`; `python -m app.mcp_server` is the stdio entry point (Stage C, `5758dae`).
+- [x] Implement strict ticker validator. `app/symbols.py` `normalize_symbol`: strip, ASCII checked before upper-casing, `[A-Z0-9.-]{1,15}` by `fullmatch`; used at the MCP tool boundary, in the client, and defensively in the adapter (Stage A, `31ed823`).
+- [x] Implement `get_market_quote`. Returns the strict `MarketQuote` model with string-valued financial fields and the fixed end-of-day freshness text.
+- [x] Implement `get_company_overview`. Returns the curated `CompanyOverview` model; control characters replaced, whitespace collapsed, only `description` truncated.
+- [x] Use a single provider adapter. `AlphaVantageProvider` in `app/market_data.py`, one fixed `GET https://www.alphavantage.co/query` with exactly `function`, `symbol`, `apikey`; no redirects, no retries (Stage B, `361338e`).
+- [x] Add bounded HTTP timeout. `MCP_TOOL_TIMEOUT_SECONDS` (default 5.0, `0 < value <= 30`) bounds the whole request and read with `anyio.fail_after`; the client deadline is that value plus 2.0 seconds.
+- [x] Normalize provider payloads into small schemas. `normalize_quote` and `normalize_overview`, fail closed: only `{}` and `{"Global Quote": {}}` give `no_data`.
+- [x] Detect provider error/rate-limit payloads. `classify_status` and `classify_envelope` map HTTP status and the provisional `"Error Message"`/`"Information"`/`"Note"` envelopes to the closed codes, including `provider_unavailable`.
+- [x] Ensure error strings cannot contain API keys. Every failure is a closed, runtime-validated code with no chained exception; `httpx`/`httpcore` are held at `WARNING`; tests assert the sentinel key is absent from errors, results, and every log record.
+- [x] Add MCP unit tests with mocked provider HTTP. `tests/test_market_data.py` owns the complete provider matrix over `httpx.MockTransport`.
+- [x] Add at least one test crossing the real MCP protocol boundary using in-process transport if supported by the resolved SDK. `tests/test_mcp.py` drives the real server definition through the in-process `Client` in `auto` mode, plus exactly one offline stdio subprocess test of `python -m app.mcp_server`.
 
 **Exit condition:** MCP client can call both tools and receive validated structured output without involving the LLM.
+
+**Verified 2026-09-24.** The exit condition is met. The change was specified in `docs/changes/M5-mcp-server.md` (approved revision 3) and built on `feat/milestone-5-mcp-server` in the approved order: step 1 contract alignment (`ddc34f4`), Stage A pure foundations (`31ed823`), Stage B provider adapter (`361338e`), Stage C MCP server (`5758dae`), and Stage D standalone client with completion records. Stages A, B, and C each passed an independent `project-review` with a CLEAN verdict before being committed. AC14 (concurrency) is withdrawn; AC1–AC13 and AC15–AC20 have passing evidence.
+
+Exit condition, automated (AC12): `test_the_client_returns_validated_results_for_both_tools` (`tests/test_mcp.py`) opens `open_market_data_tools` over the real `build_mcp_server` definition and receives a strict `ToolSuccess` for both tools. The provider is a scripted fake; no LLM, OpenAI client, or Alpha Vantage request is involved.
+
+What was built:
+
+- `app/symbols.py`, `MarketDataConfig` in `app/config.py`, `app/market_data.py`, `app/mcp_server.py`, and the standalone `app/mcp_client.py` (`MarketDataTools.call`, `open_market_data_tools`, `stdio_server_parameters`, and the `mcp.tool.*` events).
+- `httpx==0.28.1` declared directly in `pyproject.toml`; `uv.lock` changed only by the two root-package `httpx` entries, 104 packages, no version change.
+- The client is **standalone**: `app/main.py`, `app/graph.py`, the lifespan, and the HTTP contract are unchanged. `use_tools=true` still makes no MCP call and `tools_used` is still `[]`.
+
+Automated verification (implementation complete, before these completion records):
+
+- `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY UV_OFFLINE=1 uv run pytest tests/test_symbols.py tests/test_config.py tests/test_market_data.py tests/test_mcp.py -q`: exit 0, 525 passed (59, 134, 222, and 110 tests respectively).
+- `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY UV_OFFLINE=1 DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py`: exit 0, 968 passed, 0 skipped.
+- `UV_OFFLINE=1 uv lock --check`: exit 0, 104 packages. `git diff main -- pyproject.toml uv.lock`: exactly the approved Stage B `httpx` pin.
+- Every boundary check in `docs/changes/M5-mcp-server.md` §21 printed nothing, including `git diff --stat main -- app/main.py app/graph.py`.
+
+Protocol evidence:
+
+- In-process: the real `build_mcp_server` definition through `Client(..., mode="auto", cache=None)`, protocol `2026-07-28`.
+- Stdio (the single subprocess test against the server): `stdio_server_parameters` launches the real `python -m app.mcp_server` with the sentinel key `AV-SENTINEL-KEY-7f3a` and `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` set to `http://127.0.0.1:9` with `NO_PROXY=""`. It negotiated `2026-07-28` over JSON-RPC stdio, listed exactly the two tools, returned the exact wire text `Error executing tool get_market_quote: invalid_input` for an invalid symbol, left no child process after the context closed, and its captured stderr (read from a file, not `capfd`; see below) held no sentinel.
+- `mcp` 2.2.0 binds `stdio_client`'s `errlog` to `sys.stderr` at import time, so `capfd` cannot see a stdio child's stderr at all. The test instead connects through `stdio_client(params, errlog=<file>)` and reads that file. A separate positive-control test (not the server; a plain `python -c` subprocess) confirms the file actually receives a child's stderr before the real test relies on its absence.
+
+External calls: none. Every provider exchange used `httpx.MockTransport` or a scripted provider fake, no real key was used, and the stdio test sent only a symbol that fails validation behind a closed local proxy port, so no external/provider request could succeed. The only Alpha Vantage access in Milestone 5 was the documentation read recorded in `docs/TECH_BASELINE.md` §3.18. No live smoke test was run; the MCP smoke test belongs to Milestone 8.
+
+Known limitations carried forward:
+
+- Alpha Vantage response fields and error envelopes are undocumented, so the adapter's mapping is provisional and fails closed. Real provider behavior is checked only by the separately authorized Milestone 8 smoke test.
 
 ---
 
@@ -301,6 +332,7 @@ Target: ~1–1.5 hours.
 - [ ] Include provider/freshness metadata in MCP citations.
 - [ ] Ensure failed tool output never becomes grounding context.
 - [ ] Continue with document evidence when an optional tool fails.
+- [ ] Wire the MCP client into the FastAPI lifespan with `contextlib.AsyncExitStack` (moved from Milestone 5 on 2026-09-24), and decide the startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server child fails to start.
 - [ ] Add graph tests for:
   - tools disabled;
   - tools enabled/no tool selected;

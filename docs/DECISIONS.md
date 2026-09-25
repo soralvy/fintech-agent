@@ -241,6 +241,7 @@ Use this structure:
 │   ├── citations.py
 │   ├── prompts.py
 │   │
+│   ├── symbols.py
 │   ├── market_data.py
 │   ├── mcp_server.py
 │   └── mcp_client.py
@@ -264,6 +265,8 @@ Use this structure:
 │   ├── test_citations.py
 │   ├── test_prompts.py
 │   ├── test_graph.py
+│   ├── test_symbols.py
+│   ├── test_market_data.py
 │   ├── test_mcp.py
 │   └── test_http.py
 │
@@ -315,11 +318,21 @@ Import confinement after Milestone 4: FastAPI and Starlette only in `main.py` am
 
 Deferred beyond Milestone 4, or out of its scope (*recorded 2026-09-23*):
 
-- **Milestones 5–6:** `decide_tool`, `call_tool`, `route_tools`, the tool state fields, `T1` labels, MCP citations, non-empty `tools_used`, MCP settings, and `contextlib.AsyncExitStack` in the lifespan. `use_tools=true` is accepted in Milestone 4 but follows the document path with no MCP call (§13).
+- **Milestones 5–6:** `decide_tool`, `call_tool`, `route_tools`, the tool state fields, `T1` labels, MCP citations, non-empty `tools_used`, MCP settings, and `contextlib.AsyncExitStack` in the lifespan. `use_tools=true` is accepted in Milestone 4 but follows the document path with no MCP call (§13). *(Split 2026-09-24, see the Milestone 5 entry below: Milestone 5 owns `MarketDataConfig`, the MCP server, and the standalone client. Milestone 6 owns everything else in this item, including FastAPI lifespan wiring and `contextlib.AsyncExitStack`.)*
 - **Milestone 6, flagged and not resolved here:** for MCP citations, `docs/SPEC.md` §6.3 shows an `excerpt` field, while §15 below specifies `fields`.
 - **Milestone 7:** `http.request.started` and `http.request.completed`; `http.request.failed` for failures other than unexpected exceptions; the `/health` error envelope (it keeps `{"detail": ...}`); unifying `Ingestor.ingest`'s own request-ID binding with the middleware's; and the hardening checklist.
 - **Milestone 8:** README, real-PDF smoke test, and MCP smoke test.
 - **Not in Milestone 4:** new dependencies, generic LLM or provider frameworks, LangChain abstractions, dependency-injection frameworks, placeholder modules, persistence of queries or answers, a LangGraph checkpointer, and LangSmith tracing. Milestones 9–12 remain post-baseline.
+
+Added in Milestone 5 (*recorded 2026-09-24* by the step-1 contract alignment, implemented and verified 2026-09-24; `docs/changes/M5-mcp-server.md`, approved revision 3; evidence in `docs/TASKS.md` Milestone 5):
+
+- `app/symbols.py` (new): a pure, standard-library-only module owning `SYMBOL_PATTERN`, `InvalidSymbolError`, and `normalize_symbol` (§14). It has three consumers: the MCP server, the application client, and, in Milestone 6, the planner validation. This module did not exist in the original tree. It replaces putting the validator in `market_data.py`, which would make the graph import an httpx module, or duplicating it at each boundary.
+- `app/market_data.py`, `app/mcp_server.py`, and `app/mcp_client.py`, with the responsibilities below. The stdio entry point is `python -m app.mcp_server`. `app/mcp_client.py` names that module from the package (`f"{app.__name__}.mcp_server"`) rather than importing it, and derives the child's working directory from `app.__file__`.
+- `pyproject.toml` declares `httpx==0.28.1` directly, at the version `uv.lock` already resolved; only `app/market_data.py` imports it (`docs/TECH_BASELINE.md` §3.17).
+- **The Milestone 5 MCP client is standalone.** Nothing else in `app/` calls it, and `main.py` and `graph.py` do not import it. `main.py`, the lifespan, and the HTTP contract are unchanged in Milestone 5.
+- `app/config.py` gains `MarketDataConfig` (`ALPHA_VANTAGE_API_KEY`, `MCP_TOOL_TIMEOUT_SECONDS`). In Milestone 5 only the stdio MCP server entry point reads it. The API process does not, so the API still starts without an Alpha Vantage key.
+- Tests: `tests/test_symbols.py` and `tests/test_market_data.py` (new; now in the tree above), and `tests/test_mcp.py` (already in the tree). `tests/fixtures/alpha_vantage/` holds the provisional provider payloads, and `tests/fakes.py` gains `alpha_vantage_transport` and `ScriptedMarketDataProvider`.
+- **Milestone 6 owns** FastAPI lifespan wiring of the MCP client, `contextlib.AsyncExitStack` in the lifespan, `app.state` MCP handles, the startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server fails to start, and all graph integration.
 
 The optional post-baseline decision layer (§25) would add `app/typesafe_provider.py` and `app/decisions.py` in Milestone 10, and a top-level `evals/` package in Milestone 9 holding the manually invoked evaluation runner (`uv run python -m evals.run`). `evals/` is not collected by pytest (it falls outside `testpaths`) but is added to the mypy `files` setting. All three are deliberately absent from the tree above because they are not part of the MVP baseline.
 
@@ -449,6 +462,13 @@ Contains the small fixed prompts for:
 
 *From Milestone 4:* also `render_grounded_answer_input`, which renders the escaped, delimited data blocks of §17.
 
+### `symbols.py`
+
+*Added 2026-09-24 (Milestone 5).*
+
+- canonical ticker normalization and validation (§14);
+- the standard library only: no framework, HTTP, or MCP import.
+
 ### `market_data.py`
 
 Own:
@@ -457,6 +477,8 @@ Own:
 - network timeout;
 - provider response parsing;
 - provider-error normalization.
+
+*From Milestone 5 (recorded 2026-09-24):* also the normalized result models, the closed runtime-checked provider error codes (§14), and the only direct `httpx` import in `app/` (`docs/TECH_BASELINE.md` §3.17).
 
 ### `mcp_server.py`
 
@@ -473,6 +495,8 @@ Own:
 - application-side MCP invocation;
 - tool allow-list enforcement;
 - conversion of protocol errors into application tool-result errors.
+
+*From Milestone 5 (recorded 2026-09-24):* also exact argument-key enforcement, strict validation of structured output, and the `mcp.tool.*` events (§14, §19). It never imports `mcp_server.py`; it reaches the server only across the protocol.
 
 ### `logging.py`
 
@@ -1488,10 +1512,27 @@ Then validate the normalized value with:
 
 No whitespace remains after normalization.
 
+*Recorded 2026-09-24 (Milestone 5; `docs/changes/M5-mcp-server.md` §9).* The implementation is `app.symbols.normalize_symbol`:
+
+1. The value must be a `str`.
+2. It is stripped.
+3. The stripped value must be ASCII (`str.isascii()`). This is checked **before** upper-casing, because `"ﬁ".upper() == "FI"` and `"ß".upper() == "SS"` would otherwise turn non-ASCII input into a valid symbol.
+4. It is upper-cased.
+5. It must match `[A-Z0-9.-]{1,15}` by `re.fullmatch`, since `$` would also match before a trailing newline.
+
+The regex above is unchanged: there is no first-character rule and no additional length cap. A failure raises `InvalidSymbolError` with a fixed message that never contains the input.
+
 Validation occurs independently:
 
 1. after planner output in the application;
 2. inside the MCP tool implementation.
+
+*From Milestone 5:* the standalone application client (`mcp_client.py`) also validates before any call, and Milestone 6's planner check uses the same function.
+
+**Unknown arguments (limitation of the pinned `mcp==2.2.0`, recorded 2026-09-24).** The SDK silently ignores tool argument keys other than the declared parameters instead of rejecting them (`docs/TECH_BASELINE.md` §3.9). The tools read only `symbol`, so an extra key cannot influence a call. The application client compensates:
+
+- it requires the argument key set to be exactly `{"symbol"}`, and returns `invalid_input` otherwise, with no MCP call;
+- it rebuilds the wire arguments as exactly `{"symbol": <normalized>}`, never forwarding the caller's mapping.
 
 ---
 
@@ -1547,7 +1588,23 @@ rate_limited
 authentication_failed
 timeout
 malformed_provider_response
+provider_unavailable
 ```
+
+*`provider_unavailable` added 2026-09-24 (Milestone 5; `docs/SPEC.md` §7.3).* It means a transport failure, an HTTP redirect (not followed), a 5xx or other unexpected HTTP status, any unexpected exception caught at the tool boundary, or any MCP error text the client does not recognize. It never carries provider or MCP error text.
+
+**Closed, runtime-enforced codes (recorded 2026-09-24).**
+
+- **Server codes.** `ProviderErrorCode` is a `Literal` of the seven codes above, and `PROVIDER_ERROR_CODES = frozenset(get_args(ProviderErrorCode))` is its runtime twin (`app/market_data.py`).
+- **Client codes.** The client's `ToolErrorCode` adds exactly one application-side code, `tool_not_allowed`, for a tool name outside the allow-list, which is rejected before any MCP call. Its runtime twin is `TOOL_ERROR_CODES`.
+- **Runtime checks.** `MarketDataError.__init__` and `ToolFailure.__post_init__` reject a code outside their set with a fixed `ValueError` that never contains the rejected value. `str(MarketDataError(code)) == code`.
+- **No catch-all.** There is no catch-all code, and `Literal` stays the static representation, as `ErrorType` does in `app/errors.py`.
+
+**Wire format and mapping (recorded 2026-09-24).**
+
+- **Server side.** Each tool catches every exception from normalization and the provider, and re-raises it as `ToolError(<code>) from None`. A `MarketDataError` keeps its code, and any other `Exception` becomes `provider_unavailable`, so no provider exception or its message reaches the SDK's traceback logging. Cancellation is not caught. With `mcp==2.2.0` the wire text is exactly `"Error executing tool <tool>: <code>"`.
+- **Client side.** The client accepts a code only when the text matches that format exactly and the code is in `PROVIDER_ERROR_CODES`. Any other `is_error` text becomes `provider_unavailable`, and the text is never logged, returned, or kept.
+- **Provider payloads fail closed.** Alpha Vantage documents no response fields or error envelopes (`docs/TECH_BASELINE.md` §3.18). Only an empty top-level object and an empty `"Global Quote"` object are `no_data`. An unrecognized `"Error Message"` or any other unrecognized shape is `malformed_provider_response`, never data.
 
 Safe application errors may include provider identity and the error category.
 
@@ -1895,6 +1952,32 @@ error_code
 
 Never log API keys, credential-bearing URLs, or unfiltered provider bodies.
 
+*Recorded 2026-09-24 (Milestone 5; `docs/changes/M5-mcp-server.md` §13).*
+
+**Emitter.** The standalone application client (`mcp_client.py`) emits these events through `app.logging.log_event`, carrying the caller's bound `request_id`:
+
+| Event | Fields |
+|---|---|
+| `mcp.tool.requested` | `tool`, `symbol`, `provider` |
+| `mcp.tool.completed` | `tool`, `symbol`, `provider`, `duration_ms` |
+| `mcp.tool.failed` | `tool`, `symbol`, `provider`, `duration_ms`, `error_code` |
+
+**Null rules:**
+
+- `tool` is `null` for `tool_not_allowed`, so an arbitrary name never reaches the log.
+- `symbol` is `null` when the symbol failed validation before any call.
+- `provider` is always `alpha_vantage`.
+- `mcp.tool.requested` is emitted only when an MCP call is actually made.
+- `error_code` is always a member of the closed client code set (§14).
+- MCP error text, provider messages, and exception messages are never fields.
+
+**The server process emits no application events.**
+
+**httpx logging.** Alpha Vantage requires the API key in the query string (`docs/TECH_BASELINE.md` §3.18), and httpx 0.28.1 logs every request's full URL at `INFO` (`docs/TECH_BASELINE.md` §3.17). The `httpx` and `httpcore` loggers are therefore held at `WARNING` or above:
+
+- by `open_alpha_vantage_provider` when their effective level is lower;
+- by the stdio MCP server's `configure_server_logging()`. This runs `logging.basicConfig(level=WARNING)` to stderr **before** `MCPServer` is constructed, so the SDK's own `basicConfig` is a no-op. The server is built with `log_level="WARNING"`.
+
 ### Citation validation
 
 ```text
@@ -2032,6 +2115,29 @@ At least one test must use the real MCP client/server protocol boundary against 
 
 Directly calling the Python tool function alone is not sufficient for that acceptance criterion.
 
+*Recorded 2026-09-24 (Milestone 5; `docs/changes/M5-mcp-server.md` §17–§18).* Ownership is split without duplicating the matrix:
+
+- **Adapter tests (`tests/test_market_data.py`) own the complete provider matrix.**
+  - Every HTTP status class, every error envelope, and every payload shape, including the fail-closed cases, run as pure functions.
+  - The normalizers keep values as strings.
+  - The closed-code runtime checks are covered.
+  - `AlphaVantageProvider` runs over `httpx.MockTransport`: fixed request, timeout, response cap, httpx logger silencing, and sentinel-key absence.
+- **MCP tests (`tests/test_mcp.py`) cover the boundary with representative cases, and do not repeat the matrix:**
+  - success for both tools;
+  - one representative expected provider error crossing the boundary;
+  - sanitization of an unexpected provider exception;
+  - invalid input and inexact argument keys;
+  - `tool_not_allowed`;
+  - unknown MCP error text;
+  - strict output validation;
+  - client timeout;
+  - the `mcp.tool.*` events;
+  - clean client entry and exit.
+
+  A pure unit test of the client's error-text parser covers every code.
+- **Protocol paths.** The in-process `Client` in the default `auto` mode runs every functional case. Exactly one offline stdio subprocess test runs the real entry point (`python -m app.mcp_server`) over JSON-RPC stdio framing, using a symbol that fails validation, with a loopback proxy sink so that no external/provider network call can succeed. There is no in-process `legacy`-mode test.
+- **No concurrency requirement.** Concurrent calls on one connection are not a Milestone 5 requirement.
+
 ---
 
 ## 20.5 HTTP contract tests
@@ -2117,8 +2223,10 @@ retrieval
 db
   -> errors   (driver failures become DatabaseUnavailableError)
 
-MCP server
-  -> market-data provider adapter
+MCP server  -> symbols, market-data provider adapter, config   (Milestone 5)
+MCP client  -> symbols, market-data types, config, logging     (Milestone 5)
+market data -> symbols, config                                 (Milestone 5)
+symbols     -> (stdlib only)                                   (Milestone 5)
 ```
 
 *Recorded 2026-09-23 (Milestone 4):* `main` also depends on `retrieval` directly, because the lifespan now constructs the `Retriever` itself; `FastAPI -> compiled graph` did not previously cover that edge for `main`. The shared `config`, `errors`, and `logging` edges of the composition root stay implied by `FastAPI -> ingestion / compiled graph`, as they already are for `schemas`, `tokenizer`, and `db`. `citations` never imports `prompts`, and neither imports `graph`, `openai_provider`, or `main`. `config` imports only the standard library.
@@ -2324,7 +2432,7 @@ Up to `RETRIEVAL_TOP_K` (6) Jev requests per query. At about 1k input tokens per
 
 ### Chosen approach
 
-`app/typesafe_provider.py` (created in Milestone 10, not before) makes direct `POST /v1/systemone` calls with `httpx.AsyncClient`, which `fastapi[standard]` already provides. The module:
+`app/typesafe_provider.py` (created in Milestone 10, not before) makes direct `POST /v1/systemone` calls with `httpx.AsyncClient`, using the direct `httpx==0.28.1` dependency that Milestone 5 Stage B declares (`docs/TECH_BASELINE.md` §3.17). The module:
 
 - builds the request from application-owned question definitions;
 - parses the response into its own Pydantic models, strictly: every requested key present, the type tag matching, probabilities in `[0, 1]`, and the response `model` equal to the configured pinned ID;
@@ -2345,7 +2453,7 @@ The integration uses one endpoint with a three-variant answer union. A hand-writ
 
 ### Consequence
 
-The project owns about a hundred lines of request and response schema and must track TypeSafe API changes by hand. It also imports `httpx`, which it receives only transitively through `fastapi[standard]`. If that extra ever stops providing `httpx`, declaring it explicitly is a deliberate dependency change under `docs/TECH_BASELINE.md` §5, not something done silently.
+The project owns about a hundred lines of request and response schema and must track TypeSafe API changes by hand. It also imports `httpx`. Milestone 10 reuses the direct `httpx==0.28.1` dependency declared in Milestone 5 Stage B (`docs/TECH_BASELINE.md` §3.17) and adds no dependency of its own. *(Amended 2026-09-24: this previously said `httpx` arrived only transitively through `fastapi[standard]`.)*
 
 ## 25.4 Confidence-gated MCP routing (later milestone)
 

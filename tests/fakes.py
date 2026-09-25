@@ -11,15 +11,18 @@ import hashlib
 import math
 import re
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
+
+import httpx
 
 from app.config import IngestionConfig
 from app.db import Pool
 from app.errors import AppError
 from app.ingestion import Ingestor
+from app.market_data import CompanyOverview, MarketQuote
 from app.openai_provider import GroundedAnswer
 from app.retrieval import RetrievedChunk
 from tests.conftest import EMBEDDING_DIMENSIONS, embedding
@@ -316,3 +319,63 @@ async def ingest_corpus(pool: Pool) -> Corpus:
     ]
     ids = [(await ingestor.ingest(u, request_id="seed")).document_id for u in uploads]
     return Corpus(*ids)
+
+
+@dataclass
+class RecordingTransport:
+    """An ``httpx.MockTransport`` plus every request it received, in order."""
+
+    transport: httpx.MockTransport
+    requests: list[httpx.Request]
+
+
+def alpha_vantage_transport(
+    respond: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
+) -> RecordingTransport:
+    """Build a socket-free transport that records each request, then answers it.
+
+    ``respond`` may raise to simulate a transport failure, or sleep to
+    simulate a stalled provider. No request ever leaves the process.
+    """
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return await respond(request)
+
+    return RecordingTransport(httpx.MockTransport(handler), requests)
+
+
+class ScriptedMarketDataProvider:
+    """A ``MarketDataProvider`` that returns or raises scripted outcomes.
+
+    Each method returns its scripted model or raises its scripted exception,
+    which may be a ``MarketDataError`` or any other exception. Every call is
+    recorded as ``(method, symbol)``. It performs no network access.
+    """
+
+    def __init__(
+        self,
+        *,
+        quote: MarketQuote | Exception | None = None,
+        overview: CompanyOverview | Exception | None = None,
+    ) -> None:
+        self.quote = quote
+        self.overview = overview
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_quote(self, symbol: str) -> MarketQuote:
+        self.calls.append(("get_quote", symbol))
+        if isinstance(self.quote, Exception):
+            raise self.quote
+        if self.quote is None:
+            raise AssertionError("no quote scripted")
+        return self.quote
+
+    async def get_overview(self, symbol: str) -> CompanyOverview:
+        self.calls.append(("get_overview", symbol))
+        if isinstance(self.overview, Exception):
+            raise self.overview
+        if self.overview is None:
+            raise AssertionError("no overview scripted")
+        return self.overview

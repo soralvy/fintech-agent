@@ -19,6 +19,8 @@ OPENAI_EMBEDDING_DIMENSIONS_ENV = "OPENAI_EMBEDDING_DIMENSIONS"
 MAX_UPLOAD_BYTES_ENV = "MAX_UPLOAD_BYTES"
 RETRIEVAL_TOP_K_ENV = "RETRIEVAL_TOP_K"
 MIN_RETRIEVAL_SIMILARITY_ENV = "MIN_RETRIEVAL_SIMILARITY"
+ALPHA_VANTAGE_API_KEY_ENV = "ALPHA_VANTAGE_API_KEY"
+MCP_TOOL_TIMEOUT_SECONDS_ENV = "MCP_TOOL_TIMEOUT_SECONDS"
 
 DEFAULT_MIN_POOL_SIZE = 1
 DEFAULT_MAX_POOL_SIZE = 10
@@ -59,6 +61,14 @@ DEFAULT_CHUNK_OVERLAP_TOKENS = 120
 # for discarding obviously weak chunks, not a calibrated probability.
 DEFAULT_RETRIEVAL_TOP_K = 6
 DEFAULT_MIN_RETRIEVAL_SIMILARITY = 0.30
+
+# docs/SPEC.md section 14. Bounds one market-data provider request; the upper
+# limit keeps a stalled provider from holding a query for long.
+DEFAULT_MCP_TOOL_TIMEOUT_SECONDS = 5.0
+MAX_MCP_TOOL_TIMEOUT_SECONDS = 30.0
+_MCP_TOOL_TIMEOUT_MESSAGE = (
+    f"{MCP_TOOL_TIMEOUT_SECONDS_ENV} must be a number greater than 0 and at most 30"
+)
 
 # LangSmith arrives transitively through langgraph, and the application never
 # enables it (docs/TECH_BASELINE.md section 7). These are every variable that
@@ -271,3 +281,47 @@ class RetrievalConfig:
                 MIN_RETRIEVAL_SIMILARITY_ENV, DEFAULT_MIN_RETRIEVAL_SIMILARITY
             ),
         )
+
+
+def _valid_mcp_tool_timeout(value: float) -> bool:
+    return math.isfinite(value) and 0.0 < value <= MAX_MCP_TOOL_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDataConfig:
+    """Alpha Vantage credentials and the per-request provider deadline.
+
+    Read only by the stdio MCP server entry point in Milestone 5; the API
+    process does not construct it (docs/DECISIONS.md section 4). ``api_key`` is
+    excluded from ``repr`` so the dataclass can never render it.
+    """
+
+    api_key: str = field(repr=False)
+    timeout_seconds: float = DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if not _valid_mcp_tool_timeout(self.timeout_seconds):
+            raise ConfigError(_MCP_TOOL_TIMEOUT_MESSAGE)
+
+    @classmethod
+    def from_env(cls) -> MarketDataConfig:
+        """Read ``ALPHA_VANTAGE_API_KEY`` and ``MCP_TOOL_TIMEOUT_SECONDS``.
+
+        An unset or blank timeout resolves to ``DEFAULT_MCP_TOOL_TIMEOUT_SECONDS``.
+
+        Raises:
+            ConfigError: the key is unset or blank, or the timeout is not a
+                finite number in (0, 30]. The message names the variable,
+                never the supplied value.
+        """
+        api_key = os.environ.get(ALPHA_VANTAGE_API_KEY_ENV, "").strip()
+        if not api_key:
+            raise ConfigError(f"{ALPHA_VANTAGE_API_KEY_ENV} is not set")
+        raw = os.environ.get(MCP_TOOL_TIMEOUT_SECONDS_ENV, "").strip()
+        if not raw:
+            return cls(api_key=api_key)
+        try:
+            timeout = float(raw)
+        except ValueError:
+            raise ConfigError(_MCP_TOOL_TIMEOUT_MESSAGE) from None
+        return cls(api_key=api_key, timeout_seconds=timeout)
