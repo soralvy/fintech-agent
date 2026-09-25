@@ -13,7 +13,9 @@ import functools
 import json
 import logging
 import socket
+from collections import Counter
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any, get_args
 from uuid import uuid4
 
@@ -22,7 +24,14 @@ import langsmith.utils
 import pytest
 from pydantic import ValidationError
 
-from app.citations import INSUFFICIENT_CONTEXT_ANSWER, build_context_items
+from app.citations import (
+    INSUFFICIENT_CONTEXT_ANSWER,
+    OVERVIEW_FRESHNESS,
+    DocumentCitation,
+    McpCitation,
+    build_context_items,
+    build_tool_context_item,
+)
 from app.config import TRACING_ENV_VARS, RetrievalConfig, require_tracing_disabled
 from app.db import Pool
 from app.errors import (
@@ -33,20 +42,40 @@ from app.errors import (
     InvalidQueryError,
 )
 from app.graph import (
+    MarketTools,
+    PlanRejection,
+    PlanRejectionReason,
     QueryGraph,
     QueryResult,
     QueryRetriever,
+    ToolRequest,
+    approve_tool_plan,
     build_query_graph,
+    derive_tools_used,
     run_query,
 )
 from app.logging import bind_request_id
-from app.openai_provider import GroundedAnswer
-from app.prompts import GROUNDED_ANSWER_INSTRUCTIONS, render_grounded_answer_input
+from app.market_data import QUOTE_FRESHNESS, CompanyOverview, MarketQuote
+from app.mcp_client import MarketDataTools, ToolFailure, ToolSuccess
+from app.openai_provider import (
+    GroundedAnswer,
+    PlanningFailureReason,
+    ToolPlan,
+    ToolPlanningError,
+)
+from app.prompts import (
+    GROUNDED_ANSWER_INSTRUCTIONS,
+    TOOL_PLANNER_INSTRUCTIONS,
+    render_grounded_answer_input,
+    render_tool_plan_input,
+)
 from app.retrieval import RetrievedChunk, Retriever
 from tests.fakes import (
     FakeRetriever,
     KeywordEmbedder,
     ScriptedAnswerGenerator,
+    ScriptedMarketTools,
+    ScriptedToolPlanner,
     ingest_corpus,
 )
 
@@ -57,13 +86,16 @@ NODES = [
     "validate_query",
     "embed_query",
     "retrieve",
+    "decide_tool",
+    "call_tool",
     "build_context",
     "answer",
     "finalize",
     "finalize_insufficient",
 ]
-ANSWERED_PATH = NODES[:6]
-INSUFFICIENT_PATH = [*NODES[:4], "finalize_insufficient"]
+RETRIEVAL_PATH = ["validate_query", "embed_query", "retrieve"]
+ANSWERED_PATH = [*RETRIEVAL_PATH, "build_context", "answer", "finalize"]
+INSUFFICIENT_PATH = [*RETRIEVAL_PATH, "build_context", "finalize_insufficient"]
 
 
 def chunk(
@@ -124,30 +156,71 @@ def node_path(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [event["node"] for event in named(caplog, "graph.node.started")]
 
 
+def route_events(caplog: pytest.LogCaptureFixture, node: str) -> list[dict[str, Any]]:
+    """The ``graph.route`` events logged by the routing node ``node``."""
+    return [event for event in named(caplog, "graph.route") if event["node"] == node]
+
+
+def tool_graph(
+    retriever: QueryRetriever,
+    answerer: ScriptedAnswerGenerator,
+    planner: ScriptedToolPlanner | None = None,
+    market_tools: ScriptedMarketTools | None = None,
+) -> QueryGraph:
+    """A graph with tools available; unscripted fakes fail any call."""
+    return build_query_graph(
+        retriever=retriever,
+        answerer=answerer,
+        planner=ScriptedToolPlanner() if planner is None else planner,
+        market_tools=ScriptedMarketTools() if market_tools is None else market_tools,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Topology (AC6)
 # ---------------------------------------------------------------------------
 
 
-def test_the_graph_has_exactly_the_milestone_4_topology() -> None:
-    drawn = graph_over(FakeRetriever(), ScriptedAnswerGenerator()).get_graph()
+def compiled_both_ways() -> list[QueryGraph]:
+    """The graph without tools and with them: D20 gives both one topology."""
+    return [
+        graph_over(FakeRetriever(), ScriptedAnswerGenerator()),
+        tool_graph(FakeRetriever(), ScriptedAnswerGenerator()),
+    ]
+
+
+@pytest.mark.parametrize("graph", compiled_both_ways(), ids=["rag-only", "tools"])
+def test_the_graph_has_exactly_the_milestone_6_topology(graph: QueryGraph) -> None:
+    drawn = graph.get_graph()
 
     assert set(drawn.nodes) == {"__start__", "__end__", *NODES}
     assert {(e.source, e.target, e.conditional) for e in drawn.edges} == {
         ("__start__", "validate_query", False),
         ("validate_query", "embed_query", False),
         ("embed_query", "retrieve", False),
-        ("retrieve", "build_context", False),
+        ("retrieve", "decide_tool", True),
+        ("retrieve", "build_context", True),
+        ("decide_tool", "call_tool", True),
+        ("decide_tool", "build_context", True),
+        ("call_tool", "build_context", False),
         ("build_context", "answer", True),
         ("build_context", "finalize_insufficient", True),
         ("answer", "finalize", False),
         ("finalize", "__end__", False),
         ("finalize_insufficient", "__end__", False),
     }
+    assert {e.source for e in drawn.edges if e.conditional} == {
+        "retrieve",
+        "decide_tool",
+        "build_context",
+    }
+    assert [e.target for e in drawn.edges].count("call_tool") == 1
+    assert [e.target for e in drawn.edges].count("decide_tool") == 1
 
 
-def test_the_graph_has_no_cycle() -> None:
-    drawn = graph_over(FakeRetriever(), ScriptedAnswerGenerator()).get_graph()
+@pytest.mark.parametrize("graph", compiled_both_ways(), ids=["rag-only", "tools"])
+def test_the_graph_has_no_cycle(graph: QueryGraph) -> None:
+    drawn = graph.get_graph()
     successors: dict[str, set[str]] = {}
     for edge in drawn.edges:
         successors.setdefault(edge.source, set()).add(edge.target)
@@ -181,6 +254,7 @@ async def test_evidence_gives_an_answer_with_trusted_citations(
     assert result.status == "answered"
     assert result.answer == "Revenue declined 4% [D1]."
     (citation,) = result.citations
+    assert isinstance(citation, DocumentCitation)
     assert (citation.id, citation.source_type) == ("D1", "document")
     assert (citation.document_id, citation.chunk_id) == (
         evidence.document_id,
@@ -211,7 +285,7 @@ async def test_no_evidence_gives_insufficient_context_without_a_model_call(
     )
     assert answerer.calls == []
     assert node_path(caplog) == INSUFFICIENT_PATH
-    (route,) = named(caplog, "graph.route")
+    (route,) = route_events(caplog, "build_context")
     assert route == {
         "event": "graph.route",
         "node": "build_context",
@@ -251,16 +325,21 @@ async def test_labels_follow_retrieval_order_across_several_chunks() -> None:
     assert [prompt.index(c.content) for c in chunks] == sorted(
         prompt.index(c.content) for c in chunks
     )
-    assert [(c.id, c.chunk_id) for c in result.citations] == [
+    assert all(isinstance(c, DocumentCitation) for c in result.citations)
+    assert [
+        (c.id, c.chunk_id) for c in result.citations if isinstance(c, DocumentCitation)
+    ] == [
         ("D3", chunks[2].chunk_id),
         ("D1", chunks[0].chunk_id),
     ]
 
 
-async def test_use_tools_true_follows_the_same_document_path(
+async def test_use_tools_true_without_tools_follows_the_same_document_path(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """No MCP node exists in Milestone 4, so ``use_tools`` changes nothing."""
+    """Tools unavailable: ``graph_over`` passes no planner or caller, so
+    ``route_tools`` never selects the tool path and ``use_tools`` changes
+    nothing."""
     caplog.set_level(logging.DEBUG)
     evidence = chunk()
     results = []
@@ -424,12 +503,29 @@ EVENT_FIELDS = {
     "graph.started": {"use_tools"},
     "graph.node.started": {"node"},
     "graph.node.completed": {"node", "duration_ms"},
-    "graph.route": {"node", "route", "context_count"},
-    "graph.completed": {"status", "citation_count", "duration_ms"},
+    "graph.completed": {
+        "status",
+        "citation_count",
+        "tool_used",
+        "tool_error",
+        "duration_ms",
+    },
     "graph.failed": {"node", "error_code", "error_type", "duration_ms"},
     "citation.unknown_id": {"returned_id", "malformed", "known_context_count"},
     "citation.validation_failed": {"reason", "known_context_count", "returned_count"},
 }
+# ``graph.route`` carries different fields for each routing node.
+ROUTE_FIELDS = {
+    "retrieve": {"node", "route", "tools_available"},
+    "decide_tool": {"node", "route"},
+    "build_context": {"node", "route", "context_count"},
+}
+
+
+def expected_fields(event: dict[str, Any]) -> set[str]:
+    if event["event"] == "graph.route":
+        return ROUTE_FIELDS[event["node"]]
+    return EVENT_FIELDS[event["event"]]
 
 
 def assert_safe_events(
@@ -442,7 +538,7 @@ def assert_safe_events(
     ]
     assert graph_events
     for event in graph_events:
-        assert set(event) == {"event", "request_id", *EVENT_FIELDS[event["event"]]}
+        assert set(event) == {"event", "request_id", *expected_fields(event)}
         assert event["request_id"] == request_id
         if "error_type" in event:
             assert event["error_type"] in get_args(ErrorType.__value__)
@@ -471,7 +567,7 @@ async def test_answered_events_are_correlated_and_carry_no_content(
     (completed,) = named(caplog, "graph.completed")
     assert (completed["status"], completed["citation_count"]) == ("answered", 1)
     assert [e["node"] for e in named(caplog, "graph.node.completed")] == ANSWERED_PATH
-    (route,) = named(caplog, "graph.route")
+    (route,) = route_events(caplog, "build_context")
     assert (route["route"], route["context_count"]) == ("answer", 1)
 
 
@@ -539,6 +635,847 @@ async def test_failure_events_are_correlated_and_classified(
 
 
 # ---------------------------------------------------------------------------
+# The bounded tool path (Milestone 6: AC3-AC8, AC11, AC12, AC14)
+# ---------------------------------------------------------------------------
+
+TOOL_QUESTION = "What is the latest MSFT quote, and why did European revenue decline?"
+QUOTE = MarketQuote(
+    provider="alpha_vantage",
+    symbol="MSFT",
+    price="123.45",
+    previous_close="122.10",
+    change="1.35",
+    change_percent="1.11%",
+    volume="12345678",
+    latest_trading_day="2026-09-24",
+    freshness=QUOTE_FRESHNESS,
+)
+QUOTE_FIELDS = (
+    ("price", "123.45"),
+    ("previous_close", "122.10"),
+    ("change", "1.35"),
+    ("change_percent", "1.11%"),
+    ("volume", "12345678"),
+    ("latest_trading_day", "2026-09-24"),
+)
+OVERVIEW = CompanyOverview(
+    provider="alpha_vantage",
+    symbol="MSFT",
+    name="Microsoft Corporation",
+    description=None,
+    exchange="NASDAQ",
+    currency="USD",
+    sector="TECHNOLOGY",
+    industry="SERVICES-PREPACKAGED SOFTWARE",
+    market_capitalization="3000000000000",
+    latest_quarter=None,
+)
+QUOTE_PLAN = ToolPlan(tool_name="get_market_quote", symbol=" msft ")
+OVERVIEW_PLAN = ToolPlan(tool_name="get_company_overview", symbol="msft")
+NO_PLAN = ToolPlan(tool_name=None, symbol=None)
+QUOTE_SUCCESS = ToolSuccess(tool="get_market_quote", result=QUOTE)
+OVERVIEW_SUCCESS = ToolSuccess(tool="get_company_overview", result=OVERVIEW)
+RATE_LIMITED = ToolFailure(tool="get_market_quote", error_code="rate_limited")
+# Valid characters but 16 of them: invalid, and unique enough to search for.
+SENTINEL_SYMBOL = "SENTINELSYMBOL16"
+
+TOOL_PREFIX = [*RETRIEVAL_PATH, "decide_tool"]
+CALL_PREFIX = [*TOOL_PREFIX, "call_tool"]
+
+
+def _market_data_tools_satisfy_the_protocol(tools: MarketDataTools) -> MarketTools:
+    """A static pin, checked by mypy: the real client is a ``MarketTools``."""
+    return tools
+
+
+@dataclass(frozen=True)
+class ToolScenario:
+    """One situation of docs/changes/M6-mcp-graph-integration.md section 9.4."""
+
+    path: list[str]
+    plans: tuple[ToolPlan | Exception, ...] = ()
+    outcomes: tuple[ToolSuccess | ToolFailure, ...] = ()
+    use_tools: bool = True
+    documents: bool = True
+    model_answer: GroundedAnswer | None = None
+    tool_error: str | None = None
+    tools_used: tuple[str, ...] = ()
+    status: str = "answered"
+
+
+PLANNED_ANSWER = [*TOOL_PREFIX, "build_context", "answer", "finalize"]
+CALLED_ANSWER = [*CALL_PREFIX, "build_context", "answer", "finalize"]
+T1_ANSWER = grounded(
+    "Revenue fell [D1]; MSFT last traded at 123.45 [T1].", ["D1", "T1"]
+)
+SCENARIOS = {
+    "disabled": ToolScenario(ANSWERED_PATH, use_tools=False, model_answer=grounded()),
+    "no-plan": ToolScenario(PLANNED_ANSWER, (NO_PLAN,), model_answer=grounded()),
+    "planning-failed": ToolScenario(
+        PLANNED_ANSWER,
+        (ToolPlanningError("request_failed"),),
+        model_answer=grounded(),
+        tool_error="planning_failed",
+    ),
+    "incomplete-plan": ToolScenario(
+        PLANNED_ANSWER,
+        (ToolPlan(tool_name="get_market_quote", symbol=None),),
+        model_answer=grounded(),
+        tool_error="incomplete_plan",
+    ),
+    "invalid-symbol": ToolScenario(
+        PLANNED_ANSWER,
+        (ToolPlan(tool_name="get_market_quote", symbol="BAD SYMBOL"),),
+        model_answer=grounded(),
+        tool_error="invalid_symbol",
+    ),
+    "tool-failure": ToolScenario(
+        CALLED_ANSWER,
+        (QUOTE_PLAN,),
+        (RATE_LIMITED,),
+        model_answer=grounded(),
+        tool_error="rate_limited",
+    ),
+    "tool-success": ToolScenario(
+        CALLED_ANSWER,
+        (QUOTE_PLAN,),
+        (QUOTE_SUCCESS,),
+        model_answer=T1_ANSWER,
+        tools_used=("get_market_quote",),
+    ),
+    "mismatched-success": ToolScenario(
+        CALLED_ANSWER,
+        (QUOTE_PLAN,),
+        (OVERVIEW_SUCCESS,),
+        model_answer=grounded(),
+        tool_error="malformed_provider_response",
+    ),
+    "planning-failed-no-documents": ToolScenario(
+        [*TOOL_PREFIX, "build_context", "finalize_insufficient"],
+        (ToolPlanningError("schema_validation"),),
+        documents=False,
+        tool_error="planning_failed",
+        status="insufficient_context",
+    ),
+    "rejected-no-documents": ToolScenario(
+        [*TOOL_PREFIX, "build_context", "finalize_insufficient"],
+        (ToolPlan(tool_name=None, symbol="MSFT"),),
+        documents=False,
+        tool_error="incomplete_plan",
+        status="insufficient_context",
+    ),
+    "tool-failure-no-documents": ToolScenario(
+        [*CALL_PREFIX, "build_context", "finalize_insufficient"],
+        (QUOTE_PLAN,),
+        (RATE_LIMITED,),
+        documents=False,
+        tool_error="rate_limited",
+        status="insufficient_context",
+    ),
+    "tool-success-no-documents": ToolScenario(
+        CALLED_ANSWER,
+        (QUOTE_PLAN,),
+        (QUOTE_SUCCESS,),
+        documents=False,
+        model_answer=grounded("MSFT last traded at 123.45 [T1].", ["T1"]),
+        tools_used=("get_market_quote",),
+    ),
+}
+
+
+@pytest.mark.parametrize("scenario", list(SCENARIOS.values()), ids=list(SCENARIOS))
+async def test_every_tool_situation_runs_each_node_once_and_calls_mcp_at_most_once(
+    caplog: pytest.LogCaptureFixture, scenario: ToolScenario
+) -> None:
+    """AC4 behaviourally: per-node ``graph.node.started`` and the MCP call
+    count are each at most one in every situation."""
+    caplog.set_level(logging.DEBUG)
+    planner = ScriptedToolPlanner(*scenario.plans)
+    market_tools = ScriptedMarketTools(*scenario.outcomes)
+    answers = [] if scenario.model_answer is None else [scenario.model_answer]
+    answerer = ScriptedAnswerGenerator(*answers)
+    retriever = FakeRetriever([chunk()] if scenario.documents else [])
+
+    result = await ask(
+        tool_graph(retriever, answerer, planner, market_tools),
+        TOOL_QUESTION,
+        use_tools=scenario.use_tools,
+    )
+
+    assert node_path(caplog) == scenario.path
+    assert max(Counter(node_path(caplog)).values()) == 1
+    assert len(planner.calls) == len(scenario.plans) <= 1
+    assert len(market_tools.calls) == len(scenario.outcomes) <= 1
+    assert len(answerer.calls) == len(answers)
+    assert (result.status, result.tools_used) == (scenario.status, scenario.tools_used)
+    (completed,) = named(caplog, "graph.completed")
+    assert completed["tool_error"] == scenario.tool_error
+    assert completed["tool_used"] == next(iter(scenario.tools_used), None)
+    if scenario.status == "insufficient_context":
+        assert (result.answer, result.citations) == (INSUFFICIENT_CONTEXT_ANSWER, ())
+
+
+async def test_disabled_tools_give_exactly_the_rag_only_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    evidence = chunk()
+    planner, market_tools = ScriptedToolPlanner(), ScriptedMarketTools()
+
+    with_tools = await ask(
+        tool_graph(
+            FakeRetriever([evidence]),
+            ScriptedAnswerGenerator(grounded()),
+            planner,
+            market_tools,
+        ),
+        use_tools=False,
+    )
+    (route,) = route_events(caplog, "retrieve")
+    rag_only = await ask(
+        graph_over(FakeRetriever([evidence]), ScriptedAnswerGenerator(grounded()))
+    )
+
+    assert with_tools == rag_only
+    assert with_tools.tools_used == ()
+    assert (planner.calls, market_tools.calls) == ([], [])
+    assert route == {
+        "event": "graph.route",
+        "node": "retrieve",
+        "route": "build_context",
+        "tools_available": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("has_planner", "has_tools"),
+    [(False, False), (True, False), (False, True)],
+    ids=["neither", "planner-only", "tools-only"],
+)
+@pytest.mark.parametrize("documents", [True, False], ids=["documents", "none"])
+async def test_unavailable_tools_make_no_planner_or_mcp_call(
+    caplog: pytest.LogCaptureFixture,
+    has_planner: bool,
+    has_tools: bool,
+    documents: bool,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    planner, market_tools = ScriptedToolPlanner(), ScriptedMarketTools()
+    answerer = ScriptedAnswerGenerator(*([grounded()] if documents else []))
+    graph = build_query_graph(
+        retriever=FakeRetriever([chunk()] if documents else []),
+        answerer=answerer,
+        planner=planner if has_planner else None,
+        market_tools=market_tools if has_tools else None,
+    )
+
+    result = await ask(graph, TOOL_QUESTION, use_tools=True)
+
+    assert (planner.calls, market_tools.calls) == ([], [])
+    assert result.status == ("answered" if documents else "insufficient_context")
+    assert result.tools_used == ()
+    (route,) = route_events(caplog, "retrieve")
+    assert (route["route"], route["tools_available"]) == ("build_context", False)
+    assert "decide_tool" not in node_path(caplog)
+
+
+async def test_the_planner_sees_only_the_escaped_question(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC3/AC5: retrieved text is never planner input."""
+    sentinel = "CHUNK-SENTINEL-4d1e retrieved text"
+    planner = ScriptedToolPlanner(QUOTE_PLAN)
+    market_tools = ScriptedMarketTools(QUOTE_SUCCESS)
+    answerer = ScriptedAnswerGenerator(grounded())
+
+    await ask(
+        tool_graph(
+            FakeRetriever([chunk(sentinel, filename="sentinel-file.txt")]),
+            answerer,
+            planner,
+            market_tools,
+        ),
+        f"  {TOOL_QUESTION}  ",
+        use_tools=True,
+    )
+
+    assert planner.calls == [
+        (TOOL_PLANNER_INSTRUCTIONS, render_tool_plan_input(TOOL_QUESTION))
+    ]
+    ((instructions, prompt),) = planner.calls
+    for text in (sentinel, "sentinel-file.txt", "<source"):
+        assert text not in instructions
+        assert text not in prompt
+
+
+@pytest.mark.parametrize(
+    "reason", ["request_failed", "malformed_response", "schema_validation"]
+)
+async def test_a_planning_failure_degrades_to_the_document_answer(
+    caplog: pytest.LogCaptureFixture, reason: PlanningFailureReason
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    evidence = chunk()
+    market_tools = ScriptedMarketTools()
+    answerer = ScriptedAnswerGenerator(grounded())
+
+    with bind_request_id("req-graph-planning-failed"):
+        result = await ask(
+            tool_graph(
+                FakeRetriever([evidence]),
+                answerer,
+                ScriptedToolPlanner(ToolPlanningError(reason)),
+                market_tools,
+            ),
+            TOOL_QUESTION,
+            use_tools=True,
+        )
+
+    assert result.status == "answered"
+    assert [c.id for c in result.citations] == ["D1"]
+    assert result.tools_used == ()
+    assert market_tools.calls == []
+    assert answerer.calls == [
+        (
+            GROUNDED_ANSWER_INSTRUCTIONS,
+            render_grounded_answer_input(
+                TOOL_QUESTION, build_context_items([evidence])
+            ),
+        )
+    ]
+    assert named(caplog, "graph.failed") == []
+    (completed,) = named(caplog, "graph.completed")
+    assert completed["tool_error"] == "planning_failed"
+    ((_, prompt),) = answerer.calls
+    assert_safe_events(
+        caplog,
+        "req-graph-planning-failed",
+        [
+            TOOL_QUESTION,
+            evidence.content,
+            prompt,
+            GROUNDED_ANSWER_INSTRUCTIONS,
+            TOOL_PLANNER_INSTRUCTIONS,
+            "Traceback",
+        ],
+    )
+
+
+async def test_an_unexpected_planner_defect_propagates_unchanged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    error = RuntimeError("planner-defect sk-test-0000")
+    market_tools = ScriptedMarketTools()
+    answerer = ScriptedAnswerGenerator()
+
+    with pytest.raises(RuntimeError) as caught:
+        await ask(
+            tool_graph(
+                FakeRetriever([chunk()]),
+                answerer,
+                ScriptedToolPlanner(error),
+                market_tools,
+            ),
+            TOOL_QUESTION,
+            use_tools=True,
+        )
+
+    assert caught.value is error
+    assert (market_tools.calls, answerer.calls) == ([], [])
+    (failed,) = named(caplog, "graph.failed")
+    assert (failed["node"], failed["error_code"], failed["error_type"]) == (
+        "decide_tool",
+        "internal_error",
+        "unexpected_error",
+    )
+    assert named(caplog, "graph.completed") == []
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "planner-defect" not in logged
+    assert "sk-test-0000" not in logged
+
+
+# approve_tool_plan: the pure application rule (D8)
+
+
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (NO_PLAN, None),
+        (ToolPlan(tool_name="get_market_quote", symbol=None), "incomplete_plan"),
+        (ToolPlan(tool_name=None, symbol="MSFT"), "incomplete_plan"),
+        (
+            ToolPlan.model_construct(tool_name="fetch_url", symbol="MSFT"),
+            "tool_not_allowed",
+        ),
+        (ToolPlan(tool_name="get_market_quote", symbol="BAD SYMBOL"), "invalid_symbol"),
+        (ToolPlan(tool_name="get_market_quote", symbol="ﬁ"), "invalid_symbol"),
+        (
+            ToolPlan(tool_name="get_market_quote", symbol=SENTINEL_SYMBOL),
+            "invalid_symbol",
+        ),
+        (ToolPlan(tool_name="get_market_quote", symbol=""), "invalid_symbol"),
+    ],
+    ids=[
+        "no-tool",
+        "tool-only",
+        "symbol-only",
+        "not-allowed",
+        "space",
+        "ligature",
+        "sixteen-characters",
+        "empty",
+    ],
+)
+def test_approve_tool_plan_rejects_with_a_closed_reason(
+    plan: ToolPlan, expected: PlanRejectionReason | None
+) -> None:
+    approved = approve_tool_plan(plan)
+
+    if expected is None:
+        assert approved is None
+    else:
+        assert approved == PlanRejection(expected)
+
+
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (QUOTE_PLAN, ToolRequest(tool="get_market_quote", symbol="MSFT")),
+        (
+            ToolPlan(tool_name="get_company_overview", symbol="brk.b"),
+            ToolRequest(tool="get_company_overview", symbol="BRK.B"),
+        ),
+        (
+            ToolPlan(tool_name="get_market_quote", symbol="A" * 15),
+            ToolRequest(tool="get_market_quote", symbol="A" * 15),
+        ),
+    ],
+    ids=["padded-lowercase", "class-share", "fifteen-characters"],
+)
+def test_approve_tool_plan_normalizes_the_symbol_canonically(
+    plan: ToolPlan, expected: ToolRequest
+) -> None:
+    assert approve_tool_plan(plan) == expected
+
+
+@pytest.mark.parametrize(
+    ("plan", "reason"),
+    [
+        (
+            ToolPlan(tool_name="get_market_quote", symbol=SENTINEL_SYMBOL),
+            "invalid_symbol",
+        ),
+        (ToolPlan(tool_name=None, symbol=SENTINEL_SYMBOL), "incomplete_plan"),
+        (
+            ToolPlan.model_construct(tool_name="fetch_url", symbol=SENTINEL_SYMBOL),
+            "tool_not_allowed",
+        ),
+    ],
+    ids=["invalid-symbol", "incomplete", "not-allowed"],
+)
+async def test_a_rejected_plan_makes_no_mcp_call_and_keeps_only_its_reason(
+    caplog: pytest.LogCaptureFixture, plan: ToolPlan, reason: str
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    market_tools = ScriptedMarketTools()
+    graph = tool_graph(
+        FakeRetriever([chunk()]),
+        ScriptedAnswerGenerator(grounded()),
+        ScriptedToolPlanner(plan),
+        market_tools,
+    )
+
+    with bind_request_id("req-graph-reject"):
+        final = await graph.ainvoke({"question": TOOL_QUESTION, "use_tools": True})
+
+    assert market_tools.calls == []
+    assert (final["tool_plan"], final["tool_error"]) == (None, reason)
+    assert SENTINEL_SYMBOL not in repr(final)
+    (rejected,) = named(caplog, "planning.rejected")
+    assert rejected == {
+        "event": "planning.rejected",
+        "reason": reason,
+        "request_id": "req-graph-reject",
+    }
+    (route,) = route_events(caplog, "decide_tool")
+    assert route["route"] == "build_context"
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert SENTINEL_SYMBOL not in logged
+    assert "fetch_url" not in logged
+
+
+# Successful tool evidence becomes T1 (D13-D16)
+
+
+async def test_a_quote_success_is_called_once_and_becomes_t1(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    evidence = chunk()
+    market_tools = ScriptedMarketTools(QUOTE_SUCCESS)
+    answerer = ScriptedAnswerGenerator(
+        grounded("Revenue fell [D1]; MSFT last traded at 123.45 [T1].", ["D1", "T1"])
+    )
+
+    result = await ask(
+        tool_graph(
+            FakeRetriever([evidence]),
+            answerer,
+            ScriptedToolPlanner(QUOTE_PLAN),
+            market_tools,
+        ),
+        TOOL_QUESTION,
+        use_tools=True,
+    )
+
+    assert market_tools.calls == [("get_market_quote", {"symbol": "MSFT"})]
+    assert answerer.calls == [
+        (
+            GROUNDED_ANSWER_INSTRUCTIONS,
+            render_grounded_answer_input(
+                TOOL_QUESTION,
+                build_context_items([evidence]),
+                build_tool_context_item(QUOTE),
+            ),
+        )
+    ]
+    assert result.status == "answered"
+    assert result.answer == "Revenue fell [D1]; MSFT last traded at 123.45 [T1]."
+    assert [c.id for c in result.citations] == ["D1", "T1"]
+    assert result.citations[1] == McpCitation(
+        id="T1",
+        tool="get_market_quote",
+        provider="alpha_vantage",
+        symbol="MSFT",
+        as_of="2026-09-24",
+        fields=QUOTE_FIELDS,
+    )
+    assert result.tools_used == ("get_market_quote",)
+    (route,) = route_events(caplog, "build_context")
+    assert (route["route"], route["context_count"]) == ("answer", 2)
+
+
+async def test_an_overview_success_omits_absent_fields_and_uses_the_fixed_freshness() -> (
+    None
+):
+    market_tools = ScriptedMarketTools(OVERVIEW_SUCCESS)
+    answerer = ScriptedAnswerGenerator(
+        grounded("Microsoft is listed on NASDAQ [T1].", ["T1"])
+    )
+
+    result = await ask(
+        tool_graph(
+            FakeRetriever([]),
+            answerer,
+            ScriptedToolPlanner(OVERVIEW_PLAN),
+            market_tools,
+        ),
+        "What exchange is MSFT listed on?",
+        use_tools=True,
+    )
+
+    assert market_tools.calls == [("get_company_overview", {"symbol": "MSFT"})]
+    ((_, prompt),) = answerer.calls
+    assert '<source id="T1" type="mcp">' in prompt
+    assert "tool: get_company_overview" in prompt
+    assert f"as_of: {OVERVIEW_FRESHNESS}" in prompt
+    assert "description:" not in prompt
+    assert "latest_quarter:" not in prompt
+    (citation,) = result.citations
+    assert isinstance(citation, McpCitation)
+    assert citation.as_of == OVERVIEW_FRESHNESS
+    assert [name for name, _ in citation.fields] == [
+        "name",
+        "exchange",
+        "currency",
+        "sector",
+        "industry",
+        "market_capitalization",
+    ]
+    assert result.tools_used == ("get_company_overview",)
+
+
+async def test_a_t1_only_answer_is_answered_with_one_mcp_citation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    answerer = ScriptedAnswerGenerator(
+        grounded("MSFT last traded at 123.45 [T1].", ["T1"])
+    )
+
+    result = await ask(
+        tool_graph(
+            FakeRetriever([]),
+            answerer,
+            ScriptedToolPlanner(QUOTE_PLAN),
+            ScriptedMarketTools(QUOTE_SUCCESS),
+        ),
+        "What is the latest MSFT quote?",
+        use_tools=True,
+    )
+
+    assert result == QueryResult(
+        status="answered",
+        answer="MSFT last traded at 123.45 [T1].",
+        citations=(
+            McpCitation(
+                id="T1",
+                tool="get_market_quote",
+                provider="alpha_vantage",
+                symbol="MSFT",
+                as_of="2026-09-24",
+                fields=QUOTE_FIELDS,
+            ),
+        ),
+        tools_used=("get_market_quote",),
+    )
+    assert len(answerer.calls) == 1
+    (route,) = route_events(caplog, "build_context")
+    assert (route["route"], route["context_count"]) == ("answer", 1)
+
+
+@pytest.mark.parametrize(
+    "insufficient", [False, True], ids=["answered", "insufficient"]
+)
+async def test_an_uncited_successful_tool_is_still_reported_in_tools_used(
+    insufficient: bool,
+) -> None:
+    answerer = ScriptedAnswerGenerator(
+        grounded("Revenue fell [D1].", ["D1"], insufficient_context=insufficient)
+    )
+
+    result = await ask(
+        tool_graph(
+            FakeRetriever([chunk()]),
+            answerer,
+            ScriptedToolPlanner(QUOTE_PLAN),
+            ScriptedMarketTools(QUOTE_SUCCESS),
+        ),
+        TOOL_QUESTION,
+        use_tools=True,
+    )
+
+    assert not any(isinstance(c, McpCitation) for c in result.citations)
+    assert result.tools_used == ("get_market_quote",)
+    if insufficient:
+        assert result == QueryResult(
+            status="insufficient_context",
+            answer=INSUFFICIENT_CONTEXT_ANSWER,
+            citations=(),
+            tools_used=("get_market_quote",),
+        )
+    else:
+        assert [c.id for c in result.citations] == ["D1"]
+
+
+# Failed output never enters context (AC8)
+
+
+async def test_a_tool_failure_answers_from_documents_with_no_failure_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    evidence = chunk()
+    answerer = ScriptedAnswerGenerator(grounded())
+    planner = ScriptedToolPlanner(QUOTE_PLAN)
+
+    with bind_request_id("req-graph-tool-failed"):
+        result = await ask(
+            tool_graph(
+                FakeRetriever([evidence]),
+                answerer,
+                planner,
+                ScriptedMarketTools(RATE_LIMITED),
+            ),
+            TOOL_QUESTION,
+            use_tools=True,
+        )
+
+    ((_, prompt),) = answerer.calls
+    assert prompt == render_grounded_answer_input(
+        TOOL_QUESTION, build_context_items([evidence])
+    )
+    assert "rate_limited" not in prompt
+    assert result.status == "answered"
+    assert [c.id for c in result.citations] == ["D1"]
+    assert result.tools_used == ()
+    (completed,) = named(caplog, "graph.completed")
+    assert (completed["tool_error"], completed["tool_used"]) == ("rate_limited", None)
+    ((_, planner_prompt),) = planner.calls
+    assert_safe_events(
+        caplog,
+        "req-graph-tool-failed",
+        [
+            TOOL_QUESTION,
+            evidence.content,
+            prompt,
+            planner_prompt,
+            GROUNDED_ANSWER_INSTRUCTIONS,
+            TOOL_PLANNER_INSTRUCTIONS,
+            "Traceback",
+        ],
+    )
+
+
+FAILED_TOOL_PATHS = {
+    "planning-failed": ((ToolPlanningError("refusal"),), ()),
+    "incomplete-plan": ((ToolPlan(tool_name="get_market_quote", symbol=None),), ()),
+    "invalid-symbol": (
+        (ToolPlan(tool_name="get_market_quote", symbol="BAD SYMBOL"),),
+        (),
+    ),
+    "tool-failure": ((QUOTE_PLAN,), (RATE_LIMITED,)),
+    "mismatched-success": ((QUOTE_PLAN,), (OVERVIEW_SUCCESS,)),
+}
+
+
+@pytest.mark.parametrize(
+    ("plans", "outcomes"), list(FAILED_TOOL_PATHS.values()), ids=list(FAILED_TOOL_PATHS)
+)
+async def test_failed_tool_output_never_reaches_context_prompt_or_citations(
+    plans: tuple[ToolPlan | Exception, ...],
+    outcomes: tuple[ToolSuccess | ToolFailure, ...],
+) -> None:
+    answerer = ScriptedAnswerGenerator(
+        grounded("Revenue fell [D1] and the quote [T1].", ["D1", "T1"])
+    )
+    graph = tool_graph(
+        FakeRetriever([chunk()]),
+        answerer,
+        ScriptedToolPlanner(*plans),
+        ScriptedMarketTools(*outcomes),
+    )
+
+    final = await graph.ainvoke({"question": TOOL_QUESTION, "use_tools": True})
+
+    assert final["tool_result"] is None
+    assert final["tool_context"] is None
+    assert final["tool_error"] is not None
+    assert set(final["citation_map"]) == {"D1"}
+    ((_, prompt),) = answerer.calls
+    assert '<source id="T1"' not in prompt
+    assert not any(isinstance(c, McpCitation) for c in final["citations"])
+    assert "[T1]" not in final["answer"]
+
+
+async def test_a_cited_t1_without_tool_evidence_is_an_unknown_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    answerer = ScriptedAnswerGenerator(
+        grounded("Revenue fell [D1]; the quote is [T1].", ["D1", "T1"])
+    )
+
+    result = await ask(
+        tool_graph(
+            FakeRetriever([chunk()]),
+            answerer,
+            ScriptedToolPlanner(QUOTE_PLAN),
+            ScriptedMarketTools(RATE_LIMITED),
+        ),
+        TOOL_QUESTION,
+        use_tools=True,
+    )
+
+    assert result.status == "answered"
+    assert result.answer == "Revenue fell [D1]; the quote is."
+    assert [c.id for c in result.citations] == ["D1"]
+    (unknown,) = named(caplog, "citation.unknown_id")
+    assert (unknown["returned_id"], unknown["malformed"]) == ("T1", False)
+    assert unknown["known_context_count"] == 1
+
+
+async def test_known_context_count_includes_t1_when_it_exists(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    answerer = ScriptedAnswerGenerator(
+        grounded("Revenue fell [D1] [T2].", ["D1", "T2", "D9"])
+    )
+
+    await ask(
+        tool_graph(
+            FakeRetriever([chunk()]),
+            answerer,
+            ScriptedToolPlanner(QUOTE_PLAN),
+            ScriptedMarketTools(QUOTE_SUCCESS),
+        ),
+        TOOL_QUESTION,
+        use_tools=True,
+    )
+
+    unknown = named(caplog, "citation.unknown_id")
+    assert [(e["returned_id"], e["known_context_count"]) for e in unknown] == [
+        ("T2", 2),
+        ("D9", 2),
+    ]
+
+
+# tools_used (D16)
+
+
+def test_tools_used_is_derived_only_from_a_validated_success() -> None:
+    assert derive_tools_used(None) == ()
+    assert derive_tools_used(QUOTE_SUCCESS) == ("get_market_quote",)
+    assert derive_tools_used(OVERVIEW_SUCCESS) == ("get_company_overview",)
+
+
+# Safe events on the tool path (AC14)
+
+
+async def test_tool_path_events_are_correlated_and_carry_no_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    evidence = chunk("Confidential chunk text: European revenue declined 4%.")
+    answer = "Sentinel answer text [D1] [T1]."
+    answerer = ScriptedAnswerGenerator(grounded(answer, ["D1", "T1"]))
+    planner = ScriptedToolPlanner(QUOTE_PLAN)
+
+    with bind_request_id("req-graph-tools"):
+        await ask(
+            tool_graph(
+                FakeRetriever([evidence]),
+                answerer,
+                planner,
+                ScriptedMarketTools(QUOTE_SUCCESS),
+            ),
+            TOOL_QUESTION,
+            use_tools=True,
+        )
+
+    ((_, prompt),) = answerer.calls
+    ((_, planner_prompt),) = planner.calls
+    assert_safe_events(
+        caplog,
+        "req-graph-tools",
+        [
+            TOOL_QUESTION,
+            evidence.content,
+            prompt,
+            planner_prompt,
+            answer,
+            TOOL_PLANNER_INSTRUCTIONS,
+            " msft ",
+            "123.45",
+            "12345678",
+            QUOTE_FRESHNESS,
+        ],
+    )
+    assert [(e["node"], e["route"]) for e in named(caplog, "graph.route")] == [
+        ("retrieve", "decide_tool"),
+        ("decide_tool", "call_tool"),
+        ("build_context", "answer"),
+    ]
+    (completed,) = named(caplog, "graph.completed")
+    assert (completed["tool_used"], completed["tool_error"]) == (
+        "get_market_quote",
+        None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Real Retriever over pgvector (AC2)
 # ---------------------------------------------------------------------------
 
@@ -579,6 +1516,7 @@ async def test_a_fixture_question_over_the_corpus_cites_the_stored_chunk(
     assert result.status == "answered"
     assert "D9" not in result.answer
     (citation,) = result.citations
+    assert isinstance(citation, DocumentCitation)
     assert citation.id == "D1"
     assert citation.document_id == corpus.acme_report
     assert (citation.filename, citation.page) == ("acme-fy2025.txt", None)

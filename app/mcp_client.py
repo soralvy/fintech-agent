@@ -1,7 +1,8 @@
 """The application-side MCP client for the market-data tools (DECISIONS section 14).
 
-Standalone in Milestone 5: nothing else in ``app/`` calls it yet. Milestone 6
-wires it into the lifespan and the graph.
+The API lifespan opens one shared connection through ``open_market_data_tools``
+and hands the resulting ``MarketDataTools`` to the graph, whose ``call_tool``
+node is its only caller (docs/DECISIONS.md section 14).
 
 ``MarketDataTools.call`` makes at most one ``tools/call`` request and never
 raises for an expected failure. It enforces the tool allow-list and the exact
@@ -26,10 +27,11 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, Protocol, cast, get_args
+from typing import Any, Final, Literal, Protocol, TextIO, cast, get_args
 
 import anyio
 from mcp import Client, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from mcp.server import MCPServer
 from mcp.shared.exceptions import MCPError
 from mcp.types import REQUEST_TIMEOUT, CallToolResult, ContentBlock, TextContent
@@ -306,16 +308,29 @@ def _log(level: int, event: str, **fields: EventField) -> None:
 
 @asynccontextmanager
 async def open_market_data_tools(
-    server: MCPServer[Any] | StdioServerParameters, *, timeout_seconds: float
+    server: MCPServer[Any] | StdioServerParameters,
+    *,
+    timeout_seconds: float,
+    errlog: TextIO | None = None,
 ) -> AsyncIterator[MarketDataTools]:
     """Open one MCP connection and close it when the block exits.
 
     Enter and exit it in the same task: the SDK client holds task groups.
+    ``errlog`` applies only to a stdio server: the child's stderr is written
+    to that file, which must be a real one since it becomes the child's
+    ``stderr``. Without it, the connection opens exactly as before.
     """
     deadline = timeout_seconds + CLIENT_TIMEOUT_MARGIN_SECONDS
-    async with Client(
-        server, mode="auto", cache=None, read_timeout_seconds=deadline
-    ) as client:
+    if errlog is not None and isinstance(server, StdioServerParameters):
+        client = Client(
+            stdio_client(server, errlog=errlog),
+            mode="auto",
+            cache=None,
+            read_timeout_seconds=deadline,
+        )
+    else:
+        client = Client(server, mode="auto", cache=None, read_timeout_seconds=deadline)
+    async with client:
         yield MarketDataTools(client, timeout_seconds=timeout_seconds)
 
 

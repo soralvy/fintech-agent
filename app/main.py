@@ -8,9 +8,10 @@ of reaching the server's own error logging (docs/DECISIONS.md section 13).
 """
 
 import logging
+import os
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from typing import Annotated, Any, Literal
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Annotated, Any, Literal, TextIO
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -23,9 +24,11 @@ from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.citations import Citation, McpCitation
 from app.config import (
     DatabaseConfig,
     IngestionConfig,
+    MarketDataConfig,
     OpenAIConfig,
     RetrievalConfig,
     require_tracing_disabled,
@@ -41,9 +44,15 @@ from app.errors import (
 from app.graph import QueryGraph, QueryResult, build_query_graph, run_query
 from app.ingestion import Ingestor
 from app.logging import bind_request_id, configure_logging, log_event
+from app.mcp_client import (
+    MarketDataTools,
+    open_market_data_tools,
+    stdio_server_parameters,
+)
 from app.openai_provider import (
     OpenAIAnswerGenerator,
     OpenAIEmbedder,
+    OpenAIToolPlanner,
     create_openai_client,
 )
 from app.retrieval import Retriever
@@ -68,49 +77,132 @@ REQUEST_INVALID_MESSAGE = "The request is malformed or failed validation."
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 
+def _open_devnull() -> TextIO:
+    """The sink for the MCP child's stderr, opened outside any coroutine."""
+    return open(os.devnull, "w", encoding="utf-8")
+
+
+@asynccontextmanager
+async def open_market_tools(config: MarketDataConfig) -> AsyncIterator[MarketDataTools]:
+    """Launch the one stdio MCP server child and connect to it.
+
+    The child's stderr is discarded: it could hold a startup error line or a
+    traceback, and subprocess output is never exposed (M6 D5). Tests replace
+    this seam with an in-process server.
+    """
+    with _open_devnull() as errlog:
+        async with open_market_data_tools(
+            stdio_server_parameters(config),
+            timeout_seconds=config.timeout_seconds,
+            errlog=errlog,
+        ) as tools:
+            yield tools
+
+
+@asynccontextmanager
+async def optional_market_tools(
+    config: MarketDataConfig | None,
+) -> AsyncIterator[MarketDataTools | None]:
+    """The shared market-data client, or ``None`` when MCP is unavailable.
+
+    Without a configuration no child is started. An ``Exception`` while
+    entering the client degrades to RAG only; one while closing it is
+    contained, since a raised shutdown error would be reported with its
+    traceback. Only the closed outcome is logged, never the exception.
+    Cancellation and other ``BaseException``s propagate.
+    """
+    if config is None:
+        _log_mcp("mcp.startup", "not_configured")
+        yield None
+        return
+
+    stack = AsyncExitStack()
+    tools: MarketDataTools | None
+    try:
+        tools = await stack.enter_async_context(open_market_tools(config))
+    except Exception:  # noqa: BLE001 - D3: any startup failure means RAG only
+        _log_mcp("mcp.startup", "start_failed", level=logging.WARNING)
+        tools = None
+    if tools is None:
+        # Yielded outside the handler, so the failure is not chained onto
+        # anything raised while the application runs.
+        yield None
+        return
+
+    _log_mcp("mcp.startup", "available")
+    try:
+        yield tools
+    finally:
+        try:
+            await stack.aclose()
+        except Exception:  # noqa: BLE001 - never re-raised: D18
+            _log_mcp("mcp.shutdown", "close_failed", level=logging.WARNING)
+        else:
+            _log_mcp("mcp.shutdown", "closed")
+
+
+def _log_mcp(event: str, outcome: str, *, level: int = logging.INFO) -> None:
+    log_event(logger, event, level=level, outcome=outcome)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Open the pool and the OpenAI client, and compile the query graph once.
+    """Own the pool, the OpenAI client, and the optional MCP client.
 
-    All configuration is read first, including the LangSmith tracing refusal,
-    so a missing or invalid setting stops startup before any resource is
-    created. The tokenizer loads its encoding on first use, never here, so
-    startup makes no network request.
+    All configuration is read first, including the LangSmith tracing refusal
+    and the market-data timeout, so a missing or invalid setting stops startup
+    before any resource is created. The resources are then entered on one
+    ``AsyncExitStack`` -- pool, OpenAI client, MCP client -- and closed in
+    reverse, including when a later startup step fails. Starlette enters and
+    exits the lifespan in one task, as the MCP client's task groups require.
+    The graph is compiled once over the shared clients. The tokenizer loads
+    its encoding on first use, never here, so startup makes no network request.
     """
     require_tracing_disabled()
     database_config = DatabaseConfig.from_env()
     openai_config = OpenAIConfig.from_env()
     ingestion_config = IngestionConfig.from_env()
     retrieval_config = RetrievalConfig.from_env()
+    market_config = MarketDataConfig.optional_from_env()
     configure_logging()
 
-    pool = create_pool(database_config)
-    await pool.open()
-    try:
-        async with create_openai_client(openai_config) as openai_client:
-            embedder = OpenAIEmbedder(
-                openai_client,
-                model=openai_config.embedding_model,
-                dimensions=openai_config.embedding_dimensions,
-            )
-            app.state.pool = pool
-            app.state.ingestor = Ingestor(
-                pool=pool,
-                embedder=embedder,
-                tokenizer=TiktokenTokenizer(),
-                config=ingestion_config,
-            )
-            app.state.query_graph = build_query_graph(
-                retriever=Retriever(
-                    pool=pool, embedder=embedder, config=retrieval_config
-                ),
-                answerer=OpenAIAnswerGenerator(
-                    openai_client, model=openai_config.llm_model
-                ),
-            )
-            yield
-    finally:
-        await pool.close()
+    async with AsyncExitStack() as stack:
+        pool = create_pool(database_config)
+        await pool.open()
+        stack.push_async_callback(pool.close)
+        openai_client = await stack.enter_async_context(
+            create_openai_client(openai_config)
+        )
+        market_tools = await stack.enter_async_context(
+            optional_market_tools(market_config)
+        )
+
+        embedder = OpenAIEmbedder(
+            openai_client,
+            model=openai_config.embedding_model,
+            dimensions=openai_config.embedding_dimensions,
+        )
+        ingestor = Ingestor(
+            pool=pool,
+            embedder=embedder,
+            tokenizer=TiktokenTokenizer(),
+            config=ingestion_config,
+        )
+        retriever = Retriever(pool=pool, embedder=embedder, config=retrieval_config)
+        answerer = OpenAIAnswerGenerator(openai_client, model=openai_config.llm_model)
+        planner = OpenAIToolPlanner(openai_client, model=openai_config.llm_model)
+        query_graph = build_query_graph(
+            retriever=retriever,
+            answerer=answerer,
+            planner=planner,
+            market_tools=market_tools,
+        )
+
+        app.state.pool = pool
+        app.state.ingestor = ingestor
+        app.state.market_tools = market_tools
+        app.state.query_graph = query_graph
+        yield
 
 
 class UnexpectedErrorMiddleware:
@@ -338,8 +430,9 @@ async def query(
 ) -> QueryResponse:
     """Answer a question from the ingested documents (docs/SPEC.md section 6.3).
 
-    Insufficient context is a ``200``. ``use_tools`` is accepted but makes no
-    MCP call until Milestone 6, so ``tools_used`` is always empty.
+    Insufficient context is a ``200``. With ``use_tools`` and an available
+    MCP client, the graph may add at most one market-data lookup;
+    ``tools_used`` reports a successful one.
     """
     result = await run_query(graph, question=body.question, use_tools=body.use_tools)
     return to_query_response(result)
@@ -351,18 +444,30 @@ def to_query_response(result: QueryResult) -> QueryResponse:
         {
             "answer": result.answer,
             "status": result.status,
-            "citations": [
-                {
-                    "id": citation.id,
-                    "source_type": citation.source_type,
-                    "document_id": citation.document_id,
-                    "chunk_id": citation.chunk_id,
-                    "filename": citation.filename,
-                    "page": citation.page,
-                    "excerpt": citation.excerpt,
-                }
-                for citation in result.citations
-            ],
-            "tools_used": [],
+            "citations": [_citation_payload(citation) for citation in result.citations],
+            "tools_used": list(result.tools_used),
         }
     )
+
+
+def _citation_payload(citation: Citation) -> dict[str, object]:
+    """One trusted citation as its public shape, keeping MCP field order."""
+    if isinstance(citation, McpCitation):
+        return {
+            "id": citation.id,
+            "source_type": citation.source_type,
+            "tool": citation.tool,
+            "provider": citation.provider,
+            "symbol": citation.symbol,
+            "as_of": citation.as_of,
+            "fields": dict(citation.fields),
+        }
+    return {
+        "id": citation.id,
+        "source_type": citation.source_type,
+        "document_id": citation.document_id,
+        "chunk_id": citation.chunk_id,
+        "filename": citation.filename,
+        "page": citation.page,
+        "excerpt": citation.excerpt,
+    }

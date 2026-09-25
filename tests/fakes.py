@@ -11,19 +11,21 @@ import hashlib
 import math
 import re
 from collections import deque
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+import anyio
 import httpx
 
 from app.config import IngestionConfig
 from app.db import Pool
 from app.errors import AppError
 from app.ingestion import Ingestor
-from app.market_data import CompanyOverview, MarketQuote
-from app.openai_provider import GroundedAnswer
+from app.market_data import QUOTE_FRESHNESS, CompanyOverview, MarketQuote
+from app.mcp_client import ToolFailure, ToolSuccess
+from app.openai_provider import GroundedAnswer, ToolPlan
 from app.retrieval import RetrievedChunk
 from tests.conftest import EMBEDDING_DIMENSIONS, embedding
 
@@ -277,6 +279,60 @@ class ScriptedAnswerGenerator:
         return outcome
 
 
+class ScriptedToolPlanner:
+    """A ``ToolPlanner`` that returns or raises scripted outcomes.
+
+    Every call is recorded as ``(instructions, prompt)``. By default the
+    outcomes are queued and used in call order, and a call with nothing left
+    fails the test. ``by_prompt`` instead keys each outcome by the exact
+    rendered prompt, for tests where several requests race to plan; a prompt
+    with no outcome fails the test.
+    """
+
+    def __init__(
+        self,
+        *outcomes: ToolPlan | Exception,
+        by_prompt: Mapping[str, ToolPlan | Exception] | None = None,
+    ) -> None:
+        self._outcomes = deque(outcomes)
+        self._by_prompt = None if by_prompt is None else dict(by_prompt)
+        self.calls: list[tuple[str, str]] = []
+
+    async def plan_tool(self, *, instructions: str, prompt: str) -> ToolPlan:
+        self.calls.append((instructions, prompt))
+        if self._by_prompt is not None:
+            if prompt not in self._by_prompt:
+                raise AssertionError("unexpected planner prompt")
+            outcome = self._by_prompt[prompt]
+        elif self._outcomes:
+            outcome = self._outcomes.popleft()
+        else:
+            raise AssertionError("unexpected planner call")
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class ScriptedMarketTools:
+    """A ``MarketTools`` caller that returns queued outcomes in order.
+
+    Every call is recorded as ``(tool_name, arguments)``. A call with nothing
+    left in the queue fails the test. It performs no MCP or network access.
+    """
+
+    def __init__(self, *outcomes: ToolSuccess | ToolFailure) -> None:
+        self._outcomes = deque(outcomes)
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def call(
+        self, tool_name: str, arguments: Mapping[str, object]
+    ) -> ToolSuccess | ToolFailure:
+        self.calls.append((tool_name, dict(arguments)))
+        if not self._outcomes:
+            raise AssertionError("unexpected market-data call")
+        return self._outcomes.popleft()
+
+
 # ---------------------------------------------------------------------------
 # Shared fixture corpus, ingested through the real ingestion path
 # ---------------------------------------------------------------------------
@@ -379,3 +435,60 @@ class ScriptedMarketDataProvider:
         if self.overview is None:
             raise AssertionError("no overview scripted")
         return self.overview
+
+
+def quote_for(symbol: str, *, price: str = "123.4500") -> MarketQuote:
+    """A valid provider quote for ``symbol``, as the adapter would return it."""
+    return MarketQuote(
+        provider="alpha_vantage",
+        symbol=symbol,
+        price=price,
+        previous_close="122.1000",
+        change="1.3500",
+        change_percent="1.1057%",
+        volume="12345678",
+        latest_trading_day="2026-09-24",
+        freshness=QUOTE_FRESHNESS,
+    )
+
+
+class BarrierMarketDataProvider:
+    """A provider whose quote calls all wait until ``parties`` are in flight.
+
+    Each call returns a quote for its own symbol once every party has
+    arrived, so calls that were serialized instead of overlapping would never
+    pass the barrier: they fail at the ``deadline_seconds`` bound instead of
+    hanging. ``max_active`` records the highest overlap seen. The event is
+    created on first use, inside the event loop that serves the calls.
+    """
+
+    def __init__(self, parties: int, *, deadline_seconds: float = 5.0) -> None:
+        self.parties = parties
+        self.deadline_seconds = deadline_seconds
+        self.calls: list[tuple[str, str]] = []
+        self.active = 0
+        self.max_active = 0
+        self._arrived: anyio.Event | None = None
+
+    @property
+    def barrier_reached(self) -> bool:
+        return self._arrived is not None and self._arrived.is_set()
+
+    async def get_quote(self, symbol: str) -> MarketQuote:
+        self.calls.append(("get_quote", symbol))
+        if self._arrived is None:
+            self._arrived = anyio.Event()
+        arrived = self._arrived
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.active >= self.parties:
+                arrived.set()
+            with anyio.fail_after(self.deadline_seconds):
+                await arrived.wait()
+        finally:
+            self.active -= 1
+        return quote_for(symbol)
+
+    async def get_overview(self, symbol: str) -> CompanyOverview:
+        raise AssertionError("no overview scripted")

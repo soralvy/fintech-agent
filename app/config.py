@@ -291,9 +291,11 @@ def _valid_mcp_tool_timeout(value: float) -> bool:
 class MarketDataConfig:
     """Alpha Vantage credentials and the per-request provider deadline.
 
-    Read only by the stdio MCP server entry point in Milestone 5; the API
-    process does not construct it (docs/DECISIONS.md section 4). ``api_key`` is
-    excluded from ``repr`` so the dataclass can never render it.
+    The stdio MCP server requires it through ``from_env``. The API reads it
+    through ``optional_from_env``: without a key the API serves RAG only, and
+    it passes the configuration to the one MCP child it launches
+    (docs/DECISIONS.md section 4). ``api_key`` is excluded from ``repr`` so
+    the dataclass can never render it.
     """
 
     api_key: str = field(repr=False)
@@ -317,11 +319,40 @@ class MarketDataConfig:
         api_key = os.environ.get(ALPHA_VANTAGE_API_KEY_ENV, "").strip()
         if not api_key:
             raise ConfigError(f"{ALPHA_VANTAGE_API_KEY_ENV} is not set")
-        raw = os.environ.get(MCP_TOOL_TIMEOUT_SECONDS_ENV, "").strip()
-        if not raw:
-            return cls(api_key=api_key)
-        try:
-            timeout = float(raw)
-        except ValueError:
-            raise ConfigError(_MCP_TOOL_TIMEOUT_MESSAGE) from None
+        return cls(api_key=api_key, timeout_seconds=_mcp_tool_timeout_from_env())
+
+    @classmethod
+    def optional_from_env(cls) -> MarketDataConfig | None:
+        """Read the API's optional market-data configuration.
+
+        The timeout is validated first, whether or not a key is set, so a
+        malformed value never waits for a key to be added before failing. An
+        unset or blank key returns ``None``: the API then serves RAG only.
+
+        Raises:
+            ConfigError: the timeout is not a finite number in (0, 30]. The
+                message names the variable, never the supplied value.
+        """
+        timeout = _mcp_tool_timeout_from_env()
+        api_key = os.environ.get(ALPHA_VANTAGE_API_KEY_ENV, "").strip()
+        if not api_key:
+            return None
         return cls(api_key=api_key, timeout_seconds=timeout)
+
+
+def _mcp_tool_timeout_from_env() -> float:
+    """Read ``MCP_TOOL_TIMEOUT_SECONDS``; unset or blank is the default.
+
+    Raises:
+        ConfigError: the value is malformed, non-finite, or outside (0, 30].
+    """
+    raw = os.environ.get(MCP_TOOL_TIMEOUT_SECONDS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError:
+        raise ConfigError(_MCP_TOOL_TIMEOUT_MESSAGE) from None
+    if not _valid_mcp_tool_timeout(timeout):
+        raise ConfigError(_MCP_TOOL_TIMEOUT_MESSAGE)
+    return timeout

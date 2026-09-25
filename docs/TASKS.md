@@ -317,30 +317,111 @@ Known limitations carried forward:
 
 # Milestone 6 — Bounded MCP graph integration
 
-Target: ~1–1.5 hours.
+Target: ~6–9 hours of implementation and verification across step 1 and Stages A–D, excluding review turnaround. *Re-estimated 2026-09-25* from ~1–1.5 hours, which predated the planner adapter, the MCP citation model, the lifespan refactor with degraded startup, the concurrency evidence, and the per-stage reviews (`docs/changes/M6-mcp-graph-integration.md` §14).
 
-- [ ] Add `decide_tool` node.
-- [ ] Ensure it runs only when `use_tools=true`.
-- [ ] Restrict planner output to:
+Change specification: `docs/changes/M6-mcp-graph-integration.md`, approved revision 3 (final independent review CLEAN, 2026-09-25). It was built in the approved order: step 1 canonical contract alignment (`1de7070`), Stage A planner and `T1` foundations (`551146d`), Stage B graph (`37cc0d1`), Stage C lifespan and shared client (`fdb09b0`), and Stage D final verification with these completion records.
+
+- [x] Add `decide_tool` node. `app/graph.py`; it calls the `ToolPlanner` (`OpenAIToolPlanner` in `app/openai_provider.py`: strict `ToolPlan`, one HTTP attempt, no retry) with only the escaped question (`test_the_planner_sees_only_the_escaped_question`).
+- [x] Ensure it runs only when `use_tools=true`. `route_tools` also requires tools to be available (`test_disabled_tools_give_exactly_the_rag_only_result`, `test_unavailable_tools_make_no_planner_or_mcp_call`).
+- [x] Restrict planner output to:
   - no tool;
   - `get_market_quote`;
   - `get_company_overview`.
-- [ ] Permit at most one tool request.
-- [ ] Validate planner arguments before calling MCP.
-- [ ] Add `call_tool` node.
-- [ ] Convert successful tool output into trusted `T1` context.
-- [ ] Include provider/freshness metadata in MCP citations.
-- [ ] Ensure failed tool output never becomes grounding context.
-- [ ] Continue with document evidence when an optional tool fails.
-- [ ] Wire the MCP client into the FastAPI lifespan with `contextlib.AsyncExitStack` (moved from Milestone 5 on 2026-09-24), and decide the startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server child fails to start.
-- [ ] Add graph tests for:
+
+  `PlannedToolName` is pinned to the MCP allow-list, and `ToolPlan` rejects any other name (`test_the_planned_tool_names_are_exactly_the_mcp_allow_list`, `test_the_plan_model_rejects_off_contract_payloads`).
+- [x] Permit at most one tool request. The graph is acyclic with the exact nine-node topology (`test_the_graph_has_exactly_the_milestone_6_topology`, `test_the_graph_has_no_cycle`), and every scenario runs each node at most once with at most one MCP call (`test_every_tool_situation_runs_each_node_once_and_calls_mcp_at_most_once`).
+- [x] Validate planner arguments before calling MCP. `approve_tool_plan` applies pairing, the allow-list, and `normalize_symbol`; a rejected plan makes zero MCP requests (`test_approve_tool_plan_rejects_with_a_closed_reason`, `test_a_rejected_plan_makes_no_mcp_call_and_keeps_only_its_reason`).
+- [x] Add `call_tool` node. Exactly one `market_tools.call(...)` (`test_a_quote_success_is_called_once_and_becomes_t1`).
+- [x] Convert successful tool output into trusted `T1` context. `build_tool_context_item` in `app/citations.py`; `T1` is rendered as escaped, delimited untrusted data (`test_hostile_provider_text_is_escaped_and_cannot_open_a_block`).
+- [x] Include provider/freshness metadata in MCP citations. `McpCitation` is application-built with `provider`, `symbol`, `as_of`, and ordered `fields` (`test_a_cited_t1_becomes_an_application_built_mcp_citation`, `test_both_citation_types_map_to_their_public_shapes`).
+- [x] Ensure failed tool output never becomes grounding context (`test_failed_tool_output_never_reaches_context_prompt_or_citations`).
+- [x] Continue with document evidence when an optional tool fails (`test_a_tool_failure_answers_from_documents_with_no_failure_text`, `test_a_planning_failure_degrades_to_the_document_answer`).
+- [x] Wire the MCP client into the FastAPI lifespan with `contextlib.AsyncExitStack` (moved from Milestone 5 on 2026-09-24), and decide the startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server child fails to start. The policy is D1–D6: without a key the API runs RAG-only, a child that cannot start degrades to RAG-only, and a malformed `MCP_TOOL_TIMEOUT_SECONDS` fails startup before any resource is created. Resources close in the order MCP → OpenAI → pool (`tests/test_http.py` T22–T27).
+- [x] Add graph tests for:
   - tools disabled;
   - tools enabled/no tool selected;
   - successful tool;
   - failed tool;
   - MCP-only question with failed tool.
 
+  All five are scenarios of `test_every_tool_situation_runs_each_node_once_and_calls_mcp_at_most_once` (`disabled`, `no-plan`, `tool-success`, `tool-failure`, `tool-failure-no-documents`), with dedicated tests beside them.
+
 **Exit condition:** the same `/v1/query` endpoint demonstrably supports both RAG-only and RAG+MCP paths without an agent loop.
+
+**Verified 2026-09-25.** The exit condition is met, and AC1–AC22 of `docs/changes/M6-mcp-graph-integration.md` §19 have passing evidence.
+
+Exit condition, automated (AC1): `test_rag_only_and_rag_with_mcp_through_the_same_endpoint` (`tests/test_http.py`, PostgreSQL) runs the real lifespan against `TEST_DATABASE_URL`, with an in-process MCP server over a scripted provider, through the D6 seam. It uploads `tests/fixtures/smoke.txt` and sends three queries:
+- With `use_tools=false`, the query returns `answered` with one verified `D1` citation, `tools_used []`, and no planner or provider call.
+- With `use_tools=true` and an ACME quote question, it returns `answered` citing `D1` and an application-built `T1` MCP citation, with `tools_used ["get_market_quote"]` after exactly one normalized provider call.
+- With the provider failing, it returns `answered` from `D1` only, with `tools_used []`.
+
+The queries leave row counts unchanged, and no log record holds the dummy key, the Alpha Vantage sentinel, or `postgresql://`. The graph is acyclic, with no agent loop.
+
+Acceptance evidence (tests are in `tests/`; T-numbers refer to the spec's §13):
+
+| AC | Evidence |
+|---|---|
+| AC1 | `test_http.py::test_rag_only_and_rag_with_mcp_through_the_same_endpoint` (T29) |
+| AC2 | `test_openai_provider.py`: `test_the_planner_request_carries_the_recorded_settings`, `test_a_request_failure_is_one_attempt_and_safe`, `test_every_invalid_outcome_is_one_call_and_a_planning_error`, `test_the_plan_schema_constant_matches_the_pydantic_model` (T31) |
+| AC3, AC5 | `test_prompts.py::test_the_planner_input_is_only_the_escaped_question`, `test_planner_instructions_state_each_rule` (T32); `test_graph.py::test_the_planner_sees_only_the_escaped_question` |
+| AC4, AC6 | `test_graph.py::test_the_graph_has_exactly_the_milestone_6_topology`, `test_the_graph_has_no_cycle`, `test_every_tool_situation_runs_each_node_once_and_calls_mcp_at_most_once` (T16) |
+| AC7 | `test_graph.py::test_approve_tool_plan_rejects_with_a_closed_reason`, `test_approve_tool_plan_normalizes_the_symbol_canonically`, `test_a_rejected_plan_makes_no_mcp_call_and_keeps_only_its_reason`, `test_a_quote_success_is_called_once_and_becomes_t1` (T6, T7, T9) |
+| AC8 | `test_graph.py::test_failed_tool_output_never_reaches_context_prompt_or_citations`, `test_a_tool_failure_answers_from_documents_with_no_failure_text` (T13, T18); T29/T30 |
+| AC9 | `test_prompts.py::test_the_t1_block_follows_the_documents_in_the_recorded_layout`, `test_hostile_provider_text_is_escaped_and_cannot_open_a_block`, `test_answer_instructions_state_each_t1_rule` (T33); `test_graph.py::test_an_overview_success_omits_absent_fields_and_uses_the_fixed_freshness` (T10) |
+| AC10 | `test_citations.py::test_a_cited_t1_becomes_an_application_built_mcp_citation` and the D13 field-order tests; `test_http.py::test_both_citation_types_map_to_their_public_shapes` (T11, T34) |
+| AC11 | `test_citations.py::test_t_marker_rule`, `test_t1_without_a_tool_item_is_an_unknown_id`, `test_a_non_canonical_t_label_is_removed_even_if_final`; `test_graph.py::test_a_cited_t1_without_tool_evidence_is_an_unknown_id` (T17) |
+| AC12 | `test_graph.py::test_tools_used_is_derived_only_from_a_validated_success`, `test_an_uncited_successful_tool_is_still_reported_in_tools_used`; `test_http.py::test_tools_used_is_taken_from_the_result`; T29 (T3, T9, T12, T13, T19) |
+| AC13 | `test_http.py::test_available_mode_enters_one_shared_client_and_closes_it`, `test_resources_close_in_reverse_order`, `test_a_failure_after_startup_unwinds_every_entered_resource`, `test_an_mcp_close_failure_is_contained_and_shutdown_continues`, and the two cancellation tests (T22, T26) |
+| AC14 | `test_graph.py::test_tool_path_events_are_correlated_and_carry_no_content`; `test_http.py::test_a_child_that_cannot_start_degrades_to_rag_only` (T24, T30); the startup-mode tests' `mcp.startup` and `mcp.shutdown` events |
+| AC15 | `test_http.py::test_without_a_key_no_child_starts_and_use_tools_calls_nothing`, `test_use_tools_true_without_available_tools_takes_the_document_path`; `test_graph.py::test_unavailable_tools_make_no_planner_or_mcp_call` (T2, T23) |
+| AC16 | `test_mcp.py::test_one_connection_carries_overlapping_calls_from_separate_tasks` (T20); `test_http.py::test_concurrent_requests_share_the_lifespan_owned_client` (T21) |
+| AC17 | `test_http.py::test_a_child_that_cannot_start_degrades_to_rag_only` (T24) |
+| AC18 | `test_config.py::test_the_optional_config_always_validates_the_timeout`; `test_http.py::test_startup_refuses_an_invalid_mcp_timeout_before_any_resource` (T25) |
+| AC19 | the §15.2 greps below; `test_http.py::test_open_market_tools_launches_the_server_with_stderr_discarded` (T27); `test_mcp.py::test_errlog_receives_a_stdio_childs_stderr`, `test_without_errlog_the_server_is_passed_through_unchanged`, `test_errlog_wraps_only_a_stdio_server` (T28) |
+| AC20 | every pre-existing suite passes, edited only as §14 Stages A–C name |
+| AC21 | the offline gate below; `git diff --stat main -- migrations pyproject.toml uv.lock` is empty; `uv lock --check` resolves 104 packages |
+| AC22 | the local HTTP smoke below |
+
+What was built:
+
+- The tool planner (`app/openai_provider.py`), the planner and `T1` prompts (`app/prompts.py`), `ToolContextItem`/`McpCitation` and the `[DT]` marker rule (`app/citations.py`), and the discriminated public citation union with a closed `tools_used` (`app/schemas.py`).
+- `decide_tool`, `call_tool`, `approve_tool_plan`, and the `route_tools`/`route_plan` edges (`app/graph.py`).
+- The `AsyncExitStack` lifespan with the optional shared MCP client, the `open_market_tools` seam with child stderr sent to `os.devnull`, and `MarketDataConfig.optional_from_env` (`app/main.py`, `app/config.py`, `app/mcp_client.py`), plus `.env.example`.
+- Unchanged, as §12.1 requires: `app/mcp_server.py`, `app/market_data.py`, `app/symbols.py`, `app/db.py`, `app/retrieval.py`, `app/ingestion.py`, `app/tokenizer.py`, `app/logging.py`, `app/errors.py`, the migration, `pyproject.toml`, `uv.lock`, `scripts/`, `tests/db_safety.py`, `tests/fixtures/`, and `.claude/`.
+
+Automated verification (final offline gate, before these completion records):
+
+- `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY -u MCP_TOOL_TIMEOUT_SECONDS UV_OFFLINE=1 DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py`: exit 0, `PASSED: all 5 steps; 1168 tests, 0 skipped`. `uv lock --check` resolved 104 packages, 57 files were already formatted, Ruff passed, and mypy found no issues in 41 source files.
+- Without `TEST_DATABASE_URL`, `uv run pytest` reports 1078 passed and 90 skipped, so 90 tests need PostgreSQL and every one of them ran in the gate.
+- `git diff --check`: exit 0.
+- Boundary checks (`docs/changes/M6-mcp-graph-integration.md` §15.2):
+  - Every forbidden-import grep printed nothing.
+  - `git diff --stat main` over the protected files, migrations, `pyproject.toml`, and `uv.lock` was empty.
+  - `app/citations.py` imports exactly `QUOTE_FRESHNESS`, `CompanyOverview`, and `MarketQuote` from `app.market_data`.
+  - `AsyncExitStack` appears 4 times in `app/main.py`.
+  - Neither `app/main.py` nor `app/graph.py` references `MCPServer`, `app.mcp_server`, or `build_mcp_server`.
+  - The spec's `grep -nE 'exception_handler\((Exception|500)' app/` has no `-r`, so it exits 2 (`app/: Is a directory`) and checks nothing. Run recursively (`grep -rnE`), it printed nothing.
+
+Offline live HTTP smoke (§15.3, run once on 2026-09-25 with explicit approval):
+- Each server ran as `.venv/bin/python -m uvicorn app.main:app` on 127.0.0.1:8765 against the `fintech` database.
+- Each started from `env -i` with only `PATH`, `HOME`, `TMPDIR`, `DATABASE_URL`, `OPENAI_API_KEY=DUMMY-OPENAI-M6SMOKE`, and `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` set to the closed `http://127.0.0.1:9`, with `NO_PROXY=`.
+- No request was valid, so no planner call and no `tools/call` could happen.
+
+1. With `MCP_TOOL_TIMEOUT_SECONDS=0` and no Alpha Vantage key, startup failed with `ConfigError: MCP_TOOL_TIMEOUT_SECONDS must be a number greater than 0 and at most 30` (exit 3) and started no MCP child. Starlette logs a traceback for this deliberate failure, so this log is not part of the step 5 scan. It held neither dummy key nor `postgresql://`.
+2. Without a key, the log had one `mcp.startup` `not_configured`, and the server had no `app.mcp_server` child. `/health` returned `200`, and a 2-character question returned `422`. SIGINT gave exit 0.
+3. With `ALPHA_VANTAGE_API_KEY=AV-SENTINEL-KEY-M6SMOKE`, the log had one `mcp.startup` `available`, and the server had exactly one `app.mcp_server` child. `/health` returned `200`.
+   - `/v1/query` returned `422` with the generic `invalid_request` body for a 2-character question, `use_tools: "true"`, an extra field, and malformed JSON. None echoed the question sentinel, and the log shows exactly 4 query requests.
+   - `/v1/documents` returned `415 unsupported_file_type` for `run.exe`.
+4. SIGINT gave exit 0, and the log had one `mcp.shutdown` `closed`. The recorded child was gone, no `app.mcp_server` process remained, and nothing listened on the port.
+5. The logs of steps 2–4 held 0 occurrences each of both dummy keys, `AV-SENTINEL`, `postgresql://`, `Traceback`, `apikey`, `alphavantage.co`, the question sentinel, `mcp.tool.requested`, and `planning.`.
+
+An earlier attempt the same day is not counted as evidence. Its script ran under macOS `/bin/bash` 3.2, where two faults showed:
+- It read server exit codes through `wait` inside a command substitution, which gives `-1`, so no exit code was captured.
+- It sent the `use_tools` and extra-field requests twice each, because bash 3.2 evaluates a `$(...)` containing `\"` twice. The duplicates were invalid loopback requests, all rejected with `422`.
+
+Every result that attempt did observe matched the run above. The corrected script was approved and run once. Its output files were deleted after the results were recorded.
+
+External calls: none. No OpenAI, Alpha Vantage, package, or other network request was made. Tests used only fakes, in-process servers, and local PostgreSQL. The real planner, the real Alpha Vantage shapes, and the planner's added latency are checked only by the separately authorized Milestone 8 smoke (spec §21).
 
 ---
 

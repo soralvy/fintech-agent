@@ -16,6 +16,11 @@ and validated by ``GroundedAnswer``. Only invalid structured output is retried,
 exactly once (docs/DECISIONS.md section 12). Every failure surfaces as
 ``AnswerProviderError``; refusal text, output, prompts, and provider bodies are
 never logged.
+
+``OpenAIToolPlanner`` reuses that classification for the optional tool
+planner (docs/DECISIONS.md section 10.4): one logical call, one HTTP attempt,
+no retry. It returns an untrusted ``ToolPlan`` or raises ``ToolPlanningError``,
+which is not an HTTP error: the graph falls back to document evidence.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app.config import OpenAIConfig
 from app.errors import AnswerProviderError, EmbeddingProviderError
-from app.logging import log_event
+from app.logging import EventField, log_event
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +139,92 @@ class AnswerGenerator(Protocol):
     ) -> GroundedAnswer: ...
 
 
+# ---------------------------------------------------------------------------
+# Tool planner (docs/DECISIONS.md section 10.4)
+# ---------------------------------------------------------------------------
+
+# The two approved tool names. This module does not import the MCP client, so
+# the names are repeated here; a test pins them to the MCP client's
+# ``MarketToolName``.
+PlannedToolName = Literal["get_market_quote", "get_company_overview"]
+
+
+class ToolPlan(BaseModel):
+    """The planner's structured output: untrusted until the graph approves it.
+
+    Both fields are null for no tool. The graph, not this model, requires the
+    two to be null or present together and normalizes the symbol.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    tool_name: PlannedToolName | None
+    symbol: str | None
+
+
+# The provider-side schema for ``ToolPlan``, written out by hand like
+# ``GROUNDED_ANSWER_FORMAT``; a test pins it against the model.
+TOOL_PLAN_FORMAT: Final[ResponseFormatTextJSONSchemaConfigParam] = {
+    "type": "json_schema",
+    "name": "tool_plan",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": ["string", "null"],
+                "enum": ["get_market_quote", "get_company_overview", None],
+            },
+            "symbol": {"type": ["string", "null"]},
+        },
+        "required": ["tool_name", "symbol"],
+        "additionalProperties": False,
+    },
+}
+
+# Code constants, not configuration (docs/TECH_BASELINE.md section 3.10). The
+# planner is optional evidence, so it gets one short HTTP attempt: no SDK
+# transport retry, and a tighter timeout than the shared client's.
+PLANNER_TIMEOUT_SECONDS: Final = 10.0
+PLANNER_MAX_OUTPUT_TOKENS: Final = 200
+PLANNER_REASONING_EFFORT: Final = "none"
+
+# Why a planning call failed: ``request_failed`` for an SDK or provider error,
+# otherwise the answer classification's own reason (docs/DECISIONS.md
+# section 12).
+type PlanningFailureReason = Literal[
+    "request_failed",
+    "malformed_response",
+    "incomplete_max_output_tokens",
+    "incomplete_content_filter",
+    "incomplete_other",
+    "unexpected_status",
+    "refusal",
+    "no_output_text",
+    "multiple_output_text",
+    "invalid_json",
+    "schema_validation",
+]
+
+
+class ToolPlanningError(Exception):
+    """The optional planning step produced no usable plan.
+
+    Deliberately not an ``AppError``: it never maps to an HTTP response. The
+    graph catches it and continues with document evidence.
+    """
+
+    def __init__(self, reason: PlanningFailureReason) -> None:
+        super().__init__(reason)
+        self.reason: PlanningFailureReason = reason
+
+
+class ToolPlanner(Protocol):
+    """Chooses at most one market-data tool from fixed instructions and the question."""
+
+    async def plan_tool(self, *, instructions: str, prompt: str) -> ToolPlan: ...
+
+
 def create_openai_client(config: OpenAIConfig) -> AsyncOpenAI:
     """Build the shared client. Constructing it makes no network request."""
     return AsyncOpenAI(
@@ -221,7 +312,7 @@ class OpenAIAnswerGenerator:
         for attempt in range(1, _MAX_LOGICAL_CALLS + 1):
             started = time.monotonic()
             response = await self._create(attempt, instructions, prompt)
-            outcome = _classify(response)
+            outcome = _classify(response, GroundedAnswer)
             if isinstance(outcome, GroundedAnswer):
                 log_event(
                     logger,
@@ -284,14 +375,81 @@ class OpenAIAnswerGenerator:
             raise AnswerProviderError from None
 
 
-def _classify(response: Response) -> GroundedAnswer | _Rejected:
+class OpenAIToolPlanner:
+    """``ToolPlanner`` backed by the OpenAI Responses API.
+
+    Exactly one logical call and one HTTP attempt per plan: the shared client
+    is copied with ``max_retries=0`` and a shorter timeout (the copy reuses
+    its connection pool), and nothing is retried in the application. Every
+    failure raises ``ToolPlanningError``; its SDK error, the prompt, and the
+    output are never logged.
+    """
+
+    def __init__(self, client: AsyncOpenAI, *, model: str) -> None:
+        self._client = client.with_options(
+            max_retries=0, timeout=PLANNER_TIMEOUT_SECONDS
+        )
+        self._model = model
+
+    async def plan_tool(self, *, instructions: str, prompt: str) -> ToolPlan:
+        """Return the provider's validated plan, or raise ``ToolPlanningError``."""
+        started = time.monotonic()
+        response = await self._create(instructions, prompt)
+        outcome = _classify(response, ToolPlan)
+        if isinstance(outcome, _Rejected):
+            _planning_failed(outcome.reason)
+            raise ToolPlanningError(outcome.reason)
+        log_event(
+            logger,
+            "planning.completed",
+            tool=outcome.tool_name,
+            input_tokens=_token_count(response, "input_tokens"),
+            output_tokens=_token_count(response, "output_tokens"),
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        return outcome
+
+    async def _create(self, instructions: str, prompt: str) -> Response:
+        try:
+            return await self._client.responses.create(
+                model=self._model,
+                instructions=instructions,
+                input=prompt,
+                text={"format": TOOL_PLAN_FORMAT},
+                reasoning={"effort": PLANNER_REASONING_EFFORT},
+                max_output_tokens=PLANNER_MAX_OUTPUT_TOKENS,
+                store=False,
+            )
+        except openai.OpenAIError as exc:
+            # The SDK error may quote the response body; only its type and
+            # status code are safe to record.
+            _planning_failed(
+                "request_failed",
+                error_type=type(exc).__name__,
+                status_code=getattr(exc, "status_code", None),
+            )
+            raise ToolPlanningError("request_failed") from None
+        except (ValueError, RecursionError):
+            # A 200 labelled JSON that the SDK cannot decode; the error carries
+            # the body, so nothing of it is logged.
+            _planning_failed("malformed_response")
+            raise ToolPlanningError("malformed_response") from None
+
+
+def _planning_failed(reason: PlanningFailureReason, **fields: EventField) -> None:
+    log_event(logger, "planning.failed", level=logging.WARNING, reason=reason, **fields)
+
+
+def _classify[ModelT: BaseModel](
+    response: Response, model: type[ModelT]
+) -> ModelT | _Rejected:
     """Classify one logical call's response (docs/DECISIONS.md section 12).
 
     In table order: a malformed body; the status, checked before any output
     is read; a refusal
     in any message, which wins over any payload; then exactly one usable
-    output text. Every output item is inspected: the answer is never assumed
-    to be ``output[0]``.
+    output text, validated as ``model``. Every output item is inspected: the
+    answer is never assumed to be ``output[0]``.
     """
     if not _is_well_formed(response):
         return _Rejected("malformed_response", retryable=False)
@@ -317,7 +475,7 @@ def _classify(response: Response) -> GroundedAnswer | _Rejected:
     if len(payloads) != 1:
         reason: _RejectReason = "multiple_output_text" if payloads else "no_output_text"
         return _Rejected(reason, retryable=True)
-    return _parse(payloads[0])
+    return _parse(payloads[0], model)
 
 
 def _is_well_formed(response: object) -> bool:
@@ -375,12 +533,12 @@ def _status_rejection(response: Response) -> _Rejected | None:
     return None
 
 
-def _parse(payload: str) -> GroundedAnswer | _Rejected:
+def _parse[ModelT: BaseModel](payload: str, model: type[ModelT]) -> ModelT | _Rejected:
     try:
         data = json.loads(payload)
     except (ValueError, RecursionError):
         return _Rejected("invalid_json", retryable=True)
     try:
-        return GroundedAnswer.model_validate(data)
+        return model.model_validate(data)
     except ValidationError:
         return _Rejected("schema_validation", retryable=True)
