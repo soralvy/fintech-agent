@@ -15,15 +15,19 @@ import asyncio
 import functools
 import json
 import logging
+import os
 import socket
+import threading
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, cast, get_args
+from typing import Any, NoReturn, TextIO, cast, get_args
 from uuid import UUID, uuid4
 
 import httpx
+import httpx2
 import langchain_core.tracers.langchain
 import langsmith.utils
 import psycopg
@@ -31,16 +35,23 @@ import pytest
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Message, Receive, Scope
 from starlette.types import Send as ASGISend
 
 from app.citations import INSUFFICIENT_CONTEXT_ANSWER, DocumentCitation, McpCitation
-from app.config import TRACING_ENV_VARS, ConfigError, IngestionConfig, RetrievalConfig
+from app.config import (
+    TRACING_ENV_VARS,
+    ConfigError,
+    IngestionConfig,
+    MarketDataConfig,
+    RetrievalConfig,
+)
 from app.db import Pool
 from app.errors import AnswerProviderError, EmbeddingProviderError
-from app.graph import QueryGraph, QueryResult, build_query_graph
+from app.graph import QueryGraph, QueryResult, QueryRetriever, build_query_graph
 from app.ingestion import Ingestor
 from app.main import (
     UnexpectedErrorMiddleware,
@@ -48,22 +59,36 @@ from app.main import (
     get_ingestor,
     get_query_graph,
     http_error_handler,
+    open_market_tools,
+    optional_market_tools,
     request_validation_error_handler,
     to_query_response,
 )
-from app.mcp_client import ALLOWED_TOOLS
-from app.openai_provider import Embedder, GroundedAnswer
+from app.market_data import MarketDataError, MarketDataProvider, MarketQuote
+from app.mcp_client import (
+    ALLOWED_TOOLS,
+    MarketDataTools,
+    open_market_data_tools,
+    stdio_server_parameters,
+)
+from app.mcp_server import build_mcp_server
+from app.openai_provider import Embedder, GroundedAnswer, OpenAIToolPlanner, ToolPlan
+from app.prompts import render_tool_plan_input
 from app.retrieval import RetrievedChunk, Retriever
 from app.schemas import McpQueryCitation, QueryResponse
 from app.tokenizer import TiktokenTokenizer, Tokenizer
 from tests.db_safety import reset_test_database
 from tests.fakes import (
+    BarrierMarketDataProvider,
     FakeEmbedder,
     FakeRetriever,
     FakeTokenizer,
     KeywordEmbedder,
     ScriptedAnswerGenerator,
+    ScriptedMarketDataProvider,
+    ScriptedToolPlanner,
     build_pdf,
+    quote_for,
 )
 
 URL = "/v1/documents"
@@ -690,7 +715,10 @@ def test_no_evidence_is_the_fixed_insufficient_body_without_a_model_call() -> No
     assert answerer.calls == []
 
 
-def test_use_tools_true_takes_the_same_path_and_uses_no_tool() -> None:
+def test_use_tools_true_without_available_tools_takes_the_document_path() -> None:
+    """Tools unavailable (M6 T2): the graph has no planner or MCP client, as
+    when the API starts without ``ALPHA_VANTAGE_API_KEY``, so ``use_tools``
+    changes nothing and no tool is reported."""
     chunk = evidence()
     bodies = []
     for use_tools in (False, True):
@@ -1162,7 +1190,20 @@ def test_both_citation_types_map_to_their_public_shapes() -> None:
     assert list(body["citations"][1]["fields"]) == [
         name for name, _ in MCP_CITATION.fields
     ], "field order survives serialization"
-    assert body["tools_used"] == [], "no graph is wired to tools in Stage A"
+    assert body["tools_used"] == [], "no tool supplied evidence"
+
+
+def test_tools_used_is_taken_from_the_result() -> None:
+    response = to_query_response(
+        QueryResult(
+            status="answered",
+            answer="Quote [T1].",
+            citations=(MCP_CITATION,),
+            tools_used=("get_market_quote",),
+        )
+    )
+
+    assert json.loads(response.model_dump_json())["tools_used"] == ["get_market_quote"]
 
 
 def test_the_citation_union_is_discriminated_and_closed() -> None:
@@ -1424,3 +1465,651 @@ def test_query_answers_from_an_ingested_document_with_a_verified_citation(
     kinds = {event["event"] for event in answered_events}
     assert {"graph.started", "retrieval.completed", "graph.completed"} <= kinds
     assert "citation.unknown_id" in kinds
+
+
+# ===========================================================================
+# Milestone 6: the optional MCP client in the lifespan, and RAG+MCP over HTTP
+# ===========================================================================
+
+AV_SENTINEL = "AV-SENTINEL-KEY-7f3a"
+AV_URL = f"https://www.alphavantage.co/query?apikey={AV_SENTINEL}"
+MCP_EVENT_FIELDS = {"event", "outcome"}
+
+
+class InProcessOpener:
+    """Replaces ``app.main.open_market_tools``: the real client over an
+    in-process server, so no child is started and no socket is opened."""
+
+    def __init__(self, provider: object) -> None:
+        self.provider = provider
+        self.configs: list[MarketDataConfig] = []
+        self.opened: list[MarketDataTools] = []
+        self.exits = 0
+
+    @asynccontextmanager
+    async def open(self, config: MarketDataConfig) -> AsyncIterator[MarketDataTools]:
+        self.configs.append(config)
+        server = build_mcp_server(cast(MarketDataProvider, self.provider))
+        try:
+            async with open_market_data_tools(
+                server, timeout_seconds=config.timeout_seconds
+            ) as tools:
+                self.opened.append(tools)
+                yield tools
+        finally:
+            self.exits += 1
+
+
+def refusing_opener(
+    calls: list[MarketDataConfig],
+) -> Callable[[MarketDataConfig], AbstractAsyncContextManager[MarketDataTools]]:
+    """An opener that records a call and fails the test if it is entered."""
+
+    @asynccontextmanager
+    async def opener(config: MarketDataConfig) -> AsyncIterator[MarketDataTools]:
+        calls.append(config)
+        raise AssertionError("no MCP child may be started")
+        yield  # pragma: no cover
+
+    return opener
+
+
+def failing_opener(
+    calls: list[MarketDataConfig],
+) -> Callable[[MarketDataConfig], AbstractAsyncContextManager[MarketDataTools]]:
+    """An opener whose entry fails as a child that exits at once would, with
+    a secret and a URL in the member text (P4)."""
+
+    @asynccontextmanager
+    async def opener(config: MarketDataConfig) -> AsyncIterator[MarketDataTools]:
+        calls.append(config)
+        raise ExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [RuntimeError(f"child failed: {AV_SENTINEL} {AV_URL}")],
+        )
+        yield  # pragma: no cover
+
+    return opener
+
+
+def capture_graph_kwargs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Record every ``build_query_graph`` call the lifespan makes."""
+    captured: list[dict[str, Any]] = []
+    real = build_query_graph
+
+    def recording(**kwargs: Any) -> QueryGraph:
+        captured.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr("app.main.build_query_graph", recording)
+    return captured
+
+
+def mcp_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in events(caplog)
+        if event["event"] in {"mcp.startup", "mcp.shutdown"}
+    ]
+
+
+def tool_graph(
+    retriever_for: Callable[[Request], QueryRetriever],
+    answerer: ScriptedAnswerGenerator,
+    planner: ScriptedToolPlanner,
+) -> Callable[[Request], QueryGraph]:
+    """A ``get_query_graph`` override: the real graph, compiled once, over
+    scripted models and the lifespan-owned MCP client.
+
+    FastAPI runs this synchronous dependency in a worker thread, so the
+    one-time compilation is guarded for concurrent first requests.
+    """
+    compiled: list[QueryGraph] = []
+    lock = threading.Lock()
+
+    def factory(request: Request) -> QueryGraph:
+        with lock:
+            if not compiled:
+                compiled.append(
+                    build_query_graph(
+                        retriever=retriever_for(request),
+                        answerer=answerer,
+                        planner=planner,
+                        market_tools=request.app.state.market_tools,
+                    )
+                )
+            return compiled[0]
+
+    return factory
+
+
+def fixed(retriever: QueryRetriever) -> Callable[[Request], QueryRetriever]:
+    return lambda request: retriever
+
+
+def pooled_retriever(request: Request) -> QueryRetriever:
+    return Retriever(
+        pool=request.app.state.pool,
+        embedder=KeywordEmbedder(),
+        config=RetrievalConfig(),
+    )
+
+
+def ask_with_tools(client: TestClient, question: str) -> httpx2.Response:
+    return client.post(QUERY_URL, json={"question": question, "use_tools": True})
+
+
+def plan(tool: str | None, symbol: str | None) -> ToolPlan:
+    return ToolPlan.model_validate({"tool_name": tool, "symbol": symbol})
+
+
+# ---------------------------------------------------------------------------
+# Startup modes (T22-T25; AC13-AC15, AC17, AC18)
+# ---------------------------------------------------------------------------
+
+
+def test_available_mode_enters_one_shared_client_and_closes_it(
+    live_env: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", f" {AV_SENTINEL} ")
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT_SECONDS", "7.5")
+    opener = InProcessOpener(ScriptedMarketDataProvider())
+    monkeypatch.setattr("app.main.open_market_tools", opener.open)
+    captured = capture_graph_kwargs(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+
+    with TestClient(app) as client:
+        (tools,) = opener.opened
+        assert app.state.market_tools is tools
+        ((kwargs),) = captured
+        assert kwargs["market_tools"] is tools
+        assert isinstance(kwargs["planner"], OpenAIToolPlanner)
+        assert opener.exits == 0
+        assert client.get("/health").status_code == 200
+
+    assert opener.configs == [
+        MarketDataConfig(api_key=AV_SENTINEL, timeout_seconds=7.5)
+    ]
+    assert opener.exits == 1
+    assert mcp_events(caplog) == [
+        {"event": "mcp.startup", "outcome": "available"},
+        {"event": "mcp.shutdown", "outcome": "closed"},
+    ]
+    assert_logs_hold_none_of(caplog, AV_SENTINEL, DUMMY_KEY, "postgresql://")
+
+
+def test_without_a_key_no_child_starts_and_use_tools_calls_nothing(
+    live_env: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    opener_calls: list[MarketDataConfig] = []
+    monkeypatch.setattr("app.main.open_market_tools", refusing_opener(opener_calls))
+    captured = capture_graph_kwargs(monkeypatch)
+    planner = ScriptedToolPlanner()
+    answerer = ScriptedAnswerGenerator(grounded())
+    caplog.set_level(logging.DEBUG)
+
+    for live in start_live(
+        live_env,
+        FakeEmbedder(),
+        FakeTokenizer(),
+        query_graph=tool_graph(fixed(FakeRetriever([evidence()])), answerer, planner),
+    ):
+        assert app.state.market_tools is None
+        assert captured[0]["market_tools"] is None
+        assert live.client.get("/health").status_code == 200
+        response = live.client.post(
+            QUERY_URL, json={"question": QUESTION, "use_tools": True}
+        )
+        assert response.status_code == 200
+        assert (response.json()["status"], response.json()["tools_used"]) == (
+            "answered",
+            [],
+        )
+
+    assert opener_calls == []
+    assert planner.calls == []
+    assert mcp_events(caplog) == [{"event": "mcp.startup", "outcome": "not_configured"}]
+    (route,) = [e for e in named(caplog, "graph.route") if e["node"] == "retrieve"]
+    assert route["tools_available"] is False
+
+
+def test_a_child_that_cannot_start_degrades_to_rag_only(
+    live_env: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", AV_SENTINEL)
+    opener_calls: list[MarketDataConfig] = []
+    monkeypatch.setattr("app.main.open_market_tools", failing_opener(opener_calls))
+    planner = ScriptedToolPlanner()
+    answerer = ScriptedAnswerGenerator(grounded())
+    caplog.set_level(logging.DEBUG)
+
+    for live in start_live(
+        live_env,
+        FakeEmbedder(),
+        FakeTokenizer(),
+        query_graph=tool_graph(fixed(FakeRetriever([evidence()])), answerer, planner),
+    ):
+        assert app.state.market_tools is None
+        assert live.client.get("/health").status_code == 200
+        response = live.client.post(
+            QUERY_URL, json={"question": QUESTION, "use_tools": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["tools_used"] == []
+
+    assert len(opener_calls) == 1
+    assert planner.calls == []
+    assert mcp_events(caplog) == [{"event": "mcp.startup", "outcome": "start_failed"}]
+    (record,) = [r for r in caplog.records if '"mcp.startup"' in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert_logs_hold_none_of(
+        caplog,
+        AV_SENTINEL,
+        AV_URL,
+        "alphavantage",
+        "child failed",
+        "ExceptionGroup",
+        "RuntimeError",
+        DUMMY_KEY,
+    )
+
+
+@pytest.mark.parametrize("key", [None, AV_SENTINEL], ids=["without-key", "with-key"])
+@pytest.mark.parametrize("value", ["0", "31", "nan", "five"])
+def test_startup_refuses_an_invalid_mcp_timeout_before_any_resource(
+    monkeypatch: pytest.MonkeyPatch, key: str | None, value: str
+) -> None:
+    created = _record_resources(monkeypatch)
+    opener_calls: list[MarketDataConfig] = []
+    monkeypatch.setattr("app.main.open_market_tools", refusing_opener(opener_calls))
+    if key is not None:
+        monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", key)
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(ConfigError) as raised, TestClient(app):
+        pass  # pragma: no cover
+
+    assert str(raised.value) == (
+        "MCP_TOOL_TIMEOUT_SECONDS must be a number greater than 0 and at most 30"
+    )
+    assert created == [], "no resource may be created before configuration passes"
+    assert opener_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Exit order, partial startup, and contained close failure (T26; AC13)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingPool:
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+
+    async def open(self) -> None:
+        self.order.append("pool.open")
+
+    async def close(self) -> None:
+        self.order.append("pool.close")
+
+
+def recording_resources(
+    monkeypatch: pytest.MonkeyPatch, *, close_error: Exception | None = None
+) -> list[str]:
+    """Replace the pool, OpenAI client, and MCP opener with recording fakes."""
+    order: list[str] = []
+    monkeypatch.setenv("DATABASE_URL", "postgresql://app:dbpass@127.0.0.1:1/x")
+    monkeypatch.setenv("OPENAI_API_KEY", DUMMY_KEY)
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", AV_SENTINEL)
+
+    class RecordingOpenAI(AsyncOpenAI):
+        async def close(self) -> None:
+            order.append("openai.close")
+            await super().close()
+
+    def create_openai_client(config: object) -> AsyncOpenAI:
+        order.append("openai.create")
+        return RecordingOpenAI(api_key=DUMMY_KEY, base_url="http://openai.invalid/v1")
+
+    @asynccontextmanager
+    async def opener(config: MarketDataConfig) -> AsyncIterator[MarketDataTools]:
+        order.append("mcp.enter")
+        yield cast(MarketDataTools, object())
+        order.append("mcp.close")
+        if close_error is not None:
+            raise close_error
+
+    monkeypatch.setattr("app.main.create_pool", lambda config: _RecordingPool(order))
+    monkeypatch.setattr("app.main.create_openai_client", create_openai_client)
+    monkeypatch.setattr("app.main.open_market_tools", opener)
+    return order
+
+
+STARTUP_ORDER = ["pool.open", "openai.create", "mcp.enter"]
+SHUTDOWN_ORDER = ["mcp.close", "openai.close", "pool.close"]
+
+
+def test_resources_close_in_reverse_order(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    order = recording_resources(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+
+    with TestClient(app):
+        assert order == STARTUP_ORDER
+
+    assert order == STARTUP_ORDER + SHUTDOWN_ORDER
+    assert mcp_events(caplog)[-1] == {"event": "mcp.shutdown", "outcome": "closed"}
+
+
+def test_a_failure_after_startup_unwinds_every_entered_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order = recording_resources(monkeypatch)
+
+    def broken_graph(**kwargs: object) -> NoReturn:
+        raise RuntimeError("graph compilation defect")
+
+    monkeypatch.setattr("app.main.build_query_graph", broken_graph)
+
+    with pytest.raises(RuntimeError, match="graph compilation defect"), TestClient(app):
+        pass  # pragma: no cover
+
+    assert order == STARTUP_ORDER + SHUTDOWN_ORDER
+
+
+def test_an_mcp_close_failure_is_contained_and_shutdown_continues(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    order = recording_resources(
+        monkeypatch, close_error=RuntimeError(f"close failed: {AV_SENTINEL} {AV_URL}")
+    )
+    caplog.set_level(logging.DEBUG)
+
+    with TestClient(app):
+        pass
+
+    assert order == STARTUP_ORDER + SHUTDOWN_ORDER
+    assert mcp_events(caplog) == [
+        {"event": "mcp.startup", "outcome": "available"},
+        {"event": "mcp.shutdown", "outcome": "close_failed"},
+    ]
+    assert_logs_hold_none_of(caplog, AV_SENTINEL, AV_URL, "close failed")
+
+
+@pytest.mark.anyio
+async def test_cancellation_while_entering_the_client_propagates(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    @asynccontextmanager
+    async def cancelled(config: MarketDataConfig) -> AsyncIterator[MarketDataTools]:
+        raise asyncio.CancelledError
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("app.main.open_market_tools", cancelled)
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(asyncio.CancelledError):
+        async with optional_market_tools(MarketDataConfig(api_key=AV_SENTINEL)):
+            pass  # pragma: no cover
+
+    assert mcp_events(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_cancellation_while_closing_the_client_propagates(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    @asynccontextmanager
+    async def opener(config: MarketDataConfig) -> AsyncIterator[MarketDataTools]:
+        yield cast(MarketDataTools, object())
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.main.open_market_tools", opener)
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(asyncio.CancelledError):
+        async with optional_market_tools(MarketDataConfig(api_key=AV_SENTINEL)):
+            pass
+
+    assert mcp_events(caplog) == [{"event": "mcp.startup", "outcome": "available"}]
+
+
+# ---------------------------------------------------------------------------
+# The stdio launch seam (T27; AC19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_open_market_tools_launches_the_server_with_stderr_discarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[object, float, TextIO | None]] = []
+    sentinel_tools = cast(MarketDataTools, object())
+
+    @asynccontextmanager
+    async def recording(
+        server: object, *, timeout_seconds: float, errlog: TextIO | None = None
+    ) -> AsyncIterator[MarketDataTools]:
+        seen.append((server, timeout_seconds, errlog))
+        yield sentinel_tools
+
+    monkeypatch.setattr("app.main.open_market_data_tools", recording)
+    config = MarketDataConfig(api_key=AV_SENTINEL, timeout_seconds=7.5)
+
+    async with open_market_tools(config) as tools:
+        assert tools is sentinel_tools
+        ((server, timeout_seconds, errlog),) = seen
+        assert errlog is not None
+        assert not errlog.closed and errlog.writable()
+
+    assert server == stdio_server_parameters(config)
+    assert timeout_seconds == 7.5
+    assert errlog.name == os.devnull
+    assert errlog.closed, "the sink is closed with the client"
+
+
+# ---------------------------------------------------------------------------
+# Shared-client concurrency through the lifespan (T21; AC16)
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_requests_share_the_lifespan_owned_client(
+    live_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four ``use_tools`` queries overlap on the one lifespan-owned client.
+
+    The provider holds every call until all four are in flight, so requests
+    that were serialized, or served by separate clients that never met,
+    could not all pass. The planner is keyed by question, so each response's
+    ``T1`` must carry the symbol its own question asked for.
+    """
+    parties = 4
+    symbols = ["AAA", "BBB", "CCC", "DDD"]
+    questions = {symbol: f"What is the latest {symbol} quote?" for symbol in symbols}
+    provider = BarrierMarketDataProvider(parties, deadline_seconds=5.0)
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", AV_SENTINEL)
+    opener = InProcessOpener(provider)
+    monkeypatch.setattr("app.main.open_market_tools", opener.open)
+    planner = ScriptedToolPlanner(
+        by_prompt={
+            render_tool_plan_input(question): plan("get_market_quote", symbol.lower())
+            for symbol, question in questions.items()
+        }
+    )
+    answerer = ScriptedAnswerGenerator(
+        *[grounded("The latest quote [T1].", ["T1"]) for _ in symbols]
+    )
+    graph = tool_graph(fixed(FakeRetriever([])), answerer, planner)
+
+    for live in start_live(
+        live_env, FakeEmbedder(), FakeTokenizer(), query_graph=graph
+    ):
+        ask = functools.partial(ask_with_tools, live.client)
+        with ThreadPoolExecutor(max_workers=parties) as pool:
+            answers = pool.map(ask, [questions[symbol] for symbol in symbols])
+            responses = dict(zip(symbols, answers, strict=True))
+
+    assert len(opener.opened) == 1, "one client for every request"
+    assert provider.barrier_reached
+    assert provider.max_active == parties
+    for symbol, response in responses.items():
+        assert response.status_code == 200
+        body = response.json()
+        assert (body["status"], body["tools_used"]) == (
+            "answered",
+            ["get_market_quote"],
+        )
+        (citation,) = body["citations"]
+        assert (citation["id"], citation["symbol"]) == ("T1", symbol)
+    assert len(planner.calls) == parties
+
+
+# ---------------------------------------------------------------------------
+# RAG-only and RAG+MCP through one endpoint (T29; AC1, AC12, T30)
+# ---------------------------------------------------------------------------
+
+TOOL_QUESTION = (
+    "Why did Acme's European revenue decline, and what is the latest ACME quote?"
+)
+RAW_PLANNED_SYMBOL = " AcMe "
+
+
+def assert_stored_document_citation(
+    database_url: str, citation: dict[str, Any], document_id: str
+) -> None:
+    """A ``D`` citation that points at the stored chunk it quotes."""
+    assert (citation["id"], citation["source_type"]) == ("D1", "document")
+    assert citation["document_id"] == document_id
+    stored = _stored_chunk(database_url, citation["chunk_id"])
+    assert stored is not None and str(stored[0]) == document_id
+    assert citation["excerpt"] in stored[1]
+
+
+def expected_quote_citation(quote: MarketQuote) -> dict[str, Any]:
+    """The D13 public citation for a quote: application-built, in field order."""
+    return {
+        "id": "T1",
+        "source_type": "mcp",
+        "tool": "get_market_quote",
+        "provider": "alpha_vantage",
+        "symbol": quote.symbol,
+        "as_of": quote.latest_trading_day,
+        "fields": {
+            "price": quote.price,
+            "previous_close": quote.previous_close,
+            "change": quote.change,
+            "change_percent": quote.change_percent,
+            "volume": quote.volume,
+            "latest_trading_day": quote.latest_trading_day,
+        },
+    }
+
+
+def test_rag_only_and_rag_with_mcp_through_the_same_endpoint(
+    live_env: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Milestone 6 exit condition, against PostgreSQL and a real in-process
+    MCP server behind the lifespan-owned client."""
+    acme_quote = quote_for("ACME")
+    provider = ScriptedMarketDataProvider(quote=acme_quote)
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", AV_SENTINEL)
+    opener = InProcessOpener(provider)
+    monkeypatch.setattr("app.main.open_market_tools", opener.open)
+    planner = ScriptedToolPlanner(
+        plan("get_market_quote", RAW_PLANNED_SYMBOL),
+        plan("get_market_quote", RAW_PLANNED_SYMBOL),
+    )
+    answerer = ScriptedAnswerGenerator(
+        grounded("European revenue declined 4% [D1].", ["D1"]),
+        grounded(
+            "Revenue declined 4% [D1]; ACME last traded at 123.45 [T1].", ["D1", "T1"]
+        ),
+        grounded("Revenue declined 4% [D1].", ["D1"]),
+    )
+    caplog.set_level(logging.DEBUG)
+
+    for live in start_live(
+        live_env,
+        KeywordEmbedder(),
+        FakeTokenizer(),
+        query_graph=tool_graph(pooled_retriever, answerer, planner),
+    ):
+        smoke = (Path(__file__).parent / "fixtures" / "smoke.txt").read_bytes()
+        upload = live.client.post(
+            URL, files={"file": ("acme-fy2025.txt", smoke, "text/plain")}
+        )
+        assert upload.status_code == 201
+        document_id = upload.json()["document_id"]
+        rows_before = live.counts()
+
+        # 1. RAG only: use_tools=false never plans or calls a tool.
+        rag = live.client.post(
+            QUERY_URL, json={"question": QUESTION, "use_tools": False}
+        ).json()
+        assert (rag["status"], rag["tools_used"]) == ("answered", [])
+        (rag_citation,) = rag["citations"]
+        assert_stored_document_citation(live_env, rag_citation, document_id)
+        assert (planner.calls, provider.calls) == ([], [])
+
+        # 2. RAG + MCP: one planned, validated call becomes T1.
+        both = ask_with_tools(live.client, TOOL_QUESTION)
+        assert both.status_code == 200
+        body = both.json()
+        assert (body["status"], body["tools_used"]) == (
+            "answered",
+            ["get_market_quote"],
+        )
+        document, market = body["citations"]
+        assert_stored_document_citation(live_env, document, document_id)
+        assert market == expected_quote_citation(acme_quote)
+        assert list(market["fields"]) == list(
+            expected_quote_citation(acme_quote)["fields"]
+        )
+        assert provider.calls == [("get_quote", "ACME")], "one normalized call"
+        assert '<source id="T1" type="mcp">' in answerer.calls[1][1]
+
+        # 3. A tool failure falls back to document evidence only.
+        provider.quote = MarketDataError("rate_limited")
+        fallback = ask_with_tools(live.client, TOOL_QUESTION)
+        assert fallback.status_code == 200
+        fallback_body = fallback.json()
+        assert (fallback_body["status"], fallback_body["tools_used"]) == (
+            "answered",
+            [],
+        )
+        assert [c["id"] for c in fallback_body["citations"]] == ["D1"]
+        assert len(provider.calls) == 2
+        assert '<source id="T1"' not in answerer.calls[2][1]
+        assert "rate_limited" not in answerer.calls[2][1]
+        assert "rate_limited" not in fallback.text
+
+        assert live.counts() == rows_before, "queries are read-only"
+        assert len(planner.calls) == 2
+
+    assert len(opener.opened) == 1
+    failed = named(caplog, "mcp.tool.failed")
+    assert [e["error_code"] for e in failed] == ["rate_limited"]
+    completed = named(caplog, "graph.completed")
+    assert [(e["tool_used"], e["tool_error"]) for e in completed] == [
+        (None, None),
+        ("get_market_quote", None),
+        (None, "rate_limited"),
+    ]
+    # The in-process server's own SDK logger records the wire error; in
+    # production that logger lives in the child, whose stderr is discarded.
+    api_logged = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if not record.name.startswith("mcp.server")
+    )
+    assert "Error executing tool" not in api_logged
+    assert_logs_hold_none_of(
+        caplog,
+        DUMMY_KEY,
+        AV_SENTINEL,
+        "postgresql://",
+        RAW_PLANNED_SYMBOL.strip(),
+        QUESTION,
+        TOOL_QUESTION,
+        acme_quote.price,
+    )

@@ -16,13 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+import anyio
 import httpx
 
 from app.config import IngestionConfig
 from app.db import Pool
 from app.errors import AppError
 from app.ingestion import Ingestor
-from app.market_data import CompanyOverview, MarketQuote
+from app.market_data import QUOTE_FRESHNESS, CompanyOverview, MarketQuote
 from app.mcp_client import ToolFailure, ToolSuccess
 from app.openai_provider import GroundedAnswer, ToolPlan
 from app.retrieval import RetrievedChunk
@@ -434,3 +435,60 @@ class ScriptedMarketDataProvider:
         if self.overview is None:
             raise AssertionError("no overview scripted")
         return self.overview
+
+
+def quote_for(symbol: str, *, price: str = "123.4500") -> MarketQuote:
+    """A valid provider quote for ``symbol``, as the adapter would return it."""
+    return MarketQuote(
+        provider="alpha_vantage",
+        symbol=symbol,
+        price=price,
+        previous_close="122.1000",
+        change="1.3500",
+        change_percent="1.1057%",
+        volume="12345678",
+        latest_trading_day="2026-09-24",
+        freshness=QUOTE_FRESHNESS,
+    )
+
+
+class BarrierMarketDataProvider:
+    """A provider whose quote calls all wait until ``parties`` are in flight.
+
+    Each call returns a quote for its own symbol once every party has
+    arrived, so calls that were serialized instead of overlapping would never
+    pass the barrier: they fail at the ``deadline_seconds`` bound instead of
+    hanging. ``max_active`` records the highest overlap seen. The event is
+    created on first use, inside the event loop that serves the calls.
+    """
+
+    def __init__(self, parties: int, *, deadline_seconds: float = 5.0) -> None:
+        self.parties = parties
+        self.deadline_seconds = deadline_seconds
+        self.calls: list[tuple[str, str]] = []
+        self.active = 0
+        self.max_active = 0
+        self._arrived: anyio.Event | None = None
+
+    @property
+    def barrier_reached(self) -> bool:
+        return self._arrived is not None and self._arrived.is_set()
+
+    async def get_quote(self, symbol: str) -> MarketQuote:
+        self.calls.append(("get_quote", symbol))
+        if self._arrived is None:
+            self._arrived = anyio.Event()
+        arrived = self._arrived
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.active >= self.parties:
+                arrived.set()
+            with anyio.fail_after(self.deadline_seconds):
+                await arrived.wait()
+        finally:
+            self.active -= 1
+        return quote_for(symbol)
+
+    async def get_overview(self, symbol: str) -> CompanyOverview:
+        raise AssertionError("no overview scripted")

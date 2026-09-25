@@ -10,6 +10,10 @@ the live connection is a ``*_test`` database distinct from the application's.
 LangSmith tracing variables are removed from the environment at import, before
 any test module is collected or any graph is built: LangSmith caches its first
 read of them for the whole process (docs/TECH_BASELINE.md section 7).
+
+The Alpha Vantage variables are removed per test, so the real lifespan never
+starts an MCP child from the developer's environment. A test that needs the
+available mode sets them itself and replaces ``app.main.open_market_tools``.
 """
 
 from __future__ import annotations
@@ -22,7 +26,12 @@ import pytest
 import tiktoken
 import tiktoken.load
 
-from app.config import TRACING_ENV_VARS, DatabaseConfig
+from app.config import (
+    ALPHA_VANTAGE_API_KEY_ENV,
+    MCP_TOOL_TIMEOUT_SECONDS_ENV,
+    TRACING_ENV_VARS,
+    DatabaseConfig,
+)
 from app.db import Connection, Pool, create_pool
 from tests.db_safety import reset_test_schema
 
@@ -45,6 +54,13 @@ def _no_tracing_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unset every tracing variable per test, so none leaks into the next."""
     for name in TRACING_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_market_data_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset the Alpha Vantage variables per test: no child unless opted in."""
+    monkeypatch.delenv(ALPHA_VANTAGE_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(MCP_TOOL_TIMEOUT_SECONDS_ENV, raising=False)
 
 
 @pytest.fixture(autouse=True)

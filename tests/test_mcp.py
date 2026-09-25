@@ -19,8 +19,9 @@ import socket
 import sys
 import time
 from collections.abc import Iterator, Mapping
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from typing import Any, cast, get_args
+from typing import Any, ClassVar, Self, cast, get_args
 
 import anyio
 import httpx
@@ -76,7 +77,12 @@ from app.mcp_server import (
     main,
     serve,
 )
-from tests.fakes import ScriptedMarketDataProvider, alpha_vantage_transport
+from tests.fakes import (
+    BarrierMarketDataProvider,
+    ScriptedMarketDataProvider,
+    alpha_vantage_transport,
+    quote_for,
+)
 
 SENTINEL = "AV-SENTINEL-KEY-7f3a"
 LEAKY_MESSAGE = f"{SENTINEL} https://www.alphavantage.co/query?apikey={SENTINEL}"
@@ -954,6 +960,42 @@ async def test_the_client_opens_and_closes_in_one_async_context() -> None:
     assert provider.calls == [("get_quote", "MSFT")]
 
 
+@pytest.mark.anyio
+async def test_one_connection_carries_overlapping_calls_from_separate_tasks() -> None:
+    """M6 D19 (T20): the shared client needs no lock.
+
+    Every provider call waits until all four are in flight, so calls that
+    were serialized would fail at the barrier's deadline instead of passing.
+    """
+    parties = 4
+    provider = BarrierMarketDataProvider(parties, deadline_seconds=5.0)
+    symbols = ["AAA", "BBB", "CCC", "DDD"]
+    results: dict[str, ToolSuccess | ToolFailure] = {}
+
+    async with tools_for_provider(provider) as tools:
+
+        async def call(symbol: str) -> None:
+            arguments = {"symbol": symbol.lower()}
+            results[symbol] = await tools.call("get_market_quote", arguments)
+
+        async with anyio.create_task_group() as group:
+            for symbol in symbols:
+                group.start_soon(call, symbol)
+
+    assert results == {
+        symbol: ToolSuccess("get_market_quote", quote_for(symbol)) for symbol in symbols
+    }
+    assert provider.barrier_reached
+    assert provider.max_active == parties
+    assert sorted(provider.calls) == [("get_quote", symbol) for symbol in symbols]
+
+
+def tools_for_provider(
+    provider: BarrierMarketDataProvider,
+) -> AbstractAsyncContextManager[MarketDataTools]:
+    return open_market_data_tools(build_mcp_server(provider), timeout_seconds=5.0)
+
+
 # ---------------------------------------------------------------------------
 # Events (AC15)
 # ---------------------------------------------------------------------------
@@ -1123,3 +1165,99 @@ async def test_the_real_entry_point_serves_over_stdio(
     captured = capfd.readouterr()
     assert SENTINEL not in captured.err
     assert SENTINEL not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# The errlog parameter (M6 D5, T28)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_errlog_receives_a_stdio_childs_stderr(tmp_path: Path) -> None:
+    """A ``python -c`` child, not the server: its stderr reaches the given file."""
+    errlog_path = tmp_path / "child_stderr.log"
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-c", f"import sys; sys.stderr.write({LEAKY_MESSAGE!r})"],
+    )
+
+    with (
+        errlog_path.open("w", encoding="utf-8") as errlog,
+        pytest.raises(BaseException),  # noqa: B017 - no handshake reply for a bad command
+    ):
+        async with open_market_data_tools(params, timeout_seconds=0.5, errlog=errlog):
+            pass
+
+    assert errlog_path.read_text(encoding="utf-8") == LEAKY_MESSAGE
+
+
+class RecordingClient:
+    """Stands in for ``mcp.Client`` and records how it was constructed."""
+
+    instances: ClassVar[list[RecordingClient]] = []
+
+    def __init__(self, server: object, **options: object) -> None:
+        self.server = server
+        self.options = options
+        RecordingClient.instances.append(self)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+@pytest.fixture
+def recording_client(monkeypatch: pytest.MonkeyPatch) -> list[RecordingClient]:
+    RecordingClient.instances = []
+    monkeypatch.setattr("app.mcp_client.Client", RecordingClient)
+    return RecordingClient.instances
+
+
+@pytest.mark.anyio
+async def test_without_errlog_the_server_is_passed_through_unchanged(
+    recording_client: list[RecordingClient],
+) -> None:
+    params = stdio_server_parameters(MarketDataConfig(api_key=SENTINEL))
+    server = build_mcp_server(ScriptedMarketDataProvider())
+
+    for target in (params, server):
+        async with open_market_data_tools(target, timeout_seconds=5.0) as tools:
+            assert isinstance(tools, MarketDataTools)
+
+    assert [client.server for client in recording_client] == [params, server]
+    expected = {"mode": "auto", "cache": None, "read_timeout_seconds": 7.0}
+    assert [client.options for client in recording_client] == [expected, expected]
+
+
+@pytest.mark.anyio
+async def test_errlog_wraps_only_a_stdio_server(
+    recording_client: list[RecordingClient],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = object()
+    wrapped: list[tuple[object, object]] = []
+
+    def fake_stdio_client(server: object, errlog: object) -> object:
+        wrapped.append((server, errlog))
+        return transport
+
+    monkeypatch.setattr("app.mcp_client.stdio_client", fake_stdio_client)
+    params = stdio_server_parameters(MarketDataConfig(api_key=SENTINEL))
+    server = build_mcp_server(ScriptedMarketDataProvider())
+
+    with (tmp_path / "errlog").open("w", encoding="utf-8") as errlog:
+        for target in (params, server):
+            async with open_market_data_tools(
+                target, timeout_seconds=5.0, errlog=errlog
+            ):
+                pass
+
+    assert wrapped == [(params, errlog)]
+    stdio, in_process = recording_client
+    assert stdio.server is transport
+    assert in_process.server is server, "errlog does not apply in-process"
+    expected = {"mode": "auto", "cache": None, "read_timeout_seconds": 7.0}
+    assert stdio.options == in_process.options == expected
