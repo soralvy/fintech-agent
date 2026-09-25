@@ -2,11 +2,11 @@
 
 ## 1. Status
 
-- **Status:** Proposed — implementation not authorized
-- **Revision:** 2, 2026-09-25. Two `project-review` rounds have run (both `FIXABLE`); this text applies every fix from both. It has not yet reached a `CLEAN` verdict.
+- **Status:** Approved. Implementation has not started; step 1 (§16) comes first.
+- **Revision:** 3 (final), 2026-09-25. The scoped `/finish-task` ran 4 independent `project-review` rounds with 3 fix passes; rounds 1–3 returned `FIXABLE`, and this text applies every fix from them. The final review, round 4 on 2026-09-25, returned **`CLEAN`**.
 - **Milestone:** 6, Bounded MCP graph integration (`docs/TASKS.md` Milestone 6).
 - **Branch:** `feat/milestone-6-mcp-graph-integration`. It was created from local `main` at `12530a8`, which matched the locally recorded `origin/main` (0 ahead, 0 behind). No fetch was run, as instructed, so the remote was not re-checked.
-- **Decisions:** `D1`–`D27` are **PROPOSED** and become binding when this spec is approved. `R1`–`R17` are the rejected alternatives. No open decision blocks step 1 (§22).
+- **Decisions:** `D1`–`D27` are **APPROVED** and binding. `R1`–`R17` are the rejected alternatives. No open decision blocks step 1 (§22).
 - **Changes nothing yet.** This revision changes no canonical document, application code, test, dependency, migration, configuration, or lockfile. Step 1 (§16) records the approved decisions in the canonical documents before any code is written.
 
 **Precedence.** `docs/SPEC.md` > `docs/DECISIONS.md` > `docs/TECH_BASELINE.md` > `docs/TASKS.md` (`CLAUDE.md`). This spec refines those documents and does not override them. Wherever it extends one, step 1 amends the canonical text before any code, as Milestones 4 and 5 did.
