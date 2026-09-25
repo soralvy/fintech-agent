@@ -11,7 +11,7 @@ import hashlib
 import math
 import re
 from collections import deque
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -23,7 +23,8 @@ from app.db import Pool
 from app.errors import AppError
 from app.ingestion import Ingestor
 from app.market_data import CompanyOverview, MarketQuote
-from app.openai_provider import GroundedAnswer
+from app.mcp_client import ToolFailure, ToolSuccess
+from app.openai_provider import GroundedAnswer, ToolPlan
 from app.retrieval import RetrievedChunk
 from tests.conftest import EMBEDDING_DIMENSIONS, embedding
 
@@ -275,6 +276,60 @@ class ScriptedAnswerGenerator:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class ScriptedToolPlanner:
+    """A ``ToolPlanner`` that returns or raises scripted outcomes.
+
+    Every call is recorded as ``(instructions, prompt)``. By default the
+    outcomes are queued and used in call order, and a call with nothing left
+    fails the test. ``by_prompt`` instead keys each outcome by the exact
+    rendered prompt, for tests where several requests race to plan; a prompt
+    with no outcome fails the test.
+    """
+
+    def __init__(
+        self,
+        *outcomes: ToolPlan | Exception,
+        by_prompt: Mapping[str, ToolPlan | Exception] | None = None,
+    ) -> None:
+        self._outcomes = deque(outcomes)
+        self._by_prompt = None if by_prompt is None else dict(by_prompt)
+        self.calls: list[tuple[str, str]] = []
+
+    async def plan_tool(self, *, instructions: str, prompt: str) -> ToolPlan:
+        self.calls.append((instructions, prompt))
+        if self._by_prompt is not None:
+            if prompt not in self._by_prompt:
+                raise AssertionError("unexpected planner prompt")
+            outcome = self._by_prompt[prompt]
+        elif self._outcomes:
+            outcome = self._outcomes.popleft()
+        else:
+            raise AssertionError("unexpected planner call")
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class ScriptedMarketTools:
+    """A ``MarketTools`` caller that returns queued outcomes in order.
+
+    Every call is recorded as ``(tool_name, arguments)``. A call with nothing
+    left in the queue fails the test. It performs no MCP or network access.
+    """
+
+    def __init__(self, *outcomes: ToolSuccess | ToolFailure) -> None:
+        self._outcomes = deque(outcomes)
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def call(
+        self, tool_name: str, arguments: Mapping[str, object]
+    ) -> ToolSuccess | ToolFailure:
+        self.calls.append((tool_name, dict(arguments)))
+        if not self._outcomes:
+            raise AssertionError("unexpected market-data call")
+        return self._outcomes.popleft()
 
 
 # ---------------------------------------------------------------------------
