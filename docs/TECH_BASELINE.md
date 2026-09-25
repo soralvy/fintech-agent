@@ -501,7 +501,7 @@ The outcome classification (malformed response, incomplete, unexpected status, r
 
 **Tests.** Adapter tests drive the real SDK over `httpx2.MockTransport` at `http://openai.invalid/v1` with a fake key and `max_retries=0`, so they verify logical-call behavior only. Stage C first confirms the minimal Responses JSON bodies for each outcome against the installed SDK and records them here only if they differ from this record. No automated test calls OpenAI.
 
-### Amendment 2026-09-25 — the Milestone 6 tool planner (not yet implemented)
+### Amendment 2026-09-25 — the Milestone 6 tool planner (implemented and verified 2026-09-25)
 
 Recorded by the Milestone 6 step-1 alignment (`docs/changes/M6-mcp-graph-integration.md` D7, D9).
 

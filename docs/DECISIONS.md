@@ -341,7 +341,7 @@ Added in Milestone 5 (*recorded 2026-09-24* by the step-1 contract alignment, im
 - Tests: `tests/test_symbols.py` and `tests/test_market_data.py` (new; now in the tree above), and `tests/test_mcp.py` (already in the tree). `tests/fixtures/alpha_vantage/` holds the provisional provider payloads, and `tests/fakes.py` gains `alpha_vantage_transport` and `ScriptedMarketDataProvider`.
 - **Milestone 6 owns** FastAPI lifespan wiring of the MCP client, `contextlib.AsyncExitStack` in the lifespan, `app.state` MCP handles, the startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server fails to start, and all graph integration.
 
-Planned for Milestone 6 (*recorded 2026-09-25 by the step-1 contract alignment; `docs/changes/M6-mcp-graph-integration.md` §12, approved revision 3*). **Not yet implemented.** Every module keeps its recorded responsibility:
+Added in Milestone 6 (*recorded 2026-09-25 by the step-1 contract alignment, implemented and verified 2026-09-25*; `docs/changes/M6-mcp-graph-integration.md` §12, approved revision 3; evidence in `docs/TASKS.md` Milestone 6). The module ownership below is as built: every name listed exists, every file marked unchanged has no diff against `main`, and every module keeps its recorded responsibility:
 
 - **`app/openai_provider.py`** gains:
   - `PlannedToolName` and `ToolPlan`, the strict planner output;
@@ -380,6 +380,8 @@ Planned for Milestone 6 (*recorded 2026-09-25 by the step-1 contract alignment; 
   - `app/mcp_server.py`, `app/market_data.py`, `app/symbols.py`;
   - `app/db.py`, `app/retrieval.py`, `app/ingestion.py`, `app/tokenizer.py`, `app/logging.py`, `app/errors.py`;
   - the migration, `pyproject.toml`, and `uv.lock`.
+
+Import confinement after Milestone 6 (verified 2026-09-25 by grepping all of `app/`, a superset of the `docs/changes/M6-mcp-graph-integration.md` §15.2 checks): FastAPI and Starlette only in `main.py`; `langgraph` only in `graph.py`; `openai` only in `openai_provider.py`; psycopg only in `db.py`; `mcp` only in `mcp_client.py` and `mcp_server.py`; `httpx` only in `market_data.py`; `langsmith` and `langchain_core` nowhere in `app/`. Neither `main.py` nor `graph.py` references `MCPServer`, `app.mcp_server`, or `build_mcp_server`, and nothing in the API constructs a server: `mcp_client.py` names `MCPServer` only as a parameter type (unchanged since Milestone 5), and the API's one server is the stdio child `python -m app.mcp_server`.
 
 The optional post-baseline decision layer (§25) would add `app/typesafe_provider.py` and `app/decisions.py` in Milestone 10, and a top-level `evals/` package in Milestone 9 holding the manually invoked evaluation runner (`uv run python -m evals.run`). `evals/` is not collected by pytest (it falls outside `testpaths`) but is added to the mypy `files` setting. All three are deliberately absent from the tree above because they are not part of the MVP baseline.
 
@@ -1007,7 +1009,7 @@ Milestone 4 implements the no-tools subset as `QueryState`, a `TypedDict` with `
 
 `tool_plan`, `tool_result`, and `errors` are added in Milestone 6, together with the nodes that write them. The graph depends on a small `QueryRetriever` Protocol matching `Retriever.embed_query` and `Retriever.retrieve`, so graph tests can run with a fake and without PostgreSQL.
 
-### Milestone 6 state (recorded 2026-09-25; not yet implemented)
+### Milestone 6 state (recorded 2026-09-25; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` §9.1 and D22 add these fields to `QueryState`:
 
@@ -1106,7 +1108,7 @@ Instructions embedded in uploaded documents cannot influence the tool planner be
 
 The planner cannot derive a ticker from an uploaded document unless the user question itself supplies enough information. This is an intentional safety/scope trade-off.
 
-### Planner contract (recorded 2026-09-25, Milestone 6 step 1; not yet implemented)
+### Planner contract (recorded 2026-09-25, Milestone 6 step 1; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` D7–D12.
 
@@ -1162,7 +1164,7 @@ Failure:
 
 No retry loop is added at graph level.
 
-*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` §9.3; not yet implemented).* `call_tool` makes exactly one `market_tools.call(plan.tool, {"symbol": plan.symbol})`. `MarketDataTools.call` repeats the allow-list, exact-key, and symbol checks.
+*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` §9.3; implemented and verified 2026-09-25).* `call_tool` makes exactly one `market_tools.call(plan.tool, {"symbol": plan.symbol})`. `MarketDataTools.call` repeats the allow-list, exact-key, and symbol checks.
 
 - A `ToolSuccess` is stored in `tool_result`, unless its `tool` differs from `plan.tool`, which is treated as `malformed_provider_response`.
 - A `ToolFailure` stores its closed code in `tool_error`.
@@ -1217,7 +1219,7 @@ data:
 
 Uploaded/source content is delimited as data and is never interpolated into system instructions.
 
-*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D13, D15; not yet implemented).* `T1` exists only when `tool_result` holds a validated `ToolSuccess`. `build_tool_context_item` (`app/citations.py`) precomputes `tool`, `provider`, `symbol`, `as_of`, `freshness`, and the ordered `fields` (§15).
+*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D13, D15; implemented and verified 2026-09-25).* `T1` exists only when `tool_result` holds a validated `ToolSuccess`. `build_tool_context_item` (`app/citations.py`) precomputes `tool`, `provider`, `symbol`, `as_of`, `freshness`, and the ordered `fields` (§15).
 
 - **Placement.** The block is rendered inside `<sources>` after every `D` block, as:
 
@@ -1330,7 +1332,7 @@ The insufficient result is the fixed `200` body of §16. It never contains model
 
 `docs/SPEC.md` §10 allows either insufficient context or a validation failure for an uncited answer; rule 5 selects insufficient context, and so does step 5.
 
-### `T1` finalization (recorded 2026-09-25, Milestone 6 step 1; not yet implemented)
+### `T1` finalization (recorded 2026-09-25, Milestone 6 step 1; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` §10.2 extends the procedure above:
 
@@ -1409,7 +1411,7 @@ build_context --route_context--> answer -> finalize -> END           (context no
 - The graph is compiled once in the lifespan and has no checkpointer.
 - Milestone 6 replaces the `retrieve -> build_context` edge with `route_tools`. The Milestone 6 topology below is authoritative for this: it sends `use_tools=true` to `decide_tool` only when tools are available, a check the conceptual diagram above does not draw.
 
-### Milestone 6 topology (recorded 2026-09-25; not yet implemented)
+### Milestone 6 topology (recorded 2026-09-25; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` §9.2 and §9.5 define nine nodes and three conditional edges, each with an explicit `path_map`:
 
@@ -1499,7 +1501,7 @@ Every answer-model failure surfaces as `AnswerProviderError` (`502 answer_provid
 
 This is the "at most one immediate structured-output retry" allowed above; `docs/SPEC.md` §12.3 and §12.6 permit it. If scope has to be cut, the single retry may be removed, since zero retries is also within "at most one".
 
-## Planner and tool outcomes (recorded 2026-09-25, Milestone 6 step 1; not yet implemented)
+## Planner and tool outcomes (recorded 2026-09-25, Milestone 6 step 1; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` D9, D11, §9.4.
 
@@ -1649,7 +1651,7 @@ Optional MCP/provider failure alone does not produce a 5xx response.
 - The insufficient-context body is exactly the fixed body of §16.
 - A query is read-only: it writes no rows, uses no checkpointer, and stores neither the question, the prompt, nor the answer.
 
-### Milestone 6 response (recorded 2026-09-25; not yet implemented)
+### Milestone 6 response (recorded 2026-09-25; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` §10.3, D16, D24.
 
@@ -1917,7 +1919,7 @@ Use `fields` rather than synthesizing an MCP `excerpt`.
 
 MCP results are structured data. Returning selected structured fields is more precise and matches the citation requirement better than turning provider data into application-generated prose.
 
-### Fields, order, and `as_of` (recorded 2026-09-25, Milestone 6 step 1; not yet implemented)
+### Fields, order, and `as_of` (recorded 2026-09-25, Milestone 6 step 1; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` D13, D14. The keys of `fields` are allow-listed in a fixed order: the model's declaration order, minus `provider`, `symbol`, and `freshness`, which are carried elsewhere.
 
@@ -2024,7 +2026,7 @@ content:
 - The instructions state every requirement of `docs/SPEC.md` §5.1 (grounded answering) and §10.8, and ask the model to cite inline as `[D1]` and to list every label it used in `citation_ids`.
 - The graph's `answer` node renders the prompt; the adapter receives only the two strings.
 
-### Milestone 6 prompts (recorded 2026-09-25; not yet implemented)
+### Milestone 6 prompts (recorded 2026-09-25; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` D10, D15.
 
@@ -2285,7 +2287,7 @@ Every event below carries the `request_id` bound by `UnexpectedErrorMiddleware` 
 - the API key or the `Authorization` header;
 - connection strings, provider bodies, and exception messages.
 
-## Milestone 6 events (recorded 2026-09-25; not yet implemented)
+## Milestone 6 events (recorded 2026-09-25; implemented and verified 2026-09-25)
 
 `docs/changes/M6-mcp-graph-integration.md` D4, D25, §11. Every event is emitted with `log_event`. All carry the bound `request_id`, except `mcp.startup` and `mcp.shutdown`, which describe the process.
 
@@ -2374,7 +2376,7 @@ Required routes:
 
 Graph tests assert actual routing and maximum-one-tool behavior rather than merely testing individual node functions.
 
-*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` §13; not yet implemented).* Test ownership for the tool path:
+*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` §13; implemented and verified 2026-09-25).* Test ownership for the tool path:
 
 - **Graph routes and the one-call bound** belong to `tests/test_graph.py`. It uses `ScriptedToolPlanner` and `ScriptedMarketTools` (in `tests/fakes.py`) and covers routes 3–8 above, together with invalid and incomplete plans, planner failures, `T1` grounding, `tools_used`, and failure isolation.
 - **The pure `T1`, `[DT]`, and MCP-citation rules** belong to `tests/test_citations.py`.
@@ -2428,7 +2430,7 @@ Directly calling the Python tool function alone is not sufficient for that accep
 - **Protocol paths.** The in-process `Client` in the default `auto` mode runs every functional case. Exactly one offline stdio subprocess test runs the real entry point (`python -m app.mcp_server`) over JSON-RPC stdio framing, using a symbol that fails validation, with a loopback proxy sink so that no external/provider network call can succeed. There is no in-process `legacy`-mode test.
 - **No concurrency requirement.** Concurrent calls on one connection are not a Milestone 5 requirement.
 
-*Amended 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D19; not yet implemented).* Milestone 6 shares one lifespan-owned client across concurrent HTTP requests, so it takes ownership of the concurrency requirement that Milestone 5 withdrew as its AC14. No lock, pool, or queue is added. Deterministic evidence comes at two boundaries, without duplication:
+*Amended 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D19; implemented and verified 2026-09-25).* Milestone 6 shares one lifespan-owned client across concurrent HTTP requests, so it takes ownership of the concurrency requirement that Milestone 5 withdrew as its AC14. No lock, pool, or queue is added. Deterministic evidence comes at two boundaries, without duplication:
 
 - **Client level** (`tests/test_mcp.py`). `N` concurrent `MarketDataTools.call`s from separate tasks run on one open in-process connection, against a provider that waits on an `N`-party `anyio.Event` barrier under `anyio.fail_after`.
 - **Lifespan and HTTP level** (`tests/test_http.py`). `N` concurrent `/v1/query` requests are sent through one `TestClient` over the lifespan-owned instance. The planner fake is keyed by the rendered question.
@@ -2460,7 +2462,7 @@ HTTP tests validate public schemas and status codes.
 
 They do not need to retest every graph branch already covered in graph tests.
 
-*Recorded 2026-09-25 (Milestone 6 step 1; not yet implemented).* For Milestone 6, `tests/test_http.py` owns:
+*Recorded 2026-09-25 (Milestone 6 step 1; implemented and verified 2026-09-25).* For Milestone 6, `tests/test_http.py` owns:
 
 - the lifespan outcomes `available`, `not_configured`, and `start_failed`;
 - a malformed-timeout startup failure;
@@ -2545,7 +2547,7 @@ main        -> MCP client (open_market_data_tools,
                stdio_server_parameters, MarketDataTools)        (Milestone 6)
 ```
 
-*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` §12.2; not yet implemented).* The four Milestone 6 edges above are recorded, and these imports stay forbidden:
+*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` §12.2; implemented and verified 2026-09-25).* The four Milestone 6 edges above are recorded, and these imports stay forbidden:
 
 - `mcp_client` never imports `graph`, `main`, `openai_provider`, or `mcp_server`;
 - `openai_provider` imports neither `mcp_client` nor `market_data`;
