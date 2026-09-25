@@ -22,7 +22,11 @@ import langsmith.utils
 import pytest
 from pydantic import ValidationError
 
-from app.citations import INSUFFICIENT_CONTEXT_ANSWER, build_context_items
+from app.citations import (
+    INSUFFICIENT_CONTEXT_ANSWER,
+    DocumentCitation,
+    build_context_items,
+)
 from app.config import TRACING_ENV_VARS, RetrievalConfig, require_tracing_disabled
 from app.db import Pool
 from app.errors import (
@@ -181,6 +185,7 @@ async def test_evidence_gives_an_answer_with_trusted_citations(
     assert result.status == "answered"
     assert result.answer == "Revenue declined 4% [D1]."
     (citation,) = result.citations
+    assert isinstance(citation, DocumentCitation)
     assert (citation.id, citation.source_type) == ("D1", "document")
     assert (citation.document_id, citation.chunk_id) == (
         evidence.document_id,
@@ -251,7 +256,10 @@ async def test_labels_follow_retrieval_order_across_several_chunks() -> None:
     assert [prompt.index(c.content) for c in chunks] == sorted(
         prompt.index(c.content) for c in chunks
     )
-    assert [(c.id, c.chunk_id) for c in result.citations] == [
+    assert all(isinstance(c, DocumentCitation) for c in result.citations)
+    assert [
+        (c.id, c.chunk_id) for c in result.citations if isinstance(c, DocumentCitation)
+    ] == [
         ("D3", chunks[2].chunk_id),
         ("D1", chunks[0].chunk_id),
     ]
@@ -579,6 +587,7 @@ async def test_a_fixture_question_over_the_corpus_cites_the_stored_chunk(
     assert result.status == "answered"
     assert "D9" not in result.answer
     (citation,) = result.citations
+    assert isinstance(citation, DocumentCitation)
     assert citation.id == "D1"
     assert citation.document_id == corpus.acme_report
     assert (citation.filename, citation.page) == ("acme-fy2025.txt", None)

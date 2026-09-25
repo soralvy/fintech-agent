@@ -33,8 +33,8 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.citations import (
     INSUFFICIENT_CONTEXT_ANSWER,
+    Citation,
     ContextItem,
-    DocumentCitation,
     FinalizedAnswer,
     QueryStatus,
     build_context_items,
@@ -83,7 +83,7 @@ class QueryState(TypedDict, total=False):
     model_answer: GroundedAnswer
     answer: str
     citation_ids: list[str]
-    citations: list[DocumentCitation]
+    citations: list[Citation]
     status: QueryStatus
 
 
@@ -102,7 +102,7 @@ class QueryResult:
 
     status: QueryStatus
     answer: str
-    citations: tuple[DocumentCitation, ...]
+    citations: tuple[Citation, ...]
 
 
 def build_query_graph(

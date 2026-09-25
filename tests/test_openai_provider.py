@@ -12,21 +12,30 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, get_args
 
 import httpx2
 import pytest
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from app.errors import AnswerProviderError, EmbeddingProviderError
+from app.errors import AnswerProviderError, AppError, EmbeddingProviderError
+from app.mcp_client import ALLOWED_TOOLS, MarketToolName
 from app.openai_provider import (
     ANSWER_MAX_OUTPUT_TOKENS,
     ANSWER_REASONING_EFFORT,
     GROUNDED_ANSWER_FORMAT,
+    PLANNER_MAX_OUTPUT_TOKENS,
+    PLANNER_REASONING_EFFORT,
+    PLANNER_TIMEOUT_SECONDS,
+    TOOL_PLAN_FORMAT,
     GroundedAnswer,
     OpenAIAnswerGenerator,
     OpenAIEmbedder,
+    OpenAIToolPlanner,
+    PlannedToolName,
+    ToolPlan,
+    ToolPlanningError,
 )
 
 pytestmark = pytest.mark.anyio
@@ -822,3 +831,303 @@ async def test_sdk_transport_retries_are_separate_from_logical_calls(
     assert result == EXPECTED
     assert script.calls == 2, "two HTTP attempts"
     assert [e["attempt"] for e in generation_events(caplog)] == [1], "one logical call"
+
+
+# ---------------------------------------------------------------------------
+# Tool planner adapter (M6 AC2, T31)
+# ---------------------------------------------------------------------------
+
+PLANNER_INSTRUCTIONS = "sentinel-planner-instructions-6c4"
+PLANNER_PROMPT = "<question>sentinel-planner-question-2f7 MSFT</question>"
+QUOTE_PLAN: dict[str, Any] = {"tool_name": "get_market_quote", "symbol": "msft"}
+NO_PLAN: dict[str, Any] = {"tool_name": None, "symbol": None}
+
+
+def make_planner(script: Script, *, max_retries: int = 2) -> OpenAIToolPlanner:
+    """A planner over a shared client that, like production, allows retries."""
+    client = AsyncOpenAI(
+        api_key=FAKE_KEY,
+        base_url="http://openai.invalid/v1",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(script)),
+        max_retries=max_retries,
+    )
+    return OpenAIToolPlanner(client, model=MODEL)
+
+
+async def plan(script: Script) -> ToolPlan:
+    return await make_planner(script).plan_tool(
+        instructions=PLANNER_INSTRUCTIONS, prompt=PLANNER_PROMPT
+    )
+
+
+def plan_response(payload: object = QUOTE_PLAN) -> httpx2.Response:
+    return response(message(answer_text(payload)))
+
+
+def planning_events(caplog: pytest.LogCaptureFixture) -> list[Json]:
+    return [
+        event
+        for event in generation_events(caplog)
+        if event["event"].startswith("planning.")
+    ]
+
+
+def assert_no_planner_secret_logged(caplog: pytest.LogCaptureFixture) -> None:
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    for secret in (
+        FAKE_KEY,
+        PLANNER_INSTRUCTIONS,
+        PLANNER_PROMPT,
+        "sentinel-planner-question-2f7",
+        "msft",
+        REFUSAL_TEXT,
+        PAYLOAD_SENTINEL,
+        "upstream failure",
+    ):
+        assert secret not in logged
+
+
+async def test_the_planner_request_carries_the_recorded_settings() -> None:
+    timeouts: list[object] = []
+    script = Script(plan_response())
+
+    def recording(request: httpx2.Request) -> httpx2.Response:
+        timeouts.append(request.extensions.get("timeout"))
+        return script(request)
+
+    client = AsyncOpenAI(
+        api_key=FAKE_KEY,
+        base_url="http://openai.invalid/v1",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(recording)),
+        max_retries=2,
+    )
+
+    await OpenAIToolPlanner(client, model=MODEL).plan_tool(
+        instructions=PLANNER_INSTRUCTIONS, prompt=PLANNER_PROMPT
+    )
+
+    assert script.bodies == [
+        {
+            "model": "gpt-6-luna",
+            "instructions": PLANNER_INSTRUCTIONS,
+            "input": PLANNER_PROMPT,
+            "text": {"format": TOOL_PLAN_FORMAT},
+            "reasoning": {"effort": "none"},
+            "max_output_tokens": 200,
+            "store": False,
+        }
+    ]
+    assert timeouts == [{"connect": 10.0, "read": 10.0, "write": 10.0, "pool": 10.0}]
+    assert (
+        PLANNER_TIMEOUT_SECONDS,
+        PLANNER_MAX_OUTPUT_TOKENS,
+        PLANNER_REASONING_EFFORT,
+    ) == (10.0, 200, "none")
+    assert client.max_retries == 2, "the shared client keeps its own retries"
+
+
+async def test_a_tool_plan_is_returned_unchanged_and_logged_safely(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    result = await plan(Script(plan_response()))
+
+    assert result == ToolPlan(tool_name="get_market_quote", symbol="msft")
+    (completed,) = planning_events(caplog)
+    assert completed == {
+        "event": "planning.completed",
+        "tool": "get_market_quote",
+        "input_tokens": 321,
+        "output_tokens": 45,
+        "duration_ms": completed["duration_ms"],
+    }
+    assert isinstance(completed["duration_ms"], int)
+    assert_no_planner_secret_logged(caplog)
+
+
+async def test_a_null_plan_is_valid() -> None:
+    result = await plan(Script(plan_response(NO_PLAN)))
+
+    assert result == ToolPlan(tool_name=None, symbol=None)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx2.Response(
+            500, json={"error": {"message": f"upstream failure {FAKE_KEY}"}}
+        ),
+        httpx2.Response(429, json={"error": {"message": "upstream failure"}}),
+        httpx2.Response(401, json={"error": {"message": "upstream failure"}}),
+        httpx2.ConnectError(f"cannot reach host with key {FAKE_KEY}"),
+    ],
+    ids=["http-500", "http-429", "http-401", "connection-error"],
+)
+async def test_a_request_failure_is_one_attempt_and_safe(
+    caplog: pytest.LogCaptureFixture, error: httpx2.Response | Exception
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    script = Script(error)
+
+    with pytest.raises(ToolPlanningError) as raised:
+        await plan(script)
+
+    assert script.calls == 1, "no SDK transport retry, although the client allows 2"
+    assert raised.value.reason == "request_failed"
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+    (failed,) = planning_events(caplog)
+    assert failed["event"] == "planning.failed"
+    assert failed["reason"] == "request_failed"
+    assert isinstance(failed["error_type"], str)
+    assert_no_planner_secret_logged(caplog)
+
+
+def schema_invalid_plans() -> list[object]:
+    return [
+        {"tool_name": "fetch_url", "symbol": "MSFT"},
+        {"tool_name": "get_market_quote"},
+        {**QUOTE_PLAN, "url": "http://x"},
+        {"tool_name": "get_market_quote", "symbol": 7},
+        [QUOTE_PLAN],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("build", "reason"),
+    [
+        (non_json, "malformed_response"),
+        (
+            json_labelled(f"{{not json {PAYLOAD_SENTINEL}".encode()),
+            "malformed_response",
+        ),
+        (malformed({**_BASE, "status": "completed"}), "malformed_response"),
+        (
+            lambda: response(
+                status="incomplete", incomplete_reason="max_output_tokens"
+            ),
+            "incomplete_max_output_tokens",
+        ),
+        (
+            lambda: response(status="incomplete", incomplete_reason="content_filter"),
+            "incomplete_content_filter",
+        ),
+        (
+            lambda: response(status="incomplete", incomplete_reason="max_messages"),
+            "incomplete_other",
+        ),
+        (
+            lambda: response(message(answer_text(QUOTE_PLAN)), status="failed"),
+            "unexpected_status",
+        ),
+        (lambda: response(message(refusal())), "refusal"),
+        (lambda: response(reasoning()), "no_output_text"),
+        (
+            lambda: response(message(answer_text(QUOTE_PLAN), answer_text(NO_PLAN))),
+            "multiple_output_text",
+        ),
+        (lambda: response(message(text(f"{{{PAYLOAD_SENTINEL}"))), "invalid_json"),
+        *(
+            ((lambda payload=payload: plan_response(payload)), "schema_validation")
+            for payload in schema_invalid_plans()
+        ),
+    ],
+    ids=[
+        "non-json",
+        "json-labelled-invalid-json",
+        "missing-output",
+        "incomplete-max-output-tokens",
+        "incomplete-content-filter",
+        "incomplete-other",
+        "unexpected-status",
+        "refusal",
+        "no-output-text",
+        "multiple-output-text",
+        "invalid-json",
+        "schema-unknown-tool",
+        "schema-missing-symbol",
+        "schema-extra-field",
+        "schema-wrong-type",
+        "schema-not-an-object",
+    ],
+)
+async def test_every_invalid_outcome_is_one_call_and_a_planning_error(
+    caplog: pytest.LogCaptureFixture, build: Factory, reason: str
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    script = Script(build())
+
+    with pytest.raises(ToolPlanningError) as raised:
+        await plan(script)
+
+    assert script.calls == 1, "no application retry, unlike the answer adapter"
+    assert raised.value.reason == reason
+    assert raised.value.__cause__ is None
+    (failed,) = planning_events(caplog)
+    assert (failed["event"], failed["reason"]) == ("planning.failed", reason)
+    assert "error_type" not in failed
+    assert generation_events(caplog) == planning_events(caplog), "no generation.*"
+    assert_no_planner_secret_logged(caplog)
+
+
+def test_a_planning_error_is_never_an_http_error() -> None:
+    error = ToolPlanningError("refusal")
+
+    assert not isinstance(error, AppError)
+    assert (str(error), error.reason) == ("refusal", "refusal")
+
+
+def test_the_plan_schema_constant_matches_the_pydantic_model() -> None:
+    schema: Any = TOOL_PLAN_FORMAT["schema"]
+
+    assert TOOL_PLAN_FORMAT["type"] == "json_schema"
+    assert TOOL_PLAN_FORMAT["name"] == "tool_plan"
+    assert TOOL_PLAN_FORMAT["strict"] is True
+    assert schema["additionalProperties"] is False
+    assert (
+        schema["required"] == list(schema["properties"]) == list(ToolPlan.model_fields)
+    )
+    assert schema["properties"]["tool_name"] == {
+        "type": ["string", "null"],
+        "enum": [*get_args(PlannedToolName), None],
+    }
+    assert schema["properties"]["symbol"] == {"type": ["string", "null"]}
+
+
+def test_the_planned_tool_names_are_exactly_the_mcp_allow_list() -> None:
+    assert get_args(PlannedToolName) == get_args(MarketToolName)
+    assert set(get_args(PlannedToolName)) == ALLOWED_TOOLS
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tool_name": "fetch_url", "symbol": "MSFT"},
+        {"tool_name": "get_market_quote", "symbol": "MSFT", "url": "http://x"},
+        {"tool_name": "get_market_quote"},
+        {"symbol": None},
+        {"tool_name": 1, "symbol": None},
+        {"tool_name": None, "symbol": 7},
+    ],
+    ids=[
+        "unknown-tool",
+        "extra-field",
+        "missing-symbol",
+        "missing-tool",
+        "int-tool",
+        "int-symbol",
+    ],
+)
+def test_the_plan_model_rejects_off_contract_payloads(payload: object) -> None:
+    with pytest.raises(ValidationError):
+        ToolPlan.model_validate(payload)
+
+
+def test_the_plan_model_accepts_both_fields_independently() -> None:
+    """Pairing (both null or both present) is the graph's rule, not the model's."""
+    assert (
+        ToolPlan.model_validate({"tool_name": None, "symbol": "MSFT"}).symbol == "MSFT"
+    )
+    assert ToolPlan.model_validate(
+        {"tool_name": "get_company_overview", "symbol": None}
+    ).tool_name == ("get_company_overview")

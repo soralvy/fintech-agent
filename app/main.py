@@ -23,6 +23,7 @@ from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.citations import Citation, McpCitation
 from app.config import (
     DatabaseConfig,
     IngestionConfig,
@@ -351,18 +352,30 @@ def to_query_response(result: QueryResult) -> QueryResponse:
         {
             "answer": result.answer,
             "status": result.status,
-            "citations": [
-                {
-                    "id": citation.id,
-                    "source_type": citation.source_type,
-                    "document_id": citation.document_id,
-                    "chunk_id": citation.chunk_id,
-                    "filename": citation.filename,
-                    "page": citation.page,
-                    "excerpt": citation.excerpt,
-                }
-                for citation in result.citations
-            ],
+            "citations": [_citation_payload(citation) for citation in result.citations],
             "tools_used": [],
         }
     )
+
+
+def _citation_payload(citation: Citation) -> dict[str, object]:
+    """One trusted citation as its public shape, keeping MCP field order."""
+    if isinstance(citation, McpCitation):
+        return {
+            "id": citation.id,
+            "source_type": citation.source_type,
+            "tool": citation.tool,
+            "provider": citation.provider,
+            "symbol": citation.symbol,
+            "as_of": citation.as_of,
+            "fields": dict(citation.fields),
+        }
+    return {
+        "id": citation.id,
+        "source_type": citation.source_type,
+        "document_id": citation.document_id,
+        "chunk_id": citation.chunk_id,
+        "filename": citation.filename,
+        "page": citation.page,
+        "excerpt": citation.excerpt,
+    }

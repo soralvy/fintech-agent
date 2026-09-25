@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn, cast, get_args
 from uuid import UUID, uuid4
 
 import httpx
@@ -36,7 +36,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Message, Receive, Scope
 from starlette.types import Send as ASGISend
 
-from app.citations import INSUFFICIENT_CONTEXT_ANSWER, DocumentCitation
+from app.citations import INSUFFICIENT_CONTEXT_ANSWER, DocumentCitation, McpCitation
 from app.config import TRACING_ENV_VARS, ConfigError, IngestionConfig, RetrievalConfig
 from app.db import Pool
 from app.errors import AnswerProviderError, EmbeddingProviderError
@@ -51,8 +51,10 @@ from app.main import (
     request_validation_error_handler,
     to_query_response,
 )
+from app.mcp_client import ALLOWED_TOOLS
 from app.openai_provider import Embedder, GroundedAnswer
 from app.retrieval import RetrievedChunk, Retriever
+from app.schemas import McpQueryCitation, QueryResponse
 from app.tokenizer import TiktokenTokenizer, Tokenizer
 from tests.db_safety import reset_test_database
 from tests.fakes import (
@@ -1095,6 +1097,109 @@ async def test_middleware_binds_a_fresh_request_id_per_request(
         "http.response.body",
     ] * 2
     assert sent[0]["status"] == 500
+
+
+# ---------------------------------------------------------------------------
+# Public MCP citation model (M6 T34; pure, no lifespan)
+# ---------------------------------------------------------------------------
+
+MCP_CITATION = McpCitation(
+    id="T1",
+    tool="get_market_quote",
+    provider="alpha_vantage",
+    symbol="ACME",
+    as_of="2026-09-24",
+    fields=(
+        ("price", "123.45"),
+        ("previous_close", "122.10"),
+        ("change", "1.35"),
+        ("change_percent", "1.11%"),
+        ("volume", "12345678"),
+        ("latest_trading_day", "2026-09-24"),
+    ),
+)
+
+
+def test_both_citation_types_map_to_their_public_shapes() -> None:
+    document = DocumentCitation(
+        id="D1",
+        document_id=uuid4(),
+        chunk_id=uuid4(),
+        filename="acme.txt",
+        page=None,
+        excerpt="Revenue fell.",
+    )
+
+    response = to_query_response(
+        QueryResult(
+            status="answered",
+            answer="Fell [D1]; quote [T1].",
+            citations=(document, MCP_CITATION),
+        )
+    )
+    body = json.loads(response.model_dump_json())
+
+    assert body["citations"] == [
+        {
+            "id": "D1",
+            "source_type": "document",
+            "document_id": str(document.document_id),
+            "chunk_id": str(document.chunk_id),
+            "filename": "acme.txt",
+            "page": None,
+            "excerpt": "Revenue fell.",
+        },
+        {
+            "id": "T1",
+            "source_type": "mcp",
+            "tool": "get_market_quote",
+            "provider": "alpha_vantage",
+            "symbol": "ACME",
+            "as_of": "2026-09-24",
+            "fields": dict(MCP_CITATION.fields),
+        },
+    ]
+    assert list(body["citations"][1]["fields"]) == [
+        name for name, _ in MCP_CITATION.fields
+    ], "field order survives serialization"
+    assert body["tools_used"] == [], "no graph is wired to tools in Stage A"
+
+
+def test_the_citation_union_is_discriminated_and_closed() -> None:
+    base = {"answer": "x", "status": "answered", "tools_used": []}
+    mcp = {
+        "id": "T1",
+        "source_type": "mcp",
+        "tool": "get_market_quote",
+        "provider": "alpha_vantage",
+        "symbol": "ACME",
+        "as_of": "2026-09-24",
+        "fields": {"price": "1"},
+    }
+
+    parsed = QueryResponse.model_validate({**base, "citations": [mcp]})
+    assert isinstance(parsed.citations[0], McpQueryCitation)
+
+    for broken in (
+        {**mcp, "source_type": "web"},
+        {**mcp, "tool": "fetch_url"},
+        {**mcp, "provider": "other"},
+        {**mcp, "excerpt": "prose"},
+        {**mcp, "document_id": str(uuid4())},
+    ):
+        with pytest.raises(ValidationError):
+            QueryResponse.model_validate({**base, "citations": [broken]})
+    with pytest.raises(ValidationError):
+        QueryResponse.model_validate({**base, "citations": [], "tools_used": ["x"]})
+
+
+def test_the_public_tool_literals_are_exactly_the_mcp_allow_list() -> None:
+    tool_type = McpQueryCitation.model_fields["tool"].annotation
+    tools_used_type = QueryResponse.model_fields["tools_used"].annotation
+
+    assert set(get_args(tool_type)) == ALLOWED_TOOLS
+    (item_type,) = get_args(tools_used_type)
+    assert set(get_args(item_type)) == ALLOWED_TOOLS
 
 
 # ---------------------------------------------------------------------------

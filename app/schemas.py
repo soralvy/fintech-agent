@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 
 # The same bounds as the graph's own boundary check (``app.graph``). Both
 # boundaries validate independently, and schemas does not import the graph.
@@ -63,6 +63,8 @@ class QueryRequest(BaseModel):
 class QueryCitation(BaseModel):
     """A document citation, built only from trusted chunk metadata."""
 
+    model_config = ConfigDict(extra="forbid")
+
     id: str
     source_type: Literal["document"]
     document_id: UUID
@@ -72,10 +74,31 @@ class QueryCitation(BaseModel):
     excerpt: str
 
 
+class McpQueryCitation(BaseModel):
+    """An MCP citation, built only from the validated tool result.
+
+    ``fields`` holds the allow-listed provider values as strings, in their
+    fixed order; the application writes no prose from them
+    (docs/DECISIONS.md section 15).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    source_type: Literal["mcp"]
+    tool: Literal["get_market_quote", "get_company_overview"]
+    provider: Literal["alpha_vantage"]
+    symbol: str
+    as_of: str
+    fields: dict[str, str]
+
+
 class QueryResponse(BaseModel):
     """The ``200`` body of ``POST /v1/query``, answered or insufficient."""
 
     answer: str
     status: Literal["answered", "insufficient_context"]
-    citations: list[QueryCitation]
-    tools_used: list[str]
+    citations: list[
+        Annotated[QueryCitation | McpQueryCitation, Field(discriminator="source_type")]
+    ]
+    tools_used: list[Literal["get_market_quote", "get_company_overview"]]
