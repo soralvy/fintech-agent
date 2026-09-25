@@ -397,6 +397,32 @@ No HTTP MCP server, remote MCP deployment, sampling, elicitation, or generalized
 9. **Annotations.** `mcp.types.ToolAnnotations` has `read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint`, and `title`, and they remain hints only.
 10. **Dependencies.** `mcp` 2.2.0 depends on `httpx2`, a separate distribution, not on `httpx`.
 
+### Amendment 2026-09-25 — shared-client, lifespan, and stdio probes (Milestone 6)
+
+**Method.** Offline probe scripts in the session scratchpad, recorded in `docs/changes/M6-mcp-graph-integration.md` §5. None contacted a provider or used a key.
+
+- **MCP servers** were an in-process `build_mcp_server` over scripted fakes, or scratch stdio children.
+- **Stdio children** were a scratch server over a fake provider, `python -c` processes, and the real `python -m app.mcp_server` with **no** key, which exits at once.
+
+| # | Question | Result |
+|---|---|---|
+| P1 | Can one open `MarketDataTools` carry overlapping calls from tasks other than the one that entered it? (in-process, `auto`) | Yes. 5 concurrent calls, each with a 0.3 s provider sleep, finished in 0.35 s with 5 active at once, and each result carried its own symbol. |
+| P2 | The same question over real stdio JSON-RPC | Yes. 4 concurrent calls finished in 0.35 s, each correctly correlated. |
+| P3 | A stdio child dies mid-life | The in-flight call and every later call returned `ToolFailure(provider_unavailable)` at once. The task that entered the client was not cancelled, and its later exit was clean. |
+| P4 | A child fails to start: it exits at once, or it is the real server without a key | `Client.__aenter__` raised `ExceptionGroup`, an `Exception` subclass, after 0.03 s and 0.3 s. |
+| P5 | A child starts but never answers | Entry raised `ExceptionGroup` after 15.04 s at `read_timeout_seconds=3`, and after 19.03 s at 7 s (the production `t + 2` for the 5.0 s default). No child remained. |
+| P6 | Can entry be bounded by `anyio.fail_after` around `enter_async_context`? | No. A **successful** entry inside the scope raised `RuntimeError: Attempted to exit a cancel scope that isn't the current tasks's current cancel scope`, because the client's task group outlives the scope. |
+| P7 | A FastAPI lifespan entering an in-process `open_market_data_tools` on an `AsyncExitStack`, with `TestClient` sending 4 requests from threads to a 4-party barrier provider | All 4 succeeded with their own symbols, 4 were active at once, and lifespan entry and exit ran in the same asyncio task. |
+| P9 | `stdio_client(server, errlog=…)` | `errlog` is passed as the child's `stderr=` (`mcp/client/stdio.py:345`), so it must be a real file, such as one opened on `os.devnull`. |
+
+**Consequences for Milestone 6** (`docs/DECISIONS.md` §3.1, §20.4):
+
+- **Concurrency.** One shared client is safe for concurrent requests, so there is no lock (P1, P2).
+- **No supervisor.** A dead child degrades per call (P3).
+- **Degraded startup.** It catches `Exception` around entry only (P4). Startup against a hung child is bounded by the SDK at about 19 s with defaults (P5), and no external cancel scope wraps entry (P6).
+- **Same task.** The lifespan satisfies item 8's same-task rule (P7). Starlette 1.6.0 `Router.lifespan` (`starlette/routing.py:639-664`) enters and exits the lifespan context in one coroutine, and sends a shutdown exception as `lifespan.shutdown.failed` with its traceback text.
+- **Tool listing.** Item 2 also bounds the one-call rule precisely: the SDK may send one read-only `tools/list` per tool name per connection, and `cache=None` does not prevent it.
+
 ---
 
 ## 3.10 OpenAI Python SDK and answer model
@@ -474,6 +500,24 @@ The outcome classification (malformed response, incomplete, unexpected status, r
 **Retention (D6).** `store=False` disables stored Responses application state. It does **not** by itself guarantee zero retention: the OpenAI "your data" guide (fetched 2026-09-23) states that abuse-monitoring logs are "retained for up to 30 days", and only the approval-gated Zero Data Retention or Modified Abuse Monitoring controls exclude customer content from them. The project claims no stronger guarantee.
 
 **Tests.** Adapter tests drive the real SDK over `httpx2.MockTransport` at `http://openai.invalid/v1` with a fake key and `max_retries=0`, so they verify logical-call behavior only. Stage C first confirms the minimal Responses JSON bodies for each outcome against the installed SDK and records them here only if they differ from this record. No automated test calls OpenAI.
+
+### Amendment 2026-09-25 — the Milestone 6 tool planner (not yet implemented)
+
+Recorded by the Milestone 6 step-1 alignment (`docs/changes/M6-mcp-graph-integration.md` D7, D9).
+
+**P8, verified in the installed SDK 3.14.1.** `AsyncOpenAI.with_options` is `copy` (`openai/_client.py:1607`). It accepts `timeout` and `max_retries`, and reuses the original `httpx2` client (`http_client = http_client or self._client`). The planner can therefore run with `max_retries=0` on the shared connection pool, and there is no second client to close.
+
+**Request shape.** `OpenAIToolPlanner` stores `client.with_options(max_retries=0, timeout=PLANNER_TIMEOUT_SECONDS)`, and makes exactly one HTTP attempt per query:
+
+```text
+model=<OPENAI_LLM_MODEL>, instructions=<TOOL_PLANNER_INSTRUCTIONS>, input=<rendered question>,
+text={"format": TOOL_PLAN_FORMAT}, reasoning={"effort": "none"},
+max_output_tokens=PLANNER_MAX_OUTPUT_TOKENS, store=False
+```
+
+- **Limits.** `PLANNER_TIMEOUT_SECONDS = 10.0` and `PLANNER_MAX_OUTPUT_TOKENS = 200` are code constants.
+- **Schema.** `TOOL_PLAN_FORMAT` is `{"type": "json_schema", "name": "tool_plan", "strict": true, "schema": …}`. Both `tool_name` and `symbol` are required and nullable, `tool_name` is limited to the two tool names plus `null`, and `additionalProperties` is `false`.
+- **Unverified.** Provider acceptance of this nullable-enum strict schema is **not verified**, because no live OpenAI call was authorized. If the schema is rejected, the result is `planning_failed` and the query falls back to documents. The Milestone 8 smoke test checks it.
 
 ---
 

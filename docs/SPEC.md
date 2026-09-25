@@ -453,8 +453,15 @@ Response with MCP source:
       "tool": "get_market_quote",
       "provider": "alpha_vantage",
       "symbol": "ACME",
-      "as_of": "provider supplied timestamp/freshness",
-      "excerpt": "..."
+      "as_of": "2026-09-24",
+      "fields": {
+        "price": "123.45",
+        "previous_close": "122.10",
+        "change": "1.35",
+        "change_percent": "1.11%",
+        "volume": "12345678",
+        "latest_trading_day": "2026-09-24"
+      }
     }
   ],
   "tools_used": [
@@ -462,6 +469,13 @@ Response with MCP source:
   ]
 }
 ```
+
+*Amended 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D1, D13, D16).* This example previously showed an MCP `excerpt`. MCP citations carry structured `fields` instead, which resolves the conflict with `docs/DECISIONS.md` §15:
+
+- **Fields.** `fields` holds the allow-listed normalized tool fields in a fixed order, copied verbatim as strings from the validated tool result. The application never writes prose from them.
+- **`as_of`.** For a quote it is `latest_trading_day`. For an overview it is `latest_quarter` when present, and otherwise a fixed provider freshness description.
+- **`tools_used`** lists the tool exactly once when a validated tool call succeeded, whatever the final `status` and whether or not the answer cites `T1`. Otherwise it is `[]`.
+- **MCP unavailable.** `use_tools=true` is always a valid request. When MCP is unavailable (no `ALPHA_VANTAGE_API_KEY`, or the MCP child failed to start), no planner call and no MCP call are made, and the query uses document evidence only.
 
 Insufficient context remains an application-level successful response:
 
@@ -473,6 +487,8 @@ Insufficient context remains an application-level successful response:
   "tools_used": []
 }
 ```
+
+The insufficient-context `answer`, `status`, and `citations` are fixed. Its `tools_used` follows the rule above, so it is `[<tool>]` (for example `["get_market_quote"]`) rather than `[]` when a validated tool call succeeded but the result is still insufficient (*amended 2026-09-25, Milestone 6 step 1*).
 
 The service MUST NOT convert normal lack of evidence into HTTP `500`.
 
@@ -732,6 +748,15 @@ errors
 
 `tool_plan` may contain either no tool or exactly one allowed tool plus validated arguments.
 
+*Realized in Milestone 6 (recorded 2026-09-25 by step 1; `docs/changes/M6-mcp-graph-integration.md` §9.1).* The tool fields are:
+
+- `tool_plan`: the approved plan, a tool name and a normalized symbol, or `None`;
+- `tool_result`: a validated tool success, or `None`;
+- `tool_error`: one closed error code, or `None`;
+- `tool_context`: the trusted `T1` item, built only from `tool_result`.
+
+The conceptual `errors` list is realized as that single closed `tool_error` field. Only the optional tool path records a non-fatal error, and it can fail at most once per run. Fatal errors still propagate as exceptions.
+
 ## 11.2 Nodes
 
 ### `validate_query`
@@ -843,6 +868,8 @@ There is no node loop.
 
 Maximum tool calls per graph execution: 1.
 
+*Amended 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D1, D20, §9.2).* The `use_tools = true` branch goes to `decide_tool` only when tools are available, meaning the MCP client started and a planner exists. When they are not available, it goes directly to `build_context`, as `use_tools = false` does. The limit is precisely at most one `tools/call` per execution. The MCP SDK may also send one read-only `tools/list` per tool name per connection to validate output schemas; that is not a tool invocation.
+
 ---
 
 # 12. Error behavior
@@ -898,6 +925,8 @@ If the tool is optional and document evidence remains useful:
 If the user's question can only be answered using the failed tool and no document evidence supports it:
 
 - return `status = "insufficient_context"`.
+
+*Recorded 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D15).* Failure text is never given to the answer model: a failed planner or tool adds no block, no error text, and no "tool failed" note to the prompt. The limitation is made explicit only when the model reports that the supplied sources contain no market data.
 
 ## 12.6 Malformed model output
 
@@ -965,6 +994,13 @@ Secrets must not have hard-coded defaults.
 `OPENAI_EMBEDDING_MODEL` and `OPENAI_EMBEDDING_DIMENSIONS` describe stored vectors, not tunables. The MVP supports exactly `text-embedding-3-small` at 1536 dimensions. Unset or blank values resolve to those, and any other value fails startup (*recorded 2026-09-23*; `docs/TECH_BASELINE.md` §3.11).
 
 `MCP_TOOL_TIMEOUT_SECONDS` (*recorded 2026-09-24, Milestone 5*) bounds each market-data provider request. It defaults to `5.0`; unset or blank resolves to that default. A configured value must be a finite number with `0 < value <= 30`. Any other value fails startup of the process that constructs `MarketDataConfig`, with a message that names the variable but never its value. In Milestone 5 that process is the stdio MCP server; the API process does not read the setting until Milestone 6. `ALPHA_VANTAGE_API_KEY` has no default.
+
+*Amended 2026-09-25 (Milestone 6 step 1; `docs/changes/M6-mcp-graph-integration.md` D1, D2).* From Milestone 6 the API process reads both variables.
+
+- **Key.** `ALPHA_VANTAGE_API_KEY` is optional in the API. When it is unset or blank, the API starts in RAG-only mode and launches no MCP child.
+- **Timeout.** A supplied `MCP_TOOL_TIMEOUT_SECONDS` is always validated, even when the key is absent, and a malformed value fails API startup before any resource is created.
+- **Child start failure.** When a configured MCP child cannot start, the API still starts, in RAG-only mode.
+- **MCP server process.** The stdio MCP server still requires the key.
 
 Tests should replace external clients with deterministic fakes and therefore must not require real API keys.
 

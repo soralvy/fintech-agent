@@ -317,7 +317,9 @@ Known limitations carried forward:
 
 # Milestone 6 — Bounded MCP graph integration
 
-Target: ~1–1.5 hours.
+Target: ~6–9 hours of implementation and verification across step 1 and Stages A–D, excluding review turnaround. *Re-estimated 2026-09-25* from ~1–1.5 hours, which predated the planner adapter, the MCP citation model, the lifespan refactor with degraded startup, the concurrency evidence, and the per-stage reviews (`docs/changes/M6-mcp-graph-integration.md` §14).
+
+Change specification: `docs/changes/M6-mcp-graph-integration.md`, approved revision 3 (final independent review CLEAN, 2026-09-25). Implementation has not started. Step 1 (canonical contract alignment) records its decisions in the binding documents; Stages A–D follow.
 
 - [ ] Add `decide_tool` node.
 - [ ] Ensure it runs only when `use_tools=true`.

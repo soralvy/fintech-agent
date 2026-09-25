@@ -39,14 +39,25 @@ Milestones 0–5 are checked and carry verification records in [TASKS.md](TASKS.
 
 ## Current position
 
-Milestone 5 is the latest completed milestone. **Milestone 6, bounded MCP graph integration**, is next and has no change specification yet. The Milestone 5 MCP client stays standalone until Milestone 6 wires it into the lifespan and the graph.
+Milestone 5 is the latest completed milestone. The M5 milestone-wide `/finish-task` review passed (final verdict CLEAN), and the result is on `main` as `12530a8`.
+
+**Milestone 6, bounded MCP graph integration**, is in progress:
+
+- Its change specification, [changes/M6-mcp-graph-integration.md](changes/M6-mcp-graph-integration.md), is approved at revision 3, with a final independent review of CLEAN on 2026-09-25.
+- Step 1, the docs-only canonical contract alignment, records its decisions in [SPEC.md](SPEC.md), [DECISIONS.md](DECISIONS.md), [TECH_BASELINE.md](TECH_BASELINE.md), and [TASKS.md](TASKS.md).
+- **No Milestone 6 code exists yet.** The Milestone 5 MCP client stays standalone until Stages B–C wire it into the graph and the lifespan.
 
 ## Open decisions and blockers
 
 - **Blockers:** none recorded.
-- **Milestone 6 decisions to make in its change specification:** the API startup policy when `ALPHA_VANTAGE_API_KEY` is missing or the MCP server fails to start, `as_of` derivation for MCP citations, and the planner's structured output.
-- Alpha Vantage response fields and error envelopes are undocumented ([TECH_BASELINE.md](TECH_BASELINE.md) §3.18), so the adapter's mapping is provisional until the Milestone 8 smoke test.
-- MCP citation shape: [SPEC.md](SPEC.md) §6.3 shows `excerpt`, while [DECISIONS.md](DECISIONS.md) §15 specifies `fields`. This is flagged for Milestone 6 and not yet resolved.
+- **The Milestone 6 decisions carried from Milestone 5 are resolved** by the approved spec (D1–D27):
+  - **Startup policy:** MCP is optional. The API runs RAG-only without `ALPHA_VANTAGE_API_KEY` or when the child cannot start, and a malformed `MCP_TOOL_TIMEOUT_SECONDS` fails startup.
+  - **`as_of`:** `latest_trading_day` for a quote. For an overview, `latest_quarter`, or else a fixed freshness description.
+  - **Planner output:** a strict nullable `ToolPlan`, made in one HTTP attempt, using a ticker only when the question states it explicitly.
+  - **Citation shape:** MCP citations use `fields`, not `excerpt`, and [SPEC.md](SPEC.md) §6.3 is amended.
+- **Unverified until the Milestone 8 smoke test:**
+  - whether OpenAI accepts the planner's nullable-enum schema. If it does not, queries fall back to documents;
+  - the Alpha Vantage response fields and error envelopes, which are undocumented ([TECH_BASELINE.md](TECH_BASELINE.md) §3.18), so the adapter's mapping is provisional.
 - The `fintech_smoke_m4` database was left in place. Dropping it is the user's decision.
 
 ## Known limitations and deferred work
@@ -61,7 +72,8 @@ Milestone 5 is the latest completed milestone. **Milestone 6, bounded MCP graph 
 
 ## Next authorized action
 
-Run the milestone-wide `/finish-task` review of Milestone 5 on `feat/milestone-5-mcp-server`, then publish only on explicit instruction. Milestone 6 starts afterwards with a change specification, as Milestones 4 and 5 did.
+1. Finish Milestone 6 step 1: run its scoped `/finish-task`, then commit it on explicit instruction.
+2. Then **Stage A**: the planner schema and adapter, the prompts, and the pure `T1` and MCP-citation foundations ([changes/M6-mcp-graph-integration.md](changes/M6-mcp-graph-integration.md) §14).
 
 ## Canonical documents
 
@@ -71,4 +83,5 @@ Run the milestone-wide `/finish-task` review of Milestone 5 on `feat/milestone-5
 - [TASKS.md](TASKS.md): milestones, exit conditions, verification evidence
 - [changes/M4-query-graph.md](changes/M4-query-graph.md): the Milestone 4 change specification.
 - [changes/M5-mcp-server.md](changes/M5-mcp-server.md): the Milestone 5 change specification (approved revision 3), implemented and verified.
+- [changes/M6-mcp-graph-integration.md](changes/M6-mcp-graph-integration.md): the Milestone 6 change specification (approved revision 3). Not yet implemented.
 - [../CLAUDE.md](../CLAUDE.md): working instructions
