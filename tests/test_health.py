@@ -9,6 +9,7 @@ Real vector SQL is exercised in ``test_retrieval_db.py``.
 
 from __future__ import annotations
 
+import logging
 import socket
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -22,6 +23,13 @@ from fastapi.testclient import TestClient
 from app.config import DEFAULT_POOL_TIMEOUT_SECONDS, DatabaseConfig
 from app.db import create_pool
 from app.main import app, get_pool
+
+DATABASE_UNAVAILABLE = {
+    "error": {
+        "code": "database_unavailable",
+        "message": "The database is unavailable.",
+    }
+}
 
 
 class FakeConnection:
@@ -101,7 +109,7 @@ def test_health_failure_does_not_leak_connection_details() -> None:
 
     assert "hunter2" not in response.text
     assert "db.internal" not in response.text
-    assert response.json() == {"detail": "database unavailable"}
+    assert response.json() == DATABASE_UNAVAILABLE
 
 
 def _unused_local_port() -> int:
@@ -113,7 +121,7 @@ def _unused_local_port() -> int:
 
 
 def test_health_returns_503_within_the_pool_timeout_when_database_is_down(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Regression: an outage used to take psycopg_pool's 30-second default.
 
@@ -131,6 +139,7 @@ def test_health_returns_503_within_the_pool_timeout_when_database_is_down(
     )
     # Startup requires a key; a dummy is enough, since health never calls OpenAI.
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-a-secret")
+    caplog.set_level(logging.DEBUG)
 
     with TestClient(app) as client:
         started = time.monotonic()
@@ -138,11 +147,19 @@ def test_health_returns_503_within_the_pool_timeout_when_database_is_down(
         elapsed = time.monotonic() - started
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "database unavailable"}
+    assert response.json() == DATABASE_UNAVAILABLE
     assert "s3cretpw" not in response.text
     assert elapsed < timeout + 2.0, (
         f"took {elapsed:.1f}s; the pool timeout is not applied"
     )
+    # No logger, including the pool's own, may carry the DSN or its password.
+    assert any(r.name.startswith("psycopg.pool") for r in caplog.records), (
+        "the check below is not vacuous"
+    )
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    for text in ("s3cretpw", "postgresql://"):
+        assert text not in logged
+        assert text not in caplog.text
 
 
 def test_pool_uses_the_configured_timeout() -> None:

@@ -893,12 +893,61 @@ def test_the_http_exception_handler_keeps_other_statuses_unchanged() -> None:
     assert json.loads(bytes(response.body)) == {"detail": "database unavailable"}
 
 
-def test_an_unknown_route_keeps_the_framework_404() -> None:
-    with serving(object()) as client:
-        response = client.get("/no-such-route")
+@pytest.mark.parametrize(
+    ("method", "target", "status_code", "allow", "logged_path"),
+    [
+        pytest.param(
+            "GET", f"/no-such-route?x={SENTINEL}", 404, None, None, id="unknown-path"
+        ),
+        pytest.param("GET", QUERY_URL, 405, "POST", QUERY_URL, id="get-query"),
+        pytest.param("GET", URL, 405, "POST", URL, id="get-documents"),
+        pytest.param("POST", "/health", 405, "GET", "/health", id="post-health"),
+    ],
+)
+def test_unknown_paths_and_wrong_methods_use_the_envelope(
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    target: str,
+    status_code: int,
+    allow: str | None,
+    logged_path: str | None,
+) -> None:
+    caplog.set_level(logging.DEBUG)
 
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Not Found"}
+    with serving(object()) as client:
+        response = client.request(method, target)
+
+    assert response.status_code == status_code
+    if status_code == 404:
+        assert response.json() == error_body(
+            "not_found", "The requested resource does not exist."
+        )
+        assert "allow" not in response.headers
+    else:
+        assert response.json() == error_body(
+            "method_not_allowed",
+            "The request method is not allowed for this resource.",
+        )
+        assert response.headers["allow"] == allow
+    logged = events(caplog)
+    assert [event["event"] for event in logged] == [
+        "http.request.started",
+        "http.request.completed",
+    ]
+    started, completed = logged
+    assert started["method"] == completed["method"] == method
+    assert started["path"] == completed["path"] == logged_path
+    assert completed["status_code"] == status_code
+    assert SENTINEL not in response.text
+    # The test client's own httpx logger records the URL it sent; only the
+    # application's lines are under test.
+    app_logged = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("app")
+    )
+    assert SENTINEL not in app_logged
+    assert "no-such-route" not in app_logged
 
 
 # ---------------------------------------------------------------------------
