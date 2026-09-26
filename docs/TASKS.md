@@ -143,7 +143,7 @@ The Milestone 2 architecture audit found these gaps and deliberately deferred th
 | ~~Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change~~ | **Done in Milestone 4** (2026-09-24; `app/schemas.py`, `GroundedAnswer` in `app/openai_provider.py`, `app/citations.py`; `docs/DECISIONS.md` §4) |
 | `contextlib.AsyncExitStack` in the lifespan | ~~Milestone 5~~ Milestone 6, when the MCP client becomes the third lifespan resource (*moved 2026-09-24*: the Milestone 5 client is standalone; `docs/changes/M5-mcp-server.md` §15) |
 | ~~Single-flight tokenizer load, so a stalled download cannot pile up worker threads; level and timestamp in JSON log lines~~ | **Done in Milestone 7** (2026-09-26; `app/tokenizer.py`, `app/logging.py`; `docs/DECISIONS.md` §7.5, §19) |
-| Move PDF extraction off the event loop (`asyncio.to_thread`) | Only if the Milestone 8 real-PDF measurement shows the event loop stalling (`docs/DECISIONS.md` §22) |
+| Move PDF extraction off the event loop (`asyncio.to_thread`) | Only if a real-PDF measurement shows the event loop stalling (`docs/DECISIONS.md` §22). *Measured 2026-09-26 in Milestone 8:* no stall on the 3-page Apple PDF (worst `/health` probe 103.6 ms against a 5.7 ms baseline). The move stays deferred. A much larger PDF was not measured live. |
 
 ---
 
@@ -524,33 +524,124 @@ Post-verification follow-up (2026-09-26, spec revision 6). This applies the two 
 
 # Milestone 8 — Verification and portfolio finish
 
-Target: ~1.5–2 hours.
+Target: ~3–4 hours across Stages A–E, excluding review turnaround and approval waits. *Re-estimated 2026-09-26* from ~1.5–2 hours, which predated the approval package, the three-way citation check, and the README (`docs/changes/M8-verification-portfolio-finish.md` §15).
 
-- [ ] Run database migration from a clean database.
-- [ ] Run complete automated test suite.
-- [ ] Run configured lint/format check.
-- [ ] Run configured Python type checker, if present.
-- [ ] Fix failures rather than documenting them as passed.
-- [ ] Start the real API locally.
-- [ ] Ingest one real text-based financial PDF.
-- [ ] Ask one question whose answer is visibly present in the PDF.
-- [ ] Manually verify citation text/page.
-- [ ] Ask one unrelated question and verify `insufficient_context`.
-- [ ] Configure real MCP provider credentials locally.
-- [ ] Execute one MCP-enriched query.
-- [ ] Verify freshness wording does not imply unsupported real-time data.
-- [ ] Check logs for secret leakage.
-- [ ] Update README with:
+Change specification: `docs/changes/M8-verification-portfolio-finish.md`, revision 2. Its §16 is the execution record.
+
+- [x] Run database migration from a clean database. `fintech_smoke_m8` was absent, then created and migrated twice with a stable schema hash (spec §16.2).
+- [x] Run complete automated test suite. `scripts/verify.py`: 1186 passed, 0 skipped.
+- [x] Run configured lint/format check. Part of `scripts/verify.py`.
+- [x] Run configured Python type checker, if present. mypy strict, part of `scripts/verify.py`.
+- [x] Fix failures rather than documenting them as passed. The gate had no failure. The live findings F1/F2 need prompt changes, which this no-code milestone may not make. They are recorded as unresolved below, not as passed.
+- [x] Start the real API locally, with real OpenAI and Alpha Vantage keys, against the fresh database. `mcp.startup` was `available`.
+- [x] Ingest one real text-based financial PDF: Apple's FY2025 Q2 condensed consolidated financial statements (3 pages, 3 chunks).
+- [x] Ask one question whose answer is visibly present in the PDF. Q1 answered $95,359 million, cited `[D1]`.
+- [x] Manually verify citation text/page. The `D1` excerpt matches the stored chunk and the pypdf page-1 text, and a rendered image of page 1 shows the row.
+- [x] Ask one unrelated question and verify `insufficient_context`. Q2, an in-document question the statements cannot answer, returned the exact fixed body.
+- [x] Configure real MCP provider credentials locally. Both keys are in the gitignored `.env`, and their presence was verified by count only.
+- [x] Execute one MCP-enriched query. The original Q3 **failed** (no tool chosen). The separately approved simplified Q3b **passed** with one `get_market_quote` call. Both are recorded below.
+- [x] Verify freshness wording does not imply unsupported real-time data. Q3b's answer had 0 real-time matches and states end-of-day freshness.
+- [x] Check logs for secret leakage. Every scan count was 0 in both runs.
+- [x] Update README with:
   - architecture summary;
   - setup commands;
   - API demo commands;
   - test commands;
   - limitations;
   - explanation of exact pgvector search vs ANN indexing.
-- [ ] Update `docs/DECISIONS.md` with deviations or material choices discovered during implementation.
-- [ ] Update this file with the commands actually run and verified.
+- [x] Update `docs/DECISIONS.md` with deviations or material choices discovered during implementation: §10.4 (planner schema), §22 (PDF measurement), and §23 (the unresolved findings and the unverified overview tool).
+- [x] Update this file with the commands actually run and verified.
 
 **Exit condition:** the complete documented flow has been exercised successfully rather than inferred from unit tests.
+
+**Verified 2026-09-26, with two unresolved findings.** Upload, grounded answer with a verified citation, insufficient context, and a bounded MCP-enriched answer were each exercised live. The MCP-enriched step succeeded only for the simplified question. F1 and F2 below remain open and need a separate prompt-change spec.
+
+Live-run protocol:
+
+- **Approval.** Each live step ran from a scratchpad file set pinned by SHA-256 and approved once by the user.
+- **Server environment.** The server ran from `env -i` with only `PATH`, `HOME`, `TMPDIR`, `OPENAI_LOG=info`, `DATABASE_URL=postgresql://localhost:5433/fintech_smoke_m8`, and the two keys. A launcher read the keys from `.env` by name and passed them through `execve`, never as an argument.
+- **Driver.** The driver held no key and sent requests only to `127.0.0.1:8765`.
+
+Attempts that produced no smoke evidence (spec §16.1):
+
+1. Preflight stopped: the Alpha Vantage key line was not in the required form. Nothing was created or sent.
+2. Gate and migration passed, but a runbook defect (zsh `TRAPEXIT` firing on `$(...)` subshell exit) stopped the server before the first request. No provider call was made. The empty `fintech_smoke_m8` was dropped with the user's approval, and the trap was fixed.
+
+Acceptance run (attempt 3):
+
+- **Preflight:** PASS. Before creation, the databases were `fintech`, `fintech_smoke_m4`, and `fintech_test`. `TEST_DATABASE_URL` is `fintech_test`, never the smoke database.
+- **Gate:** `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY -u MCP_TOOL_TIMEOUT_SECONDS UV_OFFLINE=1 DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py` gave `verify: PASSED: all 5 steps; 1186 tests, 0 skipped`, and `git diff --check` passed.
+- **Migration:** `createdb fintech_smoke_m8`, then `psql -v ON_ERROR_STOP=1 -f migrations/001_initial.sql` twice. The schema-only dump hash was identical, after removing PostgreSQL 18's random `\restrict`/`\unrestrict` lines.
+  - `18.6 (Homebrew)`, pgvector `0.8.6`, tables `document_chunks,documents`, `vector(1536)`, B-tree indexes only, 0 rows.
+  - `documents_sha256_key` and `document_chunks_document_id_chunk_index_key` are present.
+- **Server:** `mcp.startup` `available`, with one MCP child.
+- **Requests:**
+  1. `GET /health` returned `200 {"status":"ok","database":"ok"}`.
+  2. Upload `m8-smoke-aapl.pdf` (SHA-256 `e333dd82…0e89`) returned `201 ingested`, document `0469f4d3-b1b5-437e-9757-fbb1939d7a8b`, `page_count 3`, `chunk_count 3`.
+     - Stored: 1 document, 3 chunks, pages 1–3, 1536 dimensions.
+  3. Q1, "What were Apple's total net sales for the three months ended March 29, 2025?", returned `answered`: "…$95,359 million ($95.359 billion). [D1]".
+     - `D1` is chunk `314198c3-9940-4260-bf6e-b3832045616c`, page 1, excerpt `Total net sales (1) 95,359 90,753 219,659 210,328`.
+     - The excerpt is an exact substring of the stored chunk and appears in page 1's text. The rendered page shows the row under "Three Months Ended March 29, 2025", in millions.
+  4. Q2, "According to this document, what was Apple's employee attrition rate during the quarter?", returned exactly the fixed insufficient-context body.
+     - Retrieval accepted 3 chunks, and the model declared the context insufficient in 1 answer call. No planner or tool call.
+  5. Q3, "According to the uploaded statements, what were Apple's total net sales for the three months ended March 29, 2025, and what is the latest available market quote for AAPL? Clearly distinguish the document fact from live provider data.", **FAILED**.
+     - It returned `insufficient_context`, `tools_used []`, and no citations.
+     - `planning.completed` gave `tool: null` (1,631 ms), and no MCP call followed. The answer model declared the whole request insufficient.
+- **Upload stall measurement:** `/health` baseline median 5.7 ms, and the worst of 21 probes during the upload was 103.6 ms. Started-to-parsed took 228 ms, and embedding 2,153 ms. **No stall.**
+- **Budget:**
+  - OpenAI: 4 embedding calls, 3 answer calls, 1 planner call, and 0 SDK retries, so 8 requests (ceiling 31).
+  - Alpha Vantage: 0 calls.
+- **Shutdown:** exit 0, 0 MCP children, 0 listeners on 8765.
+
+Q3-only rerun (separately approved, same database, no upload):
+
+- **Question:** Q3 without its final sentence.
+- **Response:** `200 answered`, `tools_used ["get_market_quote"]`.
+- **Events:** `planning.completed` with `tool: get_market_quote` (1,459 ms), then one `mcp.tool.requested` for `AAPL`, completed in 427 ms.
+- **Citations:**
+  - `D1` is the same page-1 chunk and excerpt, and passes every Q1 check.
+  - `T1` is `alpha_vantage`, `AAPL`, `as_of 2026-09-25` = `latest_trading_day`, with the six fields in the fixed order.
+- **Freshness:** the answer states "The latest available AAPL market quote in the supplied data is $341.07, as of September 25, 2026; the provider notes quote freshness may be end-of-day depending on entitlement. [T1]", with 0 real-time matches.
+- **Budget:** 3 OpenAI requests and 1 Alpha Vantage request, with 0 retries.
+- **Shutdown:** exit 0, 0 children, port free.
+
+Log scans (both runs):
+
+- **Zero counts.** Each of these had 0 occurrences across the whole server log:
+  - the `OPENAI_API_KEY` and `ALPHA_VANTAGE_API_KEY` values, counted without printing them;
+  - `sk-`, `Bearer`, `Authorization`, `apikey`, `alphavantage.co`, `postgresql://`, `password`, `Traceback`;
+  - `<sources>`, `<question>`, the answer instructions;
+  - `Global Quote`, `05. price`, `output_text`;
+  - the local PDF filename, every question, three document-text markers, and every excerpt and answer prefix.
+- **Line format.** Every `app` JSON line carried `level` and a UTC `timestamp`.
+- **Request lifecycle.** Every request had exactly one `http.request.started` and one `http.request.completed`, with 0 `http.request.failed`.
+- **Uncovered stream.** The MCP child's stderr goes to `os.devnull`, so it is out of scope.
+
+**Findings, unresolved.** These are not fixed and not accepted. A separate prompt-change spec is required:
+
+- **F1.** The planner may decline a valid tool request when the question also contains an additional instruction (original Q3 compared with Q3b).
+- **F2.** When optional tool data is absent, the answer model may return `insufficient_context` for the whole request instead of answering the supported document part. That is contrary to SPEC §6.3 SHOULD.
+
+**Other observations:**
+
+- **Verified live:** the strict planner schema is accepted by OpenAI, and `GLOBAL_QUOTE` is verified live.
+- **Not verified live:** `get_company_overview` remains unverified live.
+- **Log noise, no leak:** `OPENAI_LOG=info` duplicates each `app` line through the SDK's root handler, and pypdf logged 16 "fontTools is required" warnings. Neither carried a secret or document text.
+
+**Retained until `/finish-task` reports:**
+
+- the scratchpad runbooks, pinned hashes, outputs, server logs, results, and page render;
+- the `fintech_smoke_m8` database (1 document, 3 chunks). Dropping it, like `fintech_smoke_m4`, is the user's decision.
+
+Stage E gate, after these records (2026-09-26):
+
+- `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY -u MCP_TOOL_TIMEOUT_SECONDS UV_OFFLINE=1 DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py` gave `verify: PASSED: all 5 steps; 1186 tests, 0 skipped`.
+  - `uv lock --check`: passed.
+  - Ruff format: 59 files already formatted.
+  - Ruff check: passed.
+  - mypy: no issues in 41 source files.
+- `git diff --check` passed.
+- `git diff --stat main` over `app`, `tests`, `scripts`, `migrations`, `pyproject.toml`, `uv.lock`, `.env.example`, and `.claude` is empty. No application, test, dependency, or migration file changed.
 
 ---
 
