@@ -236,6 +236,31 @@ async def test_concurrent_first_calls_share_one_load() -> None:
 
 
 @pytest.mark.anyio
+async def test_joining_a_finished_but_unsettled_load_stores_the_encoding() -> None:
+    loaded: list[str] = []
+
+    def loader(name: str) -> FakeEncoding:
+        loaded.append(name)
+        return FakeEncoding()
+
+    async def finished_load() -> FakeEncoding:
+        return FakeEncoding()
+
+    tokenizer = TiktokenTokenizer(loader=loader)
+    # A load task that is done but whose ``_load_settled`` callback has not
+    # run yet: the state a caller can join between the two event-loop steps.
+    task = asyncio.create_task(finished_load())
+    await asyncio.wait({task})
+    tokenizer._load_task = task
+
+    await tokenizer.ensure_ready()
+
+    assert tokenizer._encoding is not None
+    assert tokenizer.encode("hi") == list(b"hi")
+    assert loaded == [], "encode must not reach the inline load"
+
+
+@pytest.mark.anyio
 async def test_a_completed_load_failure_is_retried_by_the_next_call(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

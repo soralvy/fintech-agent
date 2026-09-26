@@ -127,9 +127,12 @@ class TiktokenTokenizer:
             self._unavailable = True
             self._load_failed(TimeoutError())
         try:
-            task.result()
+            encoding = task.result()
         except (OSError, ValueError, ImportError) as exc:
             self._load_failed(exc)
+        # A caller can join a task that finished before ``_load_settled`` ran,
+        # so the outcome is also stored here; the assignment is idempotent.
+        self._encoding = encoding
 
     def _load_settled(self, task: asyncio.Task[_Encoding]) -> None:
         # Owns the shared task's state transitions. A cancelled task (event
