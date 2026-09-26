@@ -1142,6 +1142,8 @@ Rejected:
 - planner retries;
 - retrieved passages as planner input.
 
+*Observed 2026-09-26 (Milestone 8 live smoke; `docs/changes/M8-verification-portfolio-finish.md` §16).* OpenAI accepted the strict nullable-enum `tool_plan` schema with `gpt-6-luna`. For the simplified question "…and what is the latest available market quote for AAPL?", the planner chose `get_market_quote` with `AAPL` in 1,459 ms. The same question with an added sentence, "Clearly distinguish the document fact from live provider data.", returned `tool: null`. That is unresolved finding F1 (§23). It is not accepted behavior.
+
 ---
 
 ## 10.5 `call_tool`
@@ -2606,6 +2608,8 @@ Document parsing and deterministic chunking may execute synchronously inside ing
 
 If PDF parsing proves measurably blocking during the real smoke test, moving only parsing to a thread is an implementation optimization, not an architectural requirement.
 
+*Measured 2026-09-26 (Milestone 8; `docs/changes/M8-verification-portfolio-finish.md` D13, §16.2).* The Apple FY2025 Q2 statements (3 pages, 3 chunks) were uploaded while `GET /health` was probed every 100 ms. The baseline median was 5.7 ms, and the worst of 21 probes during the upload was 103.6 ms, under the 500 ms stall threshold. `ingestion.started`→`ingestion.parsed` took 228 ms. No stall was shown, so the move stays deferred. A much larger PDF was not measured live.
+
 ---
 
 ## Exact pgvector search
@@ -2672,6 +2676,15 @@ The MVP deliberately accepts:
 - after a tokenizer load timeout, new-document ingestion answers `503 tokenizer_unavailable` until the application restarts. `/health`, `/v1/query`, and duplicate uploads are unaffected. The mitigation is a warm `TIKTOKEN_CACHE_DIR` (*recorded 2026-09-25, Milestone 7 Stage 0, implemented and verified 2026-09-26, `docs/changes/M7-http-error-security-hardening.md` D11, C7*).
 
 These limitations are consistent with the intended 12–16 hour portfolio scope.
+
+### Unresolved findings from the Milestone 8 live smoke (recorded 2026-09-26)
+
+These are **not** accepted limitations like those above, and they are not fixed. Each needs a separate prompt-change spec (`docs/changes/M8-verification-portfolio-finish.md` §16.5):
+
+- **F1.** The tool planner may decline a valid tool request when the user question contains an additional instruction. A question that explicitly asked for the latest AAPL quote got `tool: null` while it ended with "Clearly distinguish the document fact from live provider data". Without that sentence, it got `get_market_quote`. The cause is not established.
+- **F2.** When optional tool data is absent, the answer model may return `insufficient_context` for the whole request instead of answering the portion the documents support. That is contrary to `docs/SPEC.md` §6.3's SHOULD that a missing optional tool result not fail an answer document evidence can support.
+
+Also not verified live: `get_company_overview`. Only `GLOBAL_QUOTE` (`get_market_quote`) was exercised against the real provider, so the overview field mapping stays provisional (`docs/TECH_BASELINE.md` §3.18).
 
 ---
 

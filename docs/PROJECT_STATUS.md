@@ -10,7 +10,7 @@ A backend-only portfolio project. Users upload financial documents, which are ch
 
 ## Completed milestones
 
-Milestones 0–7 are checked and carry verification records in [TASKS.md](TASKS.md):
+Milestones 0–8 are checked and carry verification records in [TASKS.md](TASKS.md). Milestone 8 carries two unresolved findings (below).
 
 | Milestone | Scope | Verified |
 |---|---|---|
@@ -22,6 +22,7 @@ Milestones 0–7 are checked and carry verification records in [TASKS.md](TASKS.
 | 5 | Local MCP server and standalone MCP client | 2026-09-24 |
 | 6 | Bounded MCP graph integration | 2026-09-25 |
 | 7 | HTTP, error, logging, and security hardening | 2026-09-26 |
+| 8 | Verification and portfolio finish (live smoke, README) | 2026-09-26, with findings F1/F2 open |
 
 ## Implemented capabilities
 
@@ -38,39 +39,44 @@ Milestones 0–7 are checked and carry verification records in [TASKS.md](TASKS.
 
 ## Latest verification
 
-- **Gate (recorded for Milestone 7, 2026-09-26):** `uv run python scripts/verify.py`, offline (`UV_OFFLINE=1`, provider keys and `MCP_TOOL_TIMEOUT_SECONDS` unset), exited 0 with 1186 tests passed, 0 skipped, after the post-verification tokenizer follow-up (1185 at Stage E). The Milestone 7 boundary checks passed. The breakdown is in [TASKS.md](TASKS.md) Milestone 7.
-- **Live smoke (Milestone 7, offline, executed 2026-09-26):** run with explicit approval, with a dummy key and a closed loopback proxy, sending no valid query or upload. It covered the `200`/`405`/`404`/`415`/`422` responses against a healthy database, the `503` envelope against an unreachable one, `level`/`timestamp` on every `app` line, one request ID per request across the HTTP and ingestion events, no secret or sentinel in any `app` line, and a clean SIGINT exit. No OpenAI or Alpha Vantage request was made. The steps are in [TASKS.md](TASKS.md) Milestone 7.
-- **Real-provider smoke:** last run for Milestone 4 (2026-09-24). The MCP-enriched real-provider smoke belongs to Milestone 8.
+- **Gate (Milestone 8 Stage E, 2026-09-26):** offline `uv run python scripts/verify.py`, with no provider keys: `PASSED: all 5 steps; 1186 tests, 0 skipped`. The record is in [TASKS.md](TASKS.md) Milestone 8.
+- **Real-provider smoke (Milestone 8, 2026-09-26), run with explicit single-use approvals:**
+  - **Setup.** A fresh `fintech_smoke_m8` database, migrated twice with a stable schema. Real OpenAI and Alpha Vantage keys.
+  - **Document.** The Apple FY2025 Q2 statements PDF was ingested: 3 pages, 3 chunks.
+  - **Q1** answered $95,359 million, with a `D1` citation on page 1 checked against the stored chunk, the page text, and a rendered image of the page.
+  - **Q2** returned the fixed insufficient-context body.
+  - **Original Q3 failed.** The planner chose no tool, and the whole answer was declared insufficient.
+  - **Simplified Q3 passed.** It made one `get_market_quote` call for AAPL, with an application-built `T1` citation (`as_of 2026-09-25`), and its wording says end-of-day, not real-time.
+  - **Logs.** Every secret and content scan count was 0.
+  - **Upload responsiveness.** No stall was measured during the PDF upload.
+  - The full record is in [TASKS.md](TASKS.md) Milestone 8 and [changes/M8-verification-portfolio-finish.md](changes/M8-verification-portfolio-finish.md) §16.
 
 ## Current position
 
-Milestone 6 is merged to `main` (PR #11).
+Milestone 7 is merged to `main` (PR #12).
 
-Milestone 7 is verified: AC1–AC18 of [changes/M7-http-error-security-hardening.md](changes/M7-http-error-security-hardening.md) have passing evidence. Its milestone-wide `/finish-task` completed CLEAN, after applying its P3 follow-ups (spec revision 6; [TASKS.md](TASKS.md) Milestone 7).
-
-**Milestone 8, verification and portfolio finish**, is next.
+Milestone 8's milestone-wide `/finish-task` review is pending.
 
 ## Open decisions and blockers
 
 - **Blockers:** none recorded.
-- **Unverified until the Milestone 8 smoke test:**
-  - whether OpenAI accepts the planner's nullable-enum schema. If it does not, queries fall back to documents;
-  - the planner's real tool choices and added latency;
-  - the Alpha Vantage response fields and error envelopes, which are undocumented ([TECH_BASELINE.md](TECH_BASELINE.md) §3.18), so the adapter's mapping is provisional.
-- The `fintech_smoke_m4` database was left in place. Dropping it is the user's decision.
+- **Unresolved findings F1 and F2.** Neither is fixed or accepted, and each needs a separate prompt-change spec ([DECISIONS.md](DECISIONS.md) §23):
+  - **F1:** the planner may decline a valid tool request when the question contains an additional instruction.
+  - **F2:** when optional tool data is absent, the answer model may declare the whole request insufficient instead of answering the supported document part, contrary to SPEC §6.3 SHOULD.
+- **Not verified live:** `get_company_overview`. Only `GLOBAL_QUOTE` was exercised against the real provider.
+- **Smoke databases:** `fintech_smoke_m4` and `fintech_smoke_m8` were left in place. Dropping them is the user's decision.
 
 ## Known limitations and deferred work
 
 - After a tokenizer load timeout, new-document ingestion answers `503 tokenizer_unavailable` until the application restarts. `/health`, `/v1/query`, and duplicate uploads are unaffected. A warm `TIKTOKEN_CACHE_DIR` avoids the download ([DECISIONS.md](DECISIONS.md) §23).
-- Moving PDF extraction off the event loop is deferred until a Milestone 8 measurement shows that it stalls.
-- `README.md` is empty. It will be written in Milestone 8.
+- Moving PDF extraction off the event loop stays deferred. The Milestone 8 measurement on a 3-page PDF showed no stall, and a much larger PDF was not measured live.
 - A clean-environment smoke run must pass `TMPDIR` or `TIKTOKEN_CACHE_DIR` through, or tiktoken re-downloads its encoding.
-- The optional Jev layer (Milestones 9–12) may start only after Milestone 8 is verified.
+- The optional Jev layer (Milestones 9–12) has not started. Whether it starts before or after the F1/F2 prompt-change spec is the user's decision.
 
 ## Next authorized action
 
-1. Run the Milestone 7 milestone-wide `/finish-task`, then commit and publish only on explicit instruction.
-2. Then **Milestone 8**, verification and portfolio finish ([TASKS.md](TASKS.md) Milestone 8).
+1. Report the Milestone 8 milestone-wide `/finish-task` result. Then commit and publish only on explicit instruction.
+2. Then, on the user's decision: a prompt-change spec for F1/F2, or the optional Milestone 9.
 
 ## Canonical documents
 
@@ -82,4 +88,5 @@ Milestone 7 is verified: AC1–AC18 of [changes/M7-http-error-security-hardening
 - [changes/M5-mcp-server.md](changes/M5-mcp-server.md): the Milestone 5 change specification (approved revision 3), implemented and verified.
 - [changes/M6-mcp-graph-integration.md](changes/M6-mcp-graph-integration.md): the Milestone 6 change specification (approved revision 3), implemented and verified.
 - [changes/M7-http-error-security-hardening.md](changes/M7-http-error-security-hardening.md): the Milestone 7 change specification (revision 6), implemented and verified.
+- [changes/M8-verification-portfolio-finish.md](changes/M8-verification-portfolio-finish.md): the Milestone 8 change specification (revision 2), executed; §16 is the execution record.
 - [../CLAUDE.md](../CLAUDE.md): working instructions

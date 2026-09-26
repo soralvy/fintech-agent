@@ -517,7 +517,7 @@ max_output_tokens=PLANNER_MAX_OUTPUT_TOKENS, store=False
 
 - **Limits.** `PLANNER_TIMEOUT_SECONDS = 10.0` and `PLANNER_MAX_OUTPUT_TOKENS = 200` are code constants.
 - **Schema.** `TOOL_PLAN_FORMAT` is `{"type": "json_schema", "name": "tool_plan", "strict": true, "schema": …}`. Both `tool_name` and `symbol` are required and nullable, `tool_name` is limited to the two tool names plus `null`, and `additionalProperties` is `false`.
-- **Unverified.** Provider acceptance of this nullable-enum strict schema is **not verified**, because no live OpenAI call was authorized. If the schema is rejected, the result is `planning_failed` and the query falls back to documents. The Milestone 8 smoke test checks it.
+- **Verified 2026-09-26 (Milestone 8 live smoke).** OpenAI accepted this nullable-enum strict schema with `gpt-6-luna`: both live planner calls returned `planning.completed`, with no `planning.failed`. One returned `tool: null` for a question that asked for a quote, which is unresolved finding F1 (`docs/DECISIONS.md` §23). The other chose `get_market_quote`. Observed per call: the original Q3 took 1,631 ms with 306 input and 18 output tokens, and Q3b took 1,459 ms with 296 input and 21 output tokens.
 
 ---
 
@@ -798,7 +798,9 @@ Alpha Vantage requires the key as a query parameter (§3.18), so the adapter hol
 - rate-limit-exceeded behavior;
 - HTTP status codes.
 
-**Consequence:** the adapter's field mapping and error-envelope classification are provisional, and they fail closed (`docs/DECISIONS.md` §14). Actual provider behavior is checked only by the separately authorized Milestone 8 smoke test. The adapter sends neither `datatype` nor `entitlement`, and describes the data as provider data that may be end-of-day, never as real-time.
+**Consequence:** the adapter's field mapping and error-envelope classification are provisional, and they fail closed (`docs/DECISIONS.md` §14). Actual provider behavior is checked only by the separately authorized Milestone 8 smoke test.
+
+*Verified live 2026-09-26 (Milestone 8; `docs/changes/M8-verification-portfolio-finish.md` §16.3).* One real `GLOBAL_QUOTE` request for `AAPL`, without `datatype` or `entitlement`, returned a response that the adapter normalized into a validated quote in 427 ms. It carried all six fields (`price`, `previous_close`, `change`, `change_percent`, `volume`, `latest_trading_day`), and `latest_trading_day` was `2026-09-25`, the day before the run. So the quote mapping is confirmed for a successful response. Error envelopes and rate-limit behavior were not exercised. `OVERVIEW` (`get_company_overview`) was not called, and its mapping remains provisional and unverified live. The adapter sends neither `datatype` nor `entitlement`, and describes the data as provider data that may be end-of-day, never as real-time.
 
 ---
 
