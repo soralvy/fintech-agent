@@ -53,9 +53,9 @@ Milestones 0–8 are checked and carry verification records in [TASKS.md](TASKS.
 
 ## Current position
 
-Milestone 7 is merged to `main` (PR #12).
+Milestones 0–8 are merged to `main`.
 
-Milestone 8's milestone-wide `/finish-task` review is pending.
+Public release preparation (README, `SECURITY.md`, the offline CI workflow; no application change) is recorded in [TASKS.md](TASKS.md). Its CI workflow has not yet run on GitHub.
 
 ## Open decisions and blockers
 
@@ -75,7 +75,7 @@ Milestone 8's milestone-wide `/finish-task` review is pending.
 
 ## Next authorized action
 
-1. Report the Milestone 8 milestone-wide `/finish-task` result. Then commit and publish only on explicit instruction.
+1. Commit and publish the public release preparation only on explicit instruction, then confirm the first CI run passes on GitHub.
 2. Then, on the user's decision: a prompt-change spec for F1/F2, or the optional Milestone 9.
 
 ## Canonical documents
