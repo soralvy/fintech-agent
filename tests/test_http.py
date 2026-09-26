@@ -314,6 +314,37 @@ def test_database_outage_is_503_without_driver_details(offline: OfflineApp) -> N
     assert offline.embedder.calls == []
 
 
+def test_http_events_share_one_id_with_ingestion_events(
+    offline: OfflineApp, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    response = offline.client.post(
+        URL, files={"file": ("a.txt", b"Revenue grew.", "text/plain")}
+    )
+
+    assert response.status_code == 503
+    logged = events(caplog)
+    assert [event["event"] for event in logged] == [
+        "http.request.started",
+        "ingestion.started",
+        "ingestion.failed",
+        "http.request.completed",
+    ]
+    (request_id,) = {event["request_id"] for event in logged}
+    assert len(request_id) == 32 and int(request_id, 16) >= 0
+    started, completed = logged[0], logged[-1]
+    assert started == {
+        "event": "http.request.started",
+        "request_id": request_id,
+        "method": "POST",
+        "path": URL,
+    }
+    assert completed["status_code"] == 503
+    assert logged[2]["error_code"] == "database_unavailable"
+    assert_logs_hold_none_of(caplog, "hunter2", "db.internal")
+
+
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
@@ -1063,8 +1094,81 @@ async def test_middleware_after_the_response_started_sends_nothing_more(
     assert_logs_hold_none_of(caplog, "secret-detail")
 
 
+async def _returns_204(scope: Scope, receive: Receive, send: ASGISend) -> None:
+    await send({"type": "http.response.start", "status": 204, "headers": []})
+    await send({"type": "http.response.body", "body": b""})
+
+
+async def _raises_before_start(scope: Scope, receive: Receive, send: ASGISend) -> None:
+    raise RuntimeError("secret-detail")
+
+
+async def _raises_after_start(scope: Scope, receive: Receive, send: ASGISend) -> None:
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    raise RuntimeError("secret-detail")
+
+
+async def _returns_controlled_503(
+    scope: Scope, receive: Receive, send: ASGISend
+) -> None:
+    await send({"type": "http.response.start", "status": 503, "headers": []})
+    await send({"type": "http.response.body", "body": b"{}"})
+
+
 @pytest.mark.anyio
-async def test_middleware_lets_cancellation_propagate_and_logs_nothing(
+@pytest.mark.parametrize(
+    ("inner", "terminal", "status_code", "level"),
+    [
+        (_returns_204, "http.request.completed", 204, "INFO"),
+        (_raises_before_start, "http.request.failed", 500, "ERROR"),
+        (_raises_after_start, "http.request.failed", 500, "ERROR"),
+        (_returns_controlled_503, "http.request.completed", 503, "WARNING"),
+    ],
+    ids=["success", "failure-before-start", "failure-after-start", "controlled-503"],
+)
+async def test_middleware_emits_one_terminal_event_per_request(
+    inner: Callable[[Scope, Receive, ASGISend], Any],
+    terminal: str,
+    status_code: int,
+    level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    async def send(message: Message) -> None:
+        return None
+
+    await UnexpectedErrorMiddleware(inner)(_http_scope(), _receive, send)
+
+    app_records = [r for r in caplog.records if r.name.startswith("app")]
+    logged = events(caplog)
+    assert [event["event"] for event in logged] == ["http.request.started", terminal]
+    (request_id,) = {event["request_id"] for event in logged}
+    assert len(request_id) == 32
+    assert logged[0] == {
+        "event": "http.request.started",
+        "request_id": request_id,
+        "method": "GET",
+        "path": None,
+    }
+    assert app_records[0].levelname == "INFO"
+    assert logged[1]["status_code"] == status_code
+    assert app_records[1].levelname == level
+    if terminal == "http.request.completed":
+        assert set(logged[1]) == {
+            "event",
+            "request_id",
+            "method",
+            "path",
+            "status_code",
+            "duration_ms",
+        }
+        assert type(logged[1]["duration_ms"]) is int
+    assert_logs_hold_none_of(caplog, "secret-detail")
+
+
+@pytest.mark.anyio
+async def test_middleware_lets_cancellation_propagate_and_logs_no_terminal_event(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.DEBUG)
@@ -1078,7 +1182,7 @@ async def test_middleware_lets_cancellation_propagate_and_logs_nothing(
     with pytest.raises(asyncio.CancelledError):
         await UnexpectedErrorMiddleware(cancelled)(_http_scope(), _receive, send)
 
-    assert events(caplog) == []
+    assert [event["event"] for event in events(caplog)] == ["http.request.started"]
 
 
 @pytest.mark.anyio

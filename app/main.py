@@ -5,10 +5,13 @@ handlers stay thin (docs/DECISIONS.md section 3.1). Every error leaves in the
 SPEC section 12.1 envelope with a fixed message, and an unexpected exception
 is turned into the ``500`` envelope by ``UnexpectedErrorMiddleware`` instead
 of reaching the server's own error logging (docs/DECISIONS.md section 13).
+The middleware also owns the one request ID of each HTTP request and logs its
+``http.request.*`` lifecycle events (docs/DECISIONS.md section 19).
 """
 
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Annotated, Any, Literal, TextIO
@@ -43,7 +46,12 @@ from app.errors import (
 )
 from app.graph import QueryGraph, QueryResult, build_query_graph, run_query
 from app.ingestion import Ingestor
-from app.logging import bind_request_id, configure_logging, log_event
+from app.logging import (
+    bind_request_id,
+    configure_logging,
+    current_request_id,
+    log_event,
+)
 from app.mcp_client import (
     MarketDataTools,
     open_market_data_tools,
@@ -75,6 +83,13 @@ REQUEST_INVALID_MESSAGE = "The request is malformed or failed validation."
 # Allowance for multipart boundaries and part headers on top of the file itself
 # when rejecting an oversized upload from its Content-Length alone.
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
+
+# The only paths and methods an ``http.request.*`` event names; any other value
+# is logged as ``null``, so arbitrary request text never reaches a log.
+_LOGGED_PATHS = frozenset({"/health", "/v1/documents", "/v1/query"})
+_LOGGED_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+)
 
 
 def _open_devnull() -> TextIO:
@@ -212,9 +227,16 @@ class UnexpectedErrorMiddleware:
     ``ServerErrorMiddleware`` and outside ``ExceptionMiddleware``: errors with
     a registered handler never reach it, and an ``Exception`` it catches never
     reaches the server, which would otherwise log its message and traceback.
-    It logs one ``http.request.failed`` event with only bounded fields and
-    never re-raises. Non-HTTP scopes, such as ``lifespan``, pass through, and
-    a ``BaseException`` that is not an ``Exception`` propagates unchanged.
+
+    It is the only place a request ID is created. Every request logs one
+    ``http.request.started``, then ``http.request.completed`` with the status
+    the application sent -- including a handled error, whose code stays on the
+    owning domain event -- or, when an ``Exception`` escapes,
+    ``http.request.failed``, without re-raising. The events carry only bounded
+    fields: the method and path when they are on the allow-lists, never the
+    query string, headers, or body. Non-HTTP scopes, such as ``lifespan``,
+    pass through, and a ``BaseException`` that is not an ``Exception``
+    propagates with no terminal event.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -226,14 +248,20 @@ class UnexpectedErrorMiddleware:
             return
 
         response_started = False
+        status_code: int | None = None
 
         async def tracking_send(message: Message) -> None:
-            nonlocal response_started
+            nonlocal response_started, status_code
             if message["type"] == "http.response.start":
                 response_started = True
+                status_code = message["status"]
             await send(message)
 
+        method = _logged_method(scope)
+        path = _logged_path(scope)
         with bind_request_id(uuid4().hex):
+            log_event(logger, "http.request.started", method=method, path=path)
+            started_at = time.monotonic()
             try:
                 await self.app(scope, receive, tracking_send)
             # A blind catch is the point: D24 requires every Exception to end
@@ -256,6 +284,33 @@ class UnexpectedErrorMiddleware:
                     AppError.message,
                 )
                 await response(scope, receive, send)
+            else:
+                log_event(
+                    logger,
+                    "http.request.completed",
+                    level=(
+                        logging.WARNING
+                        if status_code is not None
+                        and status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR
+                        else logging.INFO
+                    ),
+                    method=method,
+                    path=path,
+                    status_code=status_code,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                )
+
+
+def _logged_method(scope: Scope) -> str | None:
+    """The request method, or ``None`` when it is not a standard one."""
+    method = scope.get("method")
+    return method if method in _LOGGED_METHODS else None
+
+
+def _logged_path(scope: Scope) -> str | None:
+    """The request path, or ``None`` unless it is one of the documented routes."""
+    path = scope.get("path")
+    return path if path in _LOGGED_PATHS else None
 
 
 app = FastAPI(title="FinTech Research Agent", lifespan=lifespan)
@@ -301,6 +356,18 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException) -> R
             REQUEST_INVALID_MESSAGE,
         )
     return await http_exception_handler(request, exc)
+
+
+def _bound_request_id() -> str:
+    """The ID ``UnexpectedErrorMiddleware`` bound for this request.
+
+    Ingestion reuses it, so one request never carries two IDs. Every HTTP
+    request passes through the middleware, so a missing ID is a wiring error.
+    """
+    request_id = current_request_id()
+    if request_id is None:
+        raise RuntimeError("no request ID is bound")
+    return request_id
 
 
 def get_pool(request: Request) -> Pool:
@@ -404,7 +471,7 @@ async def ingest_document(
         uploads = form.getlist("file")
         if len(uploads) != 1 or not isinstance(uploads[0], UploadFile):
             raise InvalidRequestError
-        result = await ingestor.ingest(uploads[0], request_id=uuid4().hex)
+        result = await ingestor.ingest(uploads[0], request_id=_bound_request_id())
     finally:
         await form.close()
 
