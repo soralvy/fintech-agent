@@ -645,6 +645,23 @@ Stage E gate, after these records (2026-09-26):
 
 ---
 
+# Public release preparation (2026-09-26)
+
+A repository-hygiene change after Milestone 8, not a milestone. No application, test, dependency, prompt, or migration change. F1 and F2 stay open.
+
+- **Audit.** No real secret in any tracked file or in any of the 61 reachable commits (240 unique blobs). Every secret-shaped match is a test or smoke placeholder. No `.env`, database, log, PDF, or provider response was ever tracked. `.claude/settings.json` holds only the local `TEST_DATABASE_URL` (no credential) and ask/deny rules. The only absolute paths are fake `/Users/someone/...` test inputs.
+- **Files.** `README.md` rewritten from the current code and records. `SECURITY.md` added. `.github/workflows/ci.yml` added: pull requests and pushes to `main`, Python 3.12, uv 0.12.15, service `pgvector/pgvector:0.8.6-pg18-bookworm` with trust auth and no secret, `uv sync --locked`, the migration through `psql`, then `scripts/verify.py` with every provider and tracing variable unset. Actions are pinned to commit SHAs. `LICENSE` (MIT) and `.env.example` were already present and unchanged.
+- **Smoke PDF provenance.** The official URL recorded in the README was identified by a `HEAD` request only: its `content-length` is 3,147,962 bytes, equal to the smoke file's size. The PDF was not downloaded, so its SHA-256 was not recomputed against that URL.
+- **Gate.** `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY -u MCP_TOOL_TIMEOUT_SECONDS -u DATABASE_URL UV_OFFLINE=1 TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py` gave `verify: PASSED: all 5 steps; 1186 tests, 0 skipped`. `git diff --check` passed. `actionlint` (run once through `uvx`, not a project dependency) reported 0 errors.
+- **Clean clone.** A `git clone` of the local repository with the uncommitted files overlaid, and no `.env` copied:
+  - `uv sync --locked` succeeded;
+  - a fresh `fintech_release_test` database, migrated twice with `psql -v ON_ERROR_STOP=1`, then the CI gate command: `PASSED: all 5 steps; 1186 tests, 0 skipped`;
+  - the README server command, with a `.env` built from `.env.example`, a dummy OpenAI key, and closed proxies: `GET /health` `200 {"status":"ok","database":"ok"}`, `mcp.startup` `not_configured`, an unknown path `404 not_found`, a `.exe` upload `415 unsupported_file_type`, and a non-boolean `use_tools` `422 invalid_request`;
+  - the server log held 0 copies of the dummy key and 0 `postgresql://`. Both temporary databases were dropped.
+- **Not verified.** The workflow has not run on GitHub. No OpenAI or Alpha Vantage call was made.
+
+---
+
 # Stop criteria
 
 Do not add new features once all acceptance criteria in `docs/SPEC.md` pass.
