@@ -339,6 +339,17 @@ The endpoint SHOULD verify a lightweight database query.
 
 It does not need to verify OpenAI or Alpha Vantage availability.
 
+*Amended 2026-09-25 (Milestone 7 Stage 0; `docs/changes/M7-http-error-security-hardening.md` D1).* Response `503` when the database query fails, in the §12.1 envelope:
+
+```json
+{
+  "error": {
+    "code": "database_unavailable",
+    "message": "The database is unavailable."
+  }
+}
+```
+
 ---
 
 ## 6.2 Ingest document
@@ -888,6 +899,8 @@ Example:
   }
 }
 ```
+
+*Amended 2026-09-25 (Milestone 7 Stage 0; `docs/changes/M7-http-error-security-hardening.md` D2).* Framework `404` and `405` responses use the same envelope: an unknown path is `404` `not_found`, and a wrong method on an existing path is `405` `method_not_allowed`, keeping its `Allow` header. Their messages are fixed and never include the path, the method, or the framework's detail text.
 
 ## 12.2 Insufficient research context
 

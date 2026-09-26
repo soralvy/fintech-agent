@@ -327,7 +327,7 @@ Deferred beyond Milestone 4, or out of its scope (*recorded 2026-09-23*):
 
 - **Milestones 5–6:** `decide_tool`, `call_tool`, `route_tools`, the tool state fields, `T1` labels, MCP citations, non-empty `tools_used`, MCP settings, and `contextlib.AsyncExitStack` in the lifespan. `use_tools=true` is accepted in Milestone 4 but follows the document path with no MCP call (§13). *(Split 2026-09-24, see the Milestone 5 entry below: Milestone 5 owns `MarketDataConfig`, the MCP server, and the standalone client. Milestone 6 owns everything else in this item, including FastAPI lifespan wiring and `contextlib.AsyncExitStack`.)*
 - **Milestone 6, flagged and not resolved here:** for MCP citations, `docs/SPEC.md` §6.3 shows an `excerpt` field, while §15 below specifies `fields`. *(Resolved 2026-09-25 by the Milestone 6 spec, D13: `fields`. `docs/SPEC.md` §6.3 is amended.)*
-- **Milestone 7:** `http.request.started` and `http.request.completed`; `http.request.failed` for failures other than unexpected exceptions; the `/health` error envelope (it keeps `{"detail": ...}`); unifying `Ingestor.ingest`'s own request-ID binding with the middleware's; and the hardening checklist.
+- **Milestone 7:** `http.request.started` and `http.request.completed`; `http.request.failed` for failures other than unexpected exceptions; the `/health` error envelope (it keeps `{"detail": ...}`); unifying `Ingestor.ingest`'s own request-ID binding with the middleware's; and the hardening checklist. *(Resolved 2026-09-25 by the Milestone 7 spec, `docs/changes/M7-http-error-security-hardening.md`: `started`/`completed`, see §19 (D5, D6); `http.request.failed` for other failures is superseded, see §19 (C8, R15); the `/health` envelope, see §13 (D1); request-ID unification, see the §19 one-ID rule (D4).)*
 - **Milestone 8:** README, real-PDF smoke test, and MCP smoke test.
 - **Not in Milestone 4:** new dependencies, generic LLM or provider frameworks, LangChain abstractions, dependency-injection frameworks, placeholder modules, persistence of queries or answers, a LangGraph checkpointer, and LangSmith tracing. Milestones 9–12 remain post-baseline.
 
@@ -456,7 +456,8 @@ Own:
 Own:
 
 - the `Tokenizer` protocol that chunking depends on;
-- the tiktoken `cl100k_base` adapter, which loads its encoding lazily and turns any load failure into `TokenizerUnavailableError`.
+- the tiktoken `cl100k_base` adapter, which loads its encoding lazily and turns any load failure into `TokenizerUnavailableError`;
+- single-flight loading and the per-instance timeout latch (*amended 2026-09-25, Milestone 7 Stage 0, `docs/changes/M7-http-error-security-hardening.md` D9–D12; §7.5*).
 
 ### `retrieval.py`
 
@@ -868,8 +869,9 @@ Chunks are not guaranteed to end on semantic section boundaries.
 ### Tokenizer and window details (recorded 2026-09-23, Milestone 2)
 
 - **Tokenizer.** The tokenizer is tiktoken `cl100k_base`, the encoding of `text-embedding-3-small` (`docs/TECH_BASELINE.md` §3.15). Chunking depends on a `Tokenizer` protocol (`app/tokenizer.py`), not on tiktoken directly, and tests inject a deterministic fake.
-- **When the encoding loads.** The encoding loads lazily on the first ingestion, never at startup. If it is not cached, tiktoken downloads and hash-verifies it once. A load failure is `503 tokenizer_unavailable`, writes no rows, logs only the exception type, and is retried on the next ingestion.
-- **Load timeout.** tiktoken's own loader has no HTTP timeout, so an unbounded call could stall the event loop and hang every in-flight request, including `/health` (SPEC §13 requires external HTTP timeouts). `TiktokenTokenizer.ensure_ready` runs the load in a worker thread (`asyncio.to_thread`) under a fixed deadline (`asyncio.wait_for`, default 10 seconds), and `Ingestor` awaits it before chunking a non-empty document. A timeout is `503 tokenizer_unavailable`, the same as any other load failure; the worker thread may still be running when the deadline fires, since a Python thread cannot be cancelled, but nothing on the event loop waits for it.
+- **When the encoding loads.** The encoding loads lazily on the first ingestion, never at startup. If it is not cached, tiktoken downloads and hash-verifies it once. A load failure is `503 tokenizer_unavailable`, writes no rows, logs only the exception type, and is retried on the next ingestion, unless it was a deadline timeout (*amended 2026-09-25, Milestone 7 Stage 0; see "Load timeout" below*).
+- **Load timeout.** tiktoken's own loader has no HTTP timeout, so an unbounded call could stall the event loop and hang every in-flight request, including `/health` (SPEC §13 requires external HTTP timeouts). `TiktokenTokenizer.ensure_ready` runs the load in a worker thread (`asyncio.to_thread`) under a fixed deadline (`asyncio.wait_for`, default 10 seconds), and `Ingestor` awaits it before chunking a non-empty document. *(Amended 2026-09-25, Milestone 7 Stage 0, `docs/changes/M7-http-error-security-hardening.md` D11, C7; user decision.)* A timeout is `503 tokenizer_unavailable`. Because its worker thread may still be running when the deadline fires, and a Python thread cannot be cancelled, the timeout latches that tokenizer unavailable for the rest of the process. Later ingestions fail fast with the same `503`, start no thread, and do not log. A load that finishes after the latch is discarded. Recovery requires a restart, which builds a fresh, unlatched instance; the latch is per instance, not module-global. A completed load failure leaves no thread behind, never latches, and is still retried.
+- **Single flight** (*recorded 2026-09-25, Milestone 7 Stage 0, D9, D10, D12*). At most one load is in flight per tokenizer: concurrent first ingestions join one shared load task instead of each starting a thread. Each caller waits for it under its own deadline through `asyncio.shield`, so a waiter's timeout or cancellation never cancels the shared load, and a cancelled waiter does not set the latch. The synchronous fallback used by `encode`/`decode` when `ensure_ready` was not awaited also honors the latch.
 - **Special tokens.** Special-token text such as `<|endoftext|>` is encoded as plain text (`encode_ordinary`), so it cannot make an upload fail.
 - **Multi-byte characters at window edges.** When a window edge falls inside a multi-byte character, the partial character is dropped rather than replaced with U+FFFD. Chunk text therefore stays a verbatim substring of the normalized source, and the overlap carries the character whole into the neighbouring chunk.
 - **Last window.** A page's last window ends exactly at the page's end. Once a window reaches the end, no further window is emitted, because it would lie entirely inside the previous one. For example, 2000 tokens give windows `[0, 800)`, `[680, 1480)`, and `[1360, 2000)`.
@@ -1555,6 +1557,8 @@ Response when successful:
 
 If the database health query fails, return `503`.
 
+*Amended 2026-09-25 (Milestone 7 Stage 0; `docs/changes/M7-http-error-security-hardening.md` D1).* The route does not catch `DatabaseUnavailableError`. It reaches the global `AppError` handler, which answers `503` in the `docs/SPEC.md` §12.1 envelope with `database_unavailable` and the fixed message "The database is unavailable.". The success body is unchanged.
+
 Do not check OpenAI or Alpha Vantage.
 
 ---
@@ -1588,7 +1592,7 @@ No partial database rows remain after failed persistence.
 
 ### Error codes (recorded 2026-09-23, Milestone 2)
 
-Every ingestion failure, including request validation, uses the SPEC §12.1 envelope `{"error": {"code", "message"}}`. Messages are fixed per code (*amended 2026-09-23, Milestone 4: fixed per error class, since `invalid_request` now has three fixed messages; see `POST /v1/query` below*) and never include an exception message, class name, provider body, database detail, key, full checksum, path, or document text. `GET /health` keeps its `{"detail": ...}` shape until Milestone 7.
+Every ingestion failure, including request validation, uses the SPEC §12.1 envelope `{"error": {"code", "message"}}`. Messages are fixed per code (*amended 2026-09-23, Milestone 4: fixed per error class, since `invalid_request` now has three fixed messages; see `POST /v1/query` below*) and never include an exception message, class name, provider body, database detail, key, full checksum, path, or document text. `GET /health` uses the same envelope for its `503` (*amended 2026-09-25, Milestone 7 Stage 0; see `GET /health` above*).
 
 | Status | `code` | Cause |
 |---|---|---|
@@ -1678,6 +1682,9 @@ All errors use the `docs/SPEC.md` §12.1 envelope with a fixed message. No respo
 | Query embedding failure | 502 | `embedding_provider_error` | existing |
 | Answer-model failure (§12), `AnswerProviderError` | 502 | `answer_provider_error` | "The answer model is unavailable or returned an invalid response." |
 | Retrieval database failure | 503 | `database_unavailable` | existing |
+| `GET /health` database failure (*added 2026-09-25, Milestone 7 Stage 0, D1*) | 503 | `database_unavailable` | "The database is unavailable." |
+| Framework `404`, unknown path (*added 2026-09-25, Milestone 7 Stage 0, D2*) | 404 | `not_found` | "The requested resource does not exist." |
+| Framework `405`, wrong method on an existing path, keeping its `Allow` header (*added 2026-09-25, Milestone 7 Stage 0, D2*) | 405 | `method_not_allowed` | "The request method is not allowed for this resource." |
 | Any other `Exception`, on any route (`UnexpectedErrorMiddleware`) | 500 | `internal_error` | the `AppError` default, "The request could not be completed." |
 
 **One global `RequestValidationError` handler.** It applies to every route and uses the generic message above; a query-specific message was rejected because the handler is global. `/v1/documents` is unaffected: it declares no FastAPI-validated parameters and reports multipart problems itself through `InvalidRequestError`.
@@ -1685,16 +1692,17 @@ All errors use the `docs/SPEC.md` §12.1 envelope with a fixed message. No respo
 **One global `StarletteHTTPException` handler.** Verified against FastAPI 0.141.1 (`fastapi/routing.py`) and a scratch `TestClient` call on 2026-09-23: for a route with a declared body field, FastAPI calls `await request.json()` itself. A `json.JSONDecodeError` there becomes `RequestValidationError`, but any other exception, including the `UnicodeDecodeError` that `json.loads` raises on a non-UTF-8 body, falls into a bare `except Exception` and is re-raised as `HTTPException(400, "There was an error parsing the body")`. Without a handler, that answers `400 {"detail": "There was an error parsing the body"}`, outside the SPEC envelope; `POST` with `content=b'{"question":"\xff"}'` and `Content-Type: application/json` reproduced it. The handler therefore:
 
 - maps status `400` to the same generic `invalid_request` row as `RequestValidationError`, since both mean FastAPI could not build a valid request;
-- delegates every other status to `fastapi.exception_handlers.http_exception_handler`, so the `{"detail": ...}` shape is unchanged for every other `HTTPException`, including `/health`'s `503` (kept until Milestone 7) and framework `404`/`405` responses. `/v1/documents` catches `StarletteHTTPException` inside its own route body and never lets one reach this handler.
+- maps status `404` to `not_found` and status `405` to `method_not_allowed`, each with its fixed message from the table above; a `405` keeps `exc.headers`, which carry `Allow`. No message contains the path, the method, or `exc.detail`. The codes and messages are module constants in `main.py`, not `AppError` subclasses, because the router raises them (*amended 2026-09-25, Milestone 7 Stage 0, `docs/changes/M7-http-error-security-hardening.md` D2*);
+- delegates every other status to `fastapi.exception_handlers.http_exception_handler`, so the `{"detail": ...}` shape is unchanged for any other `HTTPException`. No route raises one, since `/health` no longer does; the branch stays so that an unforeseen framework status is never mislabelled (*amended 2026-09-25, Milestone 7 Stage 0, D1, D3*). `/v1/documents` catches `StarletteHTTPException` inside its own route body and never lets one reach this handler.
 
 **Unexpected exceptions: `UnexpectedErrorMiddleware`, not an `Exception` handler.** Verified against FastAPI 0.141.1 and Starlette 1.6.0 on 2026-09-23: `FastAPI.build_middleware_stack` orders the stack as `ServerErrorMiddleware`, user middleware, `ExceptionMiddleware`, `AsyncExitStackMiddleware`. Handlers for specific classes (`AppError`, `RequestValidationError`, `StarletteHTTPException`) run in `ExceptionMiddleware`. A handler registered for `Exception` or `500` instead becomes `ServerErrorMiddleware`'s handler, which sends its response and then **always re-raises** (`starlette/middleware/errors.py`), so Uvicorn logs the traceback and `str(exc)`. That would leak the question, prompt, chunk text, model output, or secrets carried in an exception message, so no `Exception` or `500` handler is registered.
 
 Instead `main.py` defines `UnexpectedErrorMiddleware`, a small pure ASGI middleware added once with `app.add_middleware`, which places it inside `ServerErrorMiddleware` and outside `ExceptionMiddleware`:
 
 - **Scope.** Non-HTTP scopes, including `lifespan`, pass through untouched, so a startup `ConfigError` still stops the application.
-- **Request ID.** For each HTTP request it generates `uuid4().hex` and binds it with `bind_request_id` around the downstream call, so every event of the request carries it (§19).
+- **Request ID.** For each HTTP request it generates `uuid4().hex` and binds it with `bind_request_id` around the downstream call, so every event of the request carries it (§19). *(Amended 2026-09-25, Milestone 7 Stage 0, D4: it is the only place a request ID is created. `POST /v1/documents` passes the bound ID to `Ingestor.ingest`, through a private `main.py` helper that raises `RuntimeError`, and so becomes the `500` envelope, if none is bound.)*
 - **What it catches.** Only an `Exception` escaping the downstream application. Errors with a registered handler never reach it. A `BaseException` that is not an `Exception` (`asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit`) propagates unchanged.
-- **One safe event.** It logs exactly one `http.request.failed` at `ERROR`, with only `request_id`, `status_code=500`, `error_code="internal_error"`, and `error_type` (§19). It never calls `logger.exception`, never passes `exc_info`, and never logs `str(exc)`, `repr(exc)`, traceback text, or provider output.
+- **Lifecycle events** (*amended 2026-09-25, Milestone 7 Stage 0, D5–D7; this replaces the Milestone 4 "one safe event" rule*). Inside its `bind_request_id` block it logs `http.request.started` before calling the downstream application. When the downstream application returns normally, it logs `http.request.completed`, with the status code taken from the `http.response.start` message (`null` if none was sent); a controlled `4xx` or `5xx` from a registered handler ends here. When an `Exception` escapes, it logs exactly one `http.request.failed` at `ERROR`, with only `request_id`, `status_code=500`, `error_code="internal_error"`, and `error_type`, and no `completed`. On `asyncio.CancelledError` or another `BaseException`, only `started` is logged and no terminal event. Each request therefore has exactly one `started` and at most one of `completed` or `failed`. The fields and levels are in §19; `completed` carries no `error_code`, since the middleware sees only the status line and the owning domain event already carries the code under the same request ID. It never calls `logger.exception`, never passes `exc_info`, and never logs `str(exc)`, `repr(exc)`, traceback text, or provider output.
 - **Response.** If no `http.response.start` has been sent, it sends the fixed `internal_error` envelope with status `500`. If a response has already started, it sends nothing more and returns. No Milestone 4 route streams, so that branch exists only to keep the no-re-raise guarantee.
 - **No re-raise**, in either branch.
 
@@ -2079,7 +2087,7 @@ Do not introduce an observability platform.
 
 Every request receives a correlation/request ID.
 
-*Implemented 2026-09-23 (Milestone 3):* the request ID lives in a `ContextVar` in `app/logging.py`. `bind_request_id(request_id)` is a context manager that keeps the token from `set` and resets it in `finally`, so the ID is restored on every exit, including an exception, and never leaks into a later operation. Each asyncio task runs in a copy of the context, so concurrent requests keep their own IDs. `log_event` adds the bound ID to every event unless the caller passes `request_id` explicitly. `Ingestor.ingest` binds it for the whole call. `Retriever` takes no request ID; its caller binds one. *(Amended 2026-09-23, Milestone 4: the caller is `UnexpectedErrorMiddleware`, which binds a fresh `uuid4().hex` for every HTTP request around the whole downstream call, not the `POST /v1/query` route; §13. `Ingestor.ingest` still binds its own ID for its `ingestion.*` events until Milestone 7 unifies the two.)*
+*Implemented 2026-09-23 (Milestone 3):* the request ID lives in a `ContextVar` in `app/logging.py`. `bind_request_id(request_id)` is a context manager that keeps the token from `set` and resets it in `finally`, so the ID is restored on every exit, including an exception, and never leaks into a later operation. Each asyncio task runs in a copy of the context, so concurrent requests keep their own IDs. `log_event` adds the bound ID to every event unless the caller passes `request_id` explicitly. `Ingestor.ingest` binds it for the whole call. `Retriever` takes no request ID; its caller binds one. *(Amended 2026-09-23, Milestone 4: the caller is `UnexpectedErrorMiddleware`, which binds a fresh `uuid4().hex` for every HTTP request around the whole downstream call, not the `POST /v1/query` route; §13.)* *(Amended 2026-09-25, Milestone 7 Stage 0, `docs/changes/M7-http-error-security-hardening.md` D4: **one ID per HTTP request.** `UnexpectedErrorMiddleware` is the only place a request ID is created. `POST /v1/documents` passes the bound ID to `Ingestor.ingest`, which re-binds that same value, so the `http.*`, `ingestion.*`, `embedding.*`, and `tokenizer.*` events of an upload share one ID. The ID is never returned to the client.)*
 
 Log only metadata necessary to diagnose flow.
 
@@ -2105,6 +2113,22 @@ error_code
 ```
 
 Do not log request bodies by default.
+
+*Recorded 2026-09-25 (Milestone 7 Stage 0; `docs/changes/M7-http-error-security-hardening.md` D5–D7, C8).* `UnexpectedErrorMiddleware` emits the three events (§13):
+
+| Event | Level | Fields |
+|---|---|---|
+| `http.request.started` | `INFO` | `method`, `path` |
+| `http.request.completed` | `INFO` if `status_code < 500`, else `WARNING` | `method`, `path`, `status_code`, `duration_ms` |
+| `http.request.failed` | `ERROR` | `status_code` (`500`), `error_code` (`internal_error`), `error_type` (unchanged) |
+
+- **`path`** is the raw path only when it is exactly `/health`, `/v1/documents`, or `/v1/query`; otherwise it is `null`.
+- **`method`** is logged only when it is one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`; otherwise it is `null`.
+- **`duration_ms`** is an integer measured with `time.monotonic()`.
+- **`http.request.completed` carries no `error_code`.** A controlled `4xx` or `5xx` ends in `completed` with its status code; its bounded error code stays on the owning domain event (`ingestion.failed`, `graph.failed`, `retrieval.failed`) under the same request ID. `http.request.failed` is reserved for an `Exception` that escapes the downstream application.
+- **Never logged:** the query string, headers, the body, the client address, the `Allow` value, an unlisted path, or an unlisted method.
+
+**Line format** (*recorded 2026-09-25, Milestone 7 Stage 0, D8*). `configure_logging()` installs a formatter on the `app` handler that renders each `log_event` record as one JSON object with sorted keys: the event's fields, `event`, `level` (the record's level name), and `timestamp` (UTC ISO 8601 with milliseconds and a `Z` suffix, from `record.created`), plus `request_id` when bound. The formatter's keys win over a field of the same name. A record without an event renders its plain message. `log_event` and `record.getMessage()` are unchanged, so no new content can enter a log.
 
 ### Ingestion
 
@@ -2169,6 +2193,8 @@ tokenizer.load_failed       encoding, error_type
 ```
 
 Never the exception message or the provider body.
+
+*Amended 2026-09-25 (Milestone 7 Stage 0; `docs/changes/M7-http-error-security-hardening.md` D11).* For a deadline timeout, `tokenizer.load_failed` (`error_type="TimeoutError"`) is logged once, at the transition that latches the tokenizer unavailable, and never by a later fail-fast call. A completed load failure is still logged once by each caller that waited on it.
 
 ### Graph
 
@@ -2274,7 +2300,7 @@ Every event below carries the `request_id` bound by `UnexpectedErrorMiddleware` 
 | `http.request.failed` | `status_code` (`500`), `error_code` (`internal_error`), `error_type`† |
 
 - A wrapper applied in `build_query_graph` emits `graph.node.started` and `graph.node.completed` for every node. When a node raises, it emits `graph.failed` once and re-raises. Its `error_code` is the `AppError` code, or `internal_error` for any other exception. `run_query` emits `graph.started` and `graph.completed`.
-- **`http.request.failed` is emitted early, in Milestone 4, for unexpected exceptions only**, by `UnexpectedErrorMiddleware`. `http.request.started`, `http.request.completed`, and `http.request.failed` for other failures remain Milestone 7 work.
+- **`http.request.failed` is emitted early, in Milestone 4, for unexpected exceptions only**, by `UnexpectedErrorMiddleware`. *(Amended 2026-09-25, Milestone 7 Stage 0, `docs/changes/M7-http-error-security-hardening.md` C8, R15, D5, D7; user decision.)* `http.request.failed` stays reserved for an `Exception` that escapes the downstream application. A controlled `4xx` or `5xx` ends in `http.request.completed` with its status code, and its error code stays on the owning domain event under the same request ID (see "HTTP" above).
 - **`error_type` in `graph.failed` and `http.request.failed`** is `app.errors.classify_error(exc)`, a closed `ErrorType` literal: `app_error` for an `AppError` (only `graph.failed` can see one), `validation_error` for a `pydantic.ValidationError`, and `unexpected_error` for any other `Exception`. It is never built from `str(exc)`, `repr(exc)`, the exception's class name, traceback text, or provider output. `generation.request_failed` keeps its adapter-owned `error_type`, as `embedding.request_failed` does.
 - **Returned-ID sanitization.** `returned_id` is logged verbatim only when it matches `^[A-Za-z][0-9]{1,4}$`. Otherwise the event logs `returned_id: null` and `malformed: true`, so a model cannot inject arbitrary text into a log through a citation ID.
 
@@ -2642,7 +2668,8 @@ The MVP deliberately accepts:
 - provider-dependent quote freshness;
 - no conversational follow-up state;
 - no hostile-file sandboxing claim;
-- no calibrated confidence score.
+- no calibrated confidence score;
+- after a tokenizer load timeout, new-document ingestion answers `503 tokenizer_unavailable` until the application restarts. `/health`, `/v1/query`, and duplicate uploads are unaffected. The mitigation is a warm `TIKTOKEN_CACHE_DIR` (*recorded 2026-09-25, Milestone 7 Stage 0, `docs/changes/M7-http-error-security-hardening.md` D11, C7*).
 
 These limitations are consistent with the intended 12–16 hour portfolio scope.
 
