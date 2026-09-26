@@ -20,6 +20,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from typing import TextIO
 
 type EventField = str | int | float | bool | None
@@ -76,15 +77,44 @@ class _EventHandler(logging.StreamHandler[TextIO]):
     """Marker type so ``configure_logging`` attaches its handler only once."""
 
 
+class _EventFormatter(logging.Formatter):
+    """Render an event line with its ``level`` and a UTC ``timestamp``.
+
+    The line is rebuilt from the ``event`` and ``event_fields`` attributes that
+    ``log_event`` attaches, so ``record.getMessage()`` -- which caplog-based
+    tests read -- is untouched and no new content can enter a line. The
+    formatter's keys win over a field of the same name. A record that did not
+    come from ``log_event`` renders as its plain message.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("%(message)s")
+
+    def format(self, record: logging.LogRecord) -> str:
+        event = getattr(record, "event", None)
+        fields = getattr(record, "event_fields", None)
+        if not isinstance(event, str) or not isinstance(fields, dict):
+            return super().format(record)
+        created = datetime.fromtimestamp(record.created, tz=UTC)
+        timestamp = created.isoformat(timespec="milliseconds").removesuffix("+00:00")
+        line = {
+            **fields,
+            "event": event,
+            "level": record.levelname,
+            "timestamp": f"{timestamp}Z",
+        }
+        return json.dumps(line, sort_keys=True, ensure_ascii=False)
+
+
 def configure_logging() -> None:
     """Make ``app.*`` INFO events visible when run under uvicorn.
 
-    Idempotent: the handler is attached once. The record message is already
-    JSON, so the formatter adds nothing to it.
+    Idempotent: the handler is attached once. Each line is the event's JSON
+    plus ``level`` and ``timestamp`` (``_EventFormatter``).
     """
     logger = logging.getLogger(APP_LOGGER_NAME)
     logger.setLevel(logging.INFO)
     if not any(isinstance(h, _EventHandler) for h in logger.handlers):
         handler = _EventHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.setFormatter(_EventFormatter())
         logger.addHandler(handler)
