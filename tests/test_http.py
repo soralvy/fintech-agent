@@ -894,14 +894,25 @@ def test_the_http_exception_handler_keeps_other_statuses_unchanged() -> None:
 
 
 @pytest.mark.parametrize(
-    ("method", "target", "status_code", "allow", "logged_path"),
+    ("method", "target", "status_code", "allow", "logged_method", "logged_path"),
     [
         pytest.param(
-            "GET", f"/no-such-route?x={SENTINEL}", 404, None, None, id="unknown-path"
+            "GET",
+            f"/no-such-route?x={SENTINEL}",
+            404,
+            None,
+            "GET",
+            None,
+            id="unknown-path",
         ),
-        pytest.param("GET", QUERY_URL, 405, "POST", QUERY_URL, id="get-query"),
-        pytest.param("GET", URL, 405, "POST", URL, id="get-documents"),
-        pytest.param("POST", "/health", 405, "GET", "/health", id="post-health"),
+        pytest.param("GET", QUERY_URL, 405, "POST", "GET", QUERY_URL, id="get-query"),
+        pytest.param("GET", URL, 405, "POST", "GET", URL, id="get-documents"),
+        pytest.param(
+            "POST", "/health", 405, "GET", "POST", "/health", id="post-health"
+        ),
+        pytest.param(
+            "PROPFIND", "/health", 405, "GET", None, "/health", id="unlisted-method"
+        ),
     ],
 )
 def test_unknown_paths_and_wrong_methods_use_the_envelope(
@@ -910,6 +921,7 @@ def test_unknown_paths_and_wrong_methods_use_the_envelope(
     target: str,
     status_code: int,
     allow: str | None,
+    logged_method: str | None,
     logged_path: str | None,
 ) -> None:
     caplog.set_level(logging.DEBUG)
@@ -935,7 +947,7 @@ def test_unknown_paths_and_wrong_methods_use_the_envelope(
         "http.request.completed",
     ]
     started, completed = logged
-    assert started["method"] == completed["method"] == method
+    assert started["method"] == completed["method"] == logged_method
     assert started["path"] == completed["path"] == logged_path
     assert completed["status_code"] == status_code
     assert SENTINEL not in response.text

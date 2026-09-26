@@ -2,10 +2,11 @@
 
 ## 1. Status
 
-- **Status:** Draft, revision 5 (2026-09-25). Revision 2 applied the P2 findings of the first independent review. That review raised no P0 or P1 findings, and its P3 findings are not applied yet. Revision 3 records the user's approval of D11, in the exact scope the user gave (the timeout latch). Revision 4 applies the P2 finding of the second independent review: it records the user's approval of the D5/D7 lifecycle as C8 and R15, and extends Stage 0 to amend the superseded DECISIONS §4 and §19 statements. That review's P3 findings are not applied. Revision 5 applies the P2 finding of the third independent review: T11 gains a controlled-`503` case (`completed` at `WARNING`, no `failed`), and AC5 cites it and T8. Its P3 findings are not applied. With that fix, the third review's verdict is **CLEAN**: no P0–P2 finding remains. Not yet approved as a whole. No implementation has started.
+- **Status:** Implemented and verified (2026-09-26), revision 6. Built in the §15 order, one commit per stage: Stage 0 `de5f543`, Stage A `76e3d15`, Stage B `65bea26`, Stage C `be1ffc9`, Stage D `c210e27`, and Stage E (the §16 gate and boundary checks, the approved §16.3 smoke, and the §19 records). The evidence is in `docs/TASKS.md` Milestone 7. The observed Stage E gate count was 1185 passed, 0 skipped, and 1186 after the revision 6 test. In the §16.3 smoke, `SMOKE-SENTINEL` appeared once, only in Uvicorn's access-log line, which §6.3 puts out of scope, and in no `app` line.
+- **History:** Draft, revision 5 (2026-09-25). Revision 2 applied the P2 findings of the first independent review. That review raised no P0 or P1 findings, and its P3 findings are not applied yet. Revision 3 records the user's approval of D11, in the exact scope the user gave (the timeout latch). Revision 4 applies the P2 finding of the second independent review: it records the user's approval of the D5/D7 lifecycle as C8 and R15, and extends Stage 0 to amend the superseded DECISIONS §4 and §19 statements. That review's P3 findings are not applied. Revision 5 applies the P2 finding of the third independent review: T11 gains a controlled-`503` case (`completed` at `WARNING`, no `failed`), and AC5 cites it and T8. Its P3 findings are not applied. With that fix, the third review's verdict is **CLEAN**: no P0–P2 finding remains. At revision 5 (pre-implementation), the spec was not yet approved as a whole and no implementation had started. Revision 6 (2026-09-26, after implementation) records the Stage E text changes: T9 gains the unlisted `PROPFIND /health` case, AC6 names the unlisted method, and T9 and §16.3 scope the sentinel check to `app` log lines (§6.3). It also applies both P3 findings of the milestone-wide review. `ensure_ready` now stores the encoding when a caller joins a load that finished before its done callback ran, so `encode` never falls back to the inline load (T1a, D9/D12). The spec's own text now matches the implementation.
 - **Milestone:** 7, HTTP/error/security hardening (`docs/TASKS.md` Milestone 7).
 - **Branch:** `feat/milestone-7-hardening`, created by `start-task` from `origin/main` at `8954859`. The working tree was clean when it was created. No fetch was run, so the remote was not re-checked.
-- **Decisions:** `D1`–`D14` (§8) are proposed. `D2`, `D6`, `D7`, and `D11` record the user's answers of 2026-09-25. `R1`–`R15` are the rejected alternatives.
+- **Decisions:** `D1`–`D14` (§8) are implemented and verified. `D2`, `D6`, `D7`, and `D11` record the user's answers of 2026-09-25. `R1`–`R15` are the rejected alternatives.
 - **Baseline:** Milestones 0–6 are a frozen, verified baseline. This spec changes no Milestone 4–6 module (§12.2).
 
 **Precedence.** `docs/SPEC.md` > `docs/DECISIONS.md` > `docs/TECH_BASELINE.md` > `docs/TASKS.md` (`CLAUDE.md`). This spec refines those documents and does not override them. Where it extends one, Stage 0 (§15) amends the canonical text before any code is written, as Milestones 4–6 did.
@@ -192,7 +193,7 @@ json.dumps({**event_fields, "event": event, "level": record.levelname,
 3. **Start or join.** Creates `_load_task` if none is in flight. Otherwise it joins the existing one.
 4. **Wait.** Awaits `asyncio.wait_for(asyncio.shield(task), self._timeout_seconds)`, then applies D10 to the outcome.
 
-A task done-callback owns the task's state transitions. On any outcome it clears `_load_task` if it is still that task. Then:
+A task done-callback owns the task's state transitions, apart from the success store in D10. On any outcome it clears `_load_task` if it is still that task. Then:
 
 - **Cancelled** (`task.cancelled()`, which happens only when the event loop shuts down with a load in flight): nothing else. It never calls `task.exception()`, which would raise `CancelledError` inside the callback.
 - **Failed:** it calls `task.exception()`, so asyncio never reports "Task exception was never retrieved".
@@ -201,7 +202,7 @@ A task done-callback owns the task's state transitions. On any outcome it clears
 **D10 — Failure semantics per caller.** After step 4, a caller handles its outcome in this order:
 
 - **Latched meanwhile.** If `_unavailable` became set while this caller waited (another waiter's deadline expired first), the caller raises `TokenizerUnavailableError` from `None` and logs nothing, whatever its own wait returned.
-- **Success.** Returns.
+- **Success.** Stores the encoding it read from the shared task, then returns. The store is idempotent with the done-callback's. It covers a caller that joins a load which finished before the callback ran, so `encode` never repeats the load inline (revision 6, T1a). Only this path stores: the latch checks run first, with no `await` between them and the store, so a success after the latch is still discarded.
 - **Ordinary completed failure.** The loader raised `OSError`, `ValueError`, or `ImportError`. The caller logs one `tokenizer.load_failed` (`encoding`, `error_type`) under its own request ID, as today, and raises `TokenizerUnavailableError`, unchained. The done-callback has cleared the failed task, and **the latch is not set**, so the next call starts a fresh load. Concurrent waiters on that one failed load each log once. This is bounded by the requests that were already waiting, and it is today's behavior.
 - **This caller's deadline expired.** If the shared task is already done by then, the caller handles it as the success or ordinary failure it completed with. Otherwise it applies the D11 latch.
 - **Any other loader exception** propagates unchanged, as today, and becomes the `500` envelope.
@@ -211,9 +212,9 @@ A task done-callback owns the task's state transitions. On any outcome it clears
 
 - **Transition.** The first caller whose deadline expires with the shared task not done sets `_unavailable = True`. It logs **one** `tokenizer.load_failed` with `error_type="TimeoutError"`, the existing event and fields, and raises `TokenizerUnavailableError`, unchained. That is `503 tokenizer_unavailable` with the existing fixed message. Any other waiter whose deadline also expires raises the same error without logging.
 - **Process lifetime.** The latch is never cleared. Every later `ensure_ready()` fails fast at D9 step 1: the same controlled `503`, no log line, no `get_encoding` call, and no new thread. A load that later succeeds is discarded (D9), and one that later fails is only retrieved.
-- **Recovery.** Recovery requires an application restart. The lifespan builds one `TiktokenTokenizer()` per process (`app/main.py:188`), so a restart gives a fresh, unlatched instance. The latch is per instance, not module-global, and a fresh instance may load again.
+- **Recovery.** Recovery requires an application restart. The lifespan builds one `TiktokenTokenizer()` per process (`app/main.py:209`), so a restart gives a fresh, unlatched instance. The latch is per instance, not module-global, and a fresh instance may load again.
 - **Ordinary failures are the contrast.** A load that completes with a failure leaves no worker thread behind, so it never latches (D10). That is the only difference from today's rule that every failure retries (§15 Stage 0 reconciles `docs/DECISIONS.md` §7.5).
-- **Scope: document ingestion only.** Only `Ingestor` holds the tokenizer (`app/main.py:188`). It awaits `ensure_ready` only for a document whose extraction produced pages, after type validation, the size read, the empty check, the duplicate lookup, and extraction (`app/ingestion.py:384–393`). While latched:
+- **Scope: document ingestion only.** Only `Ingestor` holds the tokenizer (`app/main.py:209`). It awaits `ensure_ready` only for a document whose extraction produced pages, after type validation, the size read, the empty check, the duplicate lookup, and extraction (`app/ingestion.py:384–393`). While latched:
   - every earlier `4xx` is unchanged;
   - a duplicate upload still answers `200 already_ingested`;
   - only a new, parseable document gets the `503`;
@@ -342,6 +343,7 @@ New tests are written at the lowest layer that owns the behavior. The edits list
 | ID | Layer / file | Test | Kind |
 |---|---|---|---|
 | T1 | unit, `test_tokenizer.py` | `test_concurrent_first_calls_share_one_load`: 5 `ensure_ready()` calls started as tasks, with the default timeout and a loader gated on a `threading.Event`. One `await asyncio.sleep(0)` lets every task join before `gate.set()`. The loader runs once and every caller returns. | new |
+| T1a | unit, `test_tokenizer.py` | `test_joining_a_finished_but_unsettled_load_stores_the_encoding`: a second `ensure_ready()` joins a load task that is done but whose done callback has not run yet. It stores the encoding, and `encode` makes no further loader call. Added in revision 6. | new |
 | T2 | unit, `test_tokenizer.py` | `test_a_completed_load_failure_is_retried_by_the_next_call`: the first load raises `OSError`, and every waiter gets `TokenizerUnavailableError`. The latch is not set and `_load_task` is cleared. The second call starts a fresh load and succeeds. The loader is called twice. | new |
 | T3 | unit, `test_tokenizer.py` | `test_a_timed_out_load_latches_and_later_calls_fail_fast`. It uses the **default loader**, with `tiktoken.get_encoding` monkeypatched to a counting stub gated on a `threading.Event`, and a short timeout. Steps: (1) call 1 raises `TokenizerUnavailableError`, and exactly one `tokenizer.load_failed` with `error_type="TimeoutError"` is logged; (2) keep `task = tokenizer._load_task`, which is not done; (3) calls 2 and 3 of `ensure_ready()`, and one `encode()` (D12), each raise `TokenizerUnavailableError` from `None`; (4) the stub was called exactly once, and no further `tokenizer.*` record was logged; (5) `gate.set()`, then `await asyncio.wait({task})`; (6) the late success is discarded: `_encoding` is `None`, a further call still fails fast, and the stub count is still 1. | new |
 | T3a | unit, `test_tokenizer.py` | `test_waiters_on_a_timed_out_load_log_the_transition_once`: two waiters join one gated load under the same short timeout, and both raise `TokenizerUnavailableError`. Exactly one `tokenizer.load_failed` record is logged, and the loader is called once. | new |
@@ -352,7 +354,7 @@ New tests are written at the lowest layer that owns the behavior. The edits list
 | T6 | unit, `test_logging.py` | `test_the_formatter_adds_level_and_utc_timestamp`: a record built with `log_event` and a fixed `record.created` renders with `level`, `timestamp` (`…Z`), the fields, and `request_id`. `getMessage()` is unchanged. | new |
 | T7 | unit, `test_logging.py` | `test_the_formatter_passes_a_plain_record_through` | new |
 | T8 | HTTP, `test_http.py` | `test_http_events_share_one_id_with_ingestion_events` (offline app, a `.txt` upload against the refusing pool): `http.request.started`, `ingestion.started`, `ingestion.failed`, and `http.request.completed(503)` share one 32-hex ID. The pool's `hunter2` never appears. | new |
-| T9 | HTTP, `test_http.py` | `test_unknown_paths_and_wrong_methods_use_the_envelope`, parametrized over `GET /no-such-route?x=<sentinel>` (404) and `GET /v1/query`, `GET /v1/documents`, `POST /health` (405). It checks the envelope, the `Allow` header on a 405, the `started`/`completed` pair with the D6 `path`/`method` rule (404 → `path: null`), and that no log holds the sentinel. **Replaces** `test_an_unknown_route_keeps_the_framework_404`. | new + removal of one superseded test |
+| T9 | HTTP, `test_http.py` | `test_unknown_paths_and_wrong_methods_use_the_envelope`, parametrized over `GET /no-such-route?x=<sentinel>` (404) and `GET /v1/query`, `GET /v1/documents`, `POST /health`, `PROPFIND /health` (405). It checks the envelope, the `Allow` header on a 405, the `started`/`completed` pair with the D6 `path`/`method` rule (404 → `path: null`; the unlisted `PROPFIND` → `method: null`), and that no `app` log line holds the sentinel (the test client's own `httpx` logger records the URL, and §6.3 puts non-`app` loggers out of scope). **Replaces** `test_an_unknown_route_keeps_the_framework_404`. | new + removal of one superseded test |
 | T10 | HTTP, `test_health.py` | edit `test_health_failure_does_not_leak_connection_details` and `test_health_returns_503_within_the_pool_timeout_when_database_is_down` to expect the D1 envelope. The latter also gets the S2 all-logger assertion, in three parts: (1) `caplog.set_level(logging.DEBUG)` before the client starts; (2) a control assertion that at least one `psycopg.pool` record was captured (its INFO "connection requested from …" line is emitted on every connection request); (3) neither `s3cretpw` nor `postgresql://` appears in any record's `getMessage()` or in `caplog.text`. | edit |
 | T11 | ASGI unit, `test_http.py` | `test_middleware_emits_one_terminal_event_per_request`, parametrized over four stub apps. Each case asserts exactly the event sequence below, with one shared 32-hex ID: (a) returns `204` → `[started, completed]`, with `status_code 204` and an integer `duration_ms`; (b) raises before `http.response.start` → `[started, failed]`, no `completed`; (c) raises after `http.response.start` → `[started, failed]`, no `completed`; (d) sends `http.response.start` with `503` and returns, as a controlled error does (C8) → `[started, completed]`, with `status_code 503`, level `WARNING`, and no `failed`. | new |
 | T12 | ASGI unit, `test_http.py` | edit `test_middleware_lets_cancellation_propagate_and_logs_nothing` → rename to `…_and_logs_no_terminal_event`, asserting only `http.request.started` | edit |
@@ -465,7 +467,7 @@ This step is required because the HTTP contract changes (CLAUDE.md). It needs ex
    - Every `app` line has `level` and `timestamp`.
    - Each request has one `started` and one terminal event with the same ID.
    - The `415` upload's `ingestion.started`/`ingestion.failed` carry that same ID.
-   - There are 0 occurrences of both dummy keys, `SMOKE-PW`, `SMOKE-SENTINEL`, `postgresql://`, and `Traceback`.
+   - There are 0 occurrences of both dummy keys, `SMOKE-PW`, `postgresql://`, and `Traceback`, and 0 occurrences of `SMOKE-SENTINEL` in `app` lines. Uvicorn's access log records the request line and is out of scope (§6.3).
 4. **Shutdown:** SIGINT exits 0.
 
 ## 17. Acceptance criteria
@@ -477,9 +479,9 @@ This step is required because the HTTP contract changes (CLAUDE.md). It needs ex
 | AC3 | Every other status, code, and message is unchanged | the existing HTTP suite, unedited except §14 |
 | AC4 | One ID per request across HTTP and ingestion events | T8 |
 | AC5 | `started`, then exactly one terminal event, with no terminal event on cancel | T11 (success, failure before and after the response started, controlled `503` at `WARNING` with no `failed`), T8 (controlled `503` through the app), T12 (cancel) |
-| AC6 | HTTP events never log an unlisted path, the query string, or headers | T9 |
+| AC6 | HTTP events never log an unlisted path, an unlisted method, the query string, or headers | T9 |
 | AC7 | Log lines carry `level` and a UTC `timestamp`, and `getMessage()` is unchanged | T6, T7, the whole caplog suite |
-| AC8 | Concurrent first loads start one loader | T1 |
+| AC8 | Concurrent first loads start one loader | T1, T1a |
 | AC9 | An ordinary completed load failure is retried and never latches | T2, the existing sync retry test |
 | AC10 | A deadline timeout latches this instance: later calls fail fast with the same `503`, make no further `get_encoding` call, and start no thread. A late success is discarded. | T3 |
 | AC11 | Cancellation neither cancels the shared load nor latches (D9/D10) | T4 |
@@ -489,7 +491,7 @@ This step is required because the HTTP contract changes (CLAUDE.md). It needs ex
 | AC15 | Protected files are unchanged | §16.2 `git diff --stat` empty |
 | AC16 | Offline gate and approved smoke pass | §16.1, §16.3 |
 | AC17 | The latch transition is logged once, and fail-fast calls log no `tokenizer.*` event | T3, T3a |
-| AC18 | A fresh instance can load again, and the latch affects ingestion only | T3b; the §16.2 `TiktokenTokenizer` grep; D11 scope (`app/main.py:188`, `app/ingestion.py:384–393`) |
+| AC18 | A fresh instance can load again, and the latch affects ingestion only | T3b; the §16.2 `TiktokenTokenizer` grep; D11 scope (`app/main.py:209`, `app/ingestion.py:384–393`) |
 
 ## 18. Risks
 
