@@ -8,19 +8,24 @@ The production adapter loads ``cl100k_base`` -- the encoding of
 startup. If the encoding file is not already in tiktoken's cache, tiktoken
 downloads it once and verifies it against a pinned SHA-256 before caching it
 (``TIKTOKEN_CACHE_DIR`` overrides the cache location). Any failure to load it
-becomes ``TokenizerUnavailableError``; the next ingestion tries again.
+becomes ``TokenizerUnavailableError``. After a load that completed with a
+failure, the next ingestion tries again.
 
 tiktoken's own loader has no HTTP timeout, so a stalled download would block
-whatever called it indefinitely. ``ensure_ready`` runs that load in a worker
-thread under a fixed deadline (``asyncio.wait_for`` + ``asyncio.to_thread``),
-so a caller on the event loop -- ``Ingestor`` calls it before chunking -- is
-bounded even though the background thread may still be blocked when the
-deadline fires (docs/DECISIONS.md section 7.5).
+whatever called it indefinitely. ``ensure_ready`` runs that load in one shared
+worker thread (``asyncio.to_thread``) and bounds each caller's wait with a
+fixed deadline (``asyncio.wait_for`` over ``asyncio.shield``). Concurrent
+first callers join the same load, and a waiter's timeout or cancellation never
+cancels it. A deadline that expires while the worker may still be running
+latches this tokenizer unavailable until restart, because Python cannot cancel
+that thread and a second one must never be started (docs/DECISIONS.md section
+7.5).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable, Sequence
 from typing import NoReturn, Protocol
@@ -83,28 +88,68 @@ class TiktokenTokenizer:
         self._loader = loader
         self._timeout_seconds = timeout_seconds
         self._encoding: _Encoding | None = None
+        # The one load in flight, shared by every waiter (single flight).
+        self._load_task: asyncio.Task[_Encoding] | None = None
+        # Set once a deadline expires while the worker may still be running;
+        # never cleared, so no later call starts another loading thread.
+        self._unavailable = False
 
     async def ensure_ready(self) -> None:
         """Load the encoding in a worker thread, bounded by ``timeout_seconds``.
 
         A no-op once the encoding is loaded. Call this before any request path
         that reaches ``encode``/``decode``, so a stalled download cannot block
-        the event loop; the worker thread itself may still be running when the
-        deadline fires, since Python threads cannot be cancelled.
+        the event loop. Concurrent callers share one load; each waits at most
+        ``timeout_seconds``. A deadline that expires with the load still
+        running latches the tokenizer unavailable for this instance's
+        lifetime, since Python threads cannot be cancelled.
         """
+        if self._unavailable:
+            raise TokenizerUnavailableError from None
         if self._encoding is not None:
             return
-        try:
-            self._encoding = await asyncio.wait_for(
-                asyncio.to_thread(self._loader, self._encoding_name),
-                timeout=self._timeout_seconds,
+        task = self._load_task
+        if task is None:
+            task = asyncio.create_task(
+                asyncio.to_thread(self._loader, self._encoding_name)
             )
-        except TimeoutError as exc:
-            self._load_failed(exc)
+            task.add_done_callback(self._load_settled)
+            self._load_task = task
+        # The wait only bounds this caller; the outcome is read from the shared
+        # task below. ``shield`` keeps a waiter's timeout or cancellation from
+        # cancelling the load, and ``CancelledError`` is not suppressed.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=self._timeout_seconds)
+        if self._unavailable:
+            # Another waiter's deadline latched the tokenizer meanwhile.
+            raise TokenizerUnavailableError from None
+        if not task.done():
+            self._unavailable = True
+            self._load_failed(TimeoutError())
+        try:
+            encoding = task.result()
         except (OSError, ValueError, ImportError) as exc:
             self._load_failed(exc)
+        # A caller can join a task that finished before ``_load_settled`` ran,
+        # so the outcome is also stored here; the assignment is idempotent.
+        self._encoding = encoding
+
+    def _load_settled(self, task: asyncio.Task[_Encoding]) -> None:
+        # Owns the shared task's state transitions. A cancelled task (event
+        # loop shutdown only) must not be asked for its exception, which would
+        # raise inside this callback; a failed one is retrieved so asyncio
+        # never reports it as unretrieved; a success after the latch is
+        # discarded.
+        if self._load_task is task:
+            self._load_task = None
+        if task.cancelled():
+            return
+        if task.exception() is None and not self._unavailable:
+            self._encoding = task.result()
 
     def _get_encoding(self) -> _Encoding:
+        if self._unavailable:
+            raise TokenizerUnavailableError from None
         if self._encoding is None:
             try:
                 self._encoding = self._loader(self._encoding_name)
@@ -116,9 +161,9 @@ class TiktokenTokenizer:
         # tiktoken fails with a network error (``requests`` exceptions are
         # ``OSError``s), a filesystem error, a hash-mismatch or
         # unknown-encoding ``ValueError``, an ``ImportError``, or -- only from
-        # ``ensure_ready`` -- a bounded-deadline ``TimeoutError``. The message
-        # may carry a cache path or response body, so only the exception type
-        # is recorded.
+        # ``ensure_ready``, once, at the latch -- a bounded-deadline
+        # ``TimeoutError``. The message may carry a cache path or response
+        # body, so only the exception type is recorded.
         log_event(
             logger,
             "tokenizer.load_failed",

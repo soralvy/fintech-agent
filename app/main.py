@@ -5,16 +5,19 @@ handlers stay thin (docs/DECISIONS.md section 3.1). Every error leaves in the
 SPEC section 12.1 envelope with a fixed message, and an unexpected exception
 is turned into the ``500`` envelope by ``UnexpectedErrorMiddleware`` instead
 of reaching the server's own error logging (docs/DECISIONS.md section 13).
+The middleware also owns the one request ID of each HTTP request and logs its
+``http.request.*`` lifecycle events (docs/DECISIONS.md section 19).
 """
 
 import logging
 import os
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Annotated, Any, Literal, TextIO
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -36,14 +39,18 @@ from app.config import (
 from app.db import Pool, check_database, create_pool
 from app.errors import (
     AppError,
-    DatabaseUnavailableError,
     InvalidRequestError,
     UploadTooLargeError,
     classify_error,
 )
 from app.graph import QueryGraph, QueryResult, build_query_graph, run_query
 from app.ingestion import Ingestor
-from app.logging import bind_request_id, configure_logging, log_event
+from app.logging import (
+    bind_request_id,
+    configure_logging,
+    current_request_id,
+    log_event,
+)
 from app.mcp_client import (
     MarketDataTools,
     open_market_data_tools,
@@ -72,9 +79,23 @@ logger = logging.getLogger(__name__)
 REQUEST_INVALID_CODE = "invalid_request"
 REQUEST_INVALID_MESSAGE = "The request is malformed or failed validation."
 
+# The router's own 404 and 405, in the envelope. Neither message names the
+# path, the method, or the framework's detail text.
+NOT_FOUND_CODE = "not_found"
+NOT_FOUND_MESSAGE = "The requested resource does not exist."
+METHOD_NOT_ALLOWED_CODE = "method_not_allowed"
+METHOD_NOT_ALLOWED_MESSAGE = "The request method is not allowed for this resource."
+
 # Allowance for multipart boundaries and part headers on top of the file itself
 # when rejecting an oversized upload from its Content-Length alone.
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
+
+# The only paths and methods an ``http.request.*`` event names; any other value
+# is logged as ``null``, so arbitrary request text never reaches a log.
+_LOGGED_PATHS = frozenset({"/health", "/v1/documents", "/v1/query"})
+_LOGGED_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+)
 
 
 def _open_devnull() -> TextIO:
@@ -212,9 +233,16 @@ class UnexpectedErrorMiddleware:
     ``ServerErrorMiddleware`` and outside ``ExceptionMiddleware``: errors with
     a registered handler never reach it, and an ``Exception`` it catches never
     reaches the server, which would otherwise log its message and traceback.
-    It logs one ``http.request.failed`` event with only bounded fields and
-    never re-raises. Non-HTTP scopes, such as ``lifespan``, pass through, and
-    a ``BaseException`` that is not an ``Exception`` propagates unchanged.
+
+    It is the only place a request ID is created. Every request logs one
+    ``http.request.started``, then ``http.request.completed`` with the status
+    the application sent -- including a handled error, whose code stays on the
+    owning domain event -- or, when an ``Exception`` escapes,
+    ``http.request.failed``, without re-raising. The events carry only bounded
+    fields: the method and path when they are on the allow-lists, never the
+    query string, headers, or body. Non-HTTP scopes, such as ``lifespan``,
+    pass through, and a ``BaseException`` that is not an ``Exception``
+    propagates with no terminal event.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -226,14 +254,20 @@ class UnexpectedErrorMiddleware:
             return
 
         response_started = False
+        status_code: int | None = None
 
         async def tracking_send(message: Message) -> None:
-            nonlocal response_started
+            nonlocal response_started, status_code
             if message["type"] == "http.response.start":
                 response_started = True
+                status_code = message["status"]
             await send(message)
 
+        method = _logged_method(scope)
+        path = _logged_path(scope)
         with bind_request_id(uuid4().hex):
+            log_event(logger, "http.request.started", method=method, path=path)
+            started_at = time.monotonic()
             try:
                 await self.app(scope, receive, tracking_send)
             # A blind catch is the point: D24 requires every Exception to end
@@ -256,15 +290,49 @@ class UnexpectedErrorMiddleware:
                     AppError.message,
                 )
                 await response(scope, receive, send)
+            else:
+                log_event(
+                    logger,
+                    "http.request.completed",
+                    level=(
+                        logging.WARNING
+                        if status_code is not None
+                        and status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR
+                        else logging.INFO
+                    ),
+                    method=method,
+                    path=path,
+                    status_code=status_code,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                )
+
+
+def _logged_method(scope: Scope) -> str | None:
+    """The request method, or ``None`` when it is not a standard one."""
+    method = scope.get("method")
+    return method if method in _LOGGED_METHODS else None
+
+
+def _logged_path(scope: Scope) -> str | None:
+    """The request path, or ``None`` unless it is one of the documented routes."""
+    path = scope.get("path")
+    return path if path in _LOGGED_PATHS else None
 
 
 app = FastAPI(title="FinTech Research Agent", lifespan=lifespan)
 app.add_middleware(UnexpectedErrorMiddleware)
 
 
-def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
+def _error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse:
     body = ErrorResponse(error=ErrorDetail(code=code, message=message))
-    return JSONResponse(status_code=status_code, content=body.model_dump())
+    return JSONResponse(
+        status_code=status_code, content=body.model_dump(), headers=headers
+    )
 
 
 @app.exception_handler(AppError)
@@ -287,12 +355,14 @@ async def request_validation_error_handler(
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error_handler(request: Request, exc: StarletteHTTPException) -> Response:
-    """Map FastAPI's own body-parse failure to the validation envelope.
+    """Map the framework's own HTTP errors to the envelope.
 
     FastAPI raises ``HTTPException(400)`` when ``Request.json()`` fails with
-    anything but a ``JSONDecodeError``, such as a non-UTF-8 body. Every other
-    status keeps FastAPI's default ``{"detail": ...}`` rendering, including
-    the ``/health`` 503 and framework 404/405 responses.
+    anything but a ``JSONDecodeError``, such as a non-UTF-8 body; it becomes
+    the validation envelope. The router's ``404`` and ``405`` get fixed codes
+    and messages, and a ``405`` keeps its ``Allow`` header. No route raises
+    any other status, so it keeps FastAPI's default ``{"detail": ...}``
+    rendering rather than a guessed code.
     """
     if exc.status_code == status.HTTP_400_BAD_REQUEST:
         return _error_response(
@@ -300,7 +370,30 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException) -> R
             REQUEST_INVALID_CODE,
             REQUEST_INVALID_MESSAGE,
         )
+    if exc.status_code == status.HTTP_404_NOT_FOUND:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND, NOT_FOUND_CODE, NOT_FOUND_MESSAGE
+        )
+    if exc.status_code == status.HTTP_405_METHOD_NOT_ALLOWED:
+        return _error_response(
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+            METHOD_NOT_ALLOWED_CODE,
+            METHOD_NOT_ALLOWED_MESSAGE,
+            headers=exc.headers,
+        )
     return await http_exception_handler(request, exc)
+
+
+def _bound_request_id() -> str:
+    """The ID ``UnexpectedErrorMiddleware`` bound for this request.
+
+    Ingestion reuses it, so one request never carries two IDs. Every HTTP
+    request passes through the middleware, so a missing ID is a wiring error.
+    """
+    request_id = current_request_id()
+    if request_id is None:
+        raise RuntimeError("no request ID is bound")
+    return request_id
 
 
 def get_pool(request: Request) -> Pool:
@@ -328,22 +421,19 @@ class HealthResponse(BaseModel):
     database: Literal["ok"]
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse}},
+)
 async def health(pool: Annotated[Pool, Depends(get_pool)]) -> HealthResponse:
     """Report that the process is serving and the database answers a query.
 
     OpenAI and the market-data provider are deliberately not checked
-    (docs/SPEC.md section 6.1).
+    (docs/SPEC.md section 6.1). A database failure is not caught here: its
+    ``DatabaseUnavailableError``, already stripped of the driver's message by
+    db.py, reaches the ``AppError`` handler as the ``503`` envelope.
     """
-    try:
-        await check_database(pool)
-    except DatabaseUnavailableError:
-        # Keeps the ``detail`` shape until Milestone 7 (docs/DECISIONS.md
-        # section 13); db.py has already dropped the driver's message.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="database unavailable",
-        ) from None
+    await check_database(pool)
     return HealthResponse(status="ok", database="ok")
 
 
@@ -404,7 +494,7 @@ async def ingest_document(
         uploads = form.getlist("file")
         if len(uploads) != 1 or not isinstance(uploads[0], UploadFile):
             raise InvalidRequestError
-        result = await ingestor.ingest(uploads[0], request_id=uuid4().hex)
+        result = await ingestor.ingest(uploads[0], request_id=_bound_request_id())
     finally:
         await form.close()
 

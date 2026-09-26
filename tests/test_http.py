@@ -314,6 +314,37 @@ def test_database_outage_is_503_without_driver_details(offline: OfflineApp) -> N
     assert offline.embedder.calls == []
 
 
+def test_http_events_share_one_id_with_ingestion_events(
+    offline: OfflineApp, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    response = offline.client.post(
+        URL, files={"file": ("a.txt", b"Revenue grew.", "text/plain")}
+    )
+
+    assert response.status_code == 503
+    logged = events(caplog)
+    assert [event["event"] for event in logged] == [
+        "http.request.started",
+        "ingestion.started",
+        "ingestion.failed",
+        "http.request.completed",
+    ]
+    (request_id,) = {event["request_id"] for event in logged}
+    assert len(request_id) == 32 and int(request_id, 16) >= 0
+    started, completed = logged[0], logged[-1]
+    assert started == {
+        "event": "http.request.started",
+        "request_id": request_id,
+        "method": "POST",
+        "path": URL,
+    }
+    assert completed["status_code"] == 503
+    assert logged[2]["error_code"] == "database_unavailable"
+    assert_logs_hold_none_of(caplog, "hunter2", "db.internal")
+
+
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
@@ -862,12 +893,73 @@ def test_the_http_exception_handler_keeps_other_statuses_unchanged() -> None:
     assert json.loads(bytes(response.body)) == {"detail": "database unavailable"}
 
 
-def test_an_unknown_route_keeps_the_framework_404() -> None:
-    with serving(object()) as client:
-        response = client.get("/no-such-route")
+@pytest.mark.parametrize(
+    ("method", "target", "status_code", "allow", "logged_method", "logged_path"),
+    [
+        pytest.param(
+            "GET",
+            f"/no-such-route?x={SENTINEL}",
+            404,
+            None,
+            "GET",
+            None,
+            id="unknown-path",
+        ),
+        pytest.param("GET", QUERY_URL, 405, "POST", "GET", QUERY_URL, id="get-query"),
+        pytest.param("GET", URL, 405, "POST", "GET", URL, id="get-documents"),
+        pytest.param(
+            "POST", "/health", 405, "GET", "POST", "/health", id="post-health"
+        ),
+        pytest.param(
+            "PROPFIND", "/health", 405, "GET", None, "/health", id="unlisted-method"
+        ),
+    ],
+)
+def test_unknown_paths_and_wrong_methods_use_the_envelope(
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    target: str,
+    status_code: int,
+    allow: str | None,
+    logged_method: str | None,
+    logged_path: str | None,
+) -> None:
+    caplog.set_level(logging.DEBUG)
 
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Not Found"}
+    with serving(object()) as client:
+        response = client.request(method, target)
+
+    assert response.status_code == status_code
+    if status_code == 404:
+        assert response.json() == error_body(
+            "not_found", "The requested resource does not exist."
+        )
+        assert "allow" not in response.headers
+    else:
+        assert response.json() == error_body(
+            "method_not_allowed",
+            "The request method is not allowed for this resource.",
+        )
+        assert response.headers["allow"] == allow
+    logged = events(caplog)
+    assert [event["event"] for event in logged] == [
+        "http.request.started",
+        "http.request.completed",
+    ]
+    started, completed = logged
+    assert started["method"] == completed["method"] == logged_method
+    assert started["path"] == completed["path"] == logged_path
+    assert completed["status_code"] == status_code
+    assert SENTINEL not in response.text
+    # The test client's own httpx logger records the URL it sent; only the
+    # application's lines are under test.
+    app_logged = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("app")
+    )
+    assert SENTINEL not in app_logged
+    assert "no-such-route" not in app_logged
 
 
 # ---------------------------------------------------------------------------
@@ -1063,8 +1155,81 @@ async def test_middleware_after_the_response_started_sends_nothing_more(
     assert_logs_hold_none_of(caplog, "secret-detail")
 
 
+async def _returns_204(scope: Scope, receive: Receive, send: ASGISend) -> None:
+    await send({"type": "http.response.start", "status": 204, "headers": []})
+    await send({"type": "http.response.body", "body": b""})
+
+
+async def _raises_before_start(scope: Scope, receive: Receive, send: ASGISend) -> None:
+    raise RuntimeError("secret-detail")
+
+
+async def _raises_after_start(scope: Scope, receive: Receive, send: ASGISend) -> None:
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    raise RuntimeError("secret-detail")
+
+
+async def _returns_controlled_503(
+    scope: Scope, receive: Receive, send: ASGISend
+) -> None:
+    await send({"type": "http.response.start", "status": 503, "headers": []})
+    await send({"type": "http.response.body", "body": b"{}"})
+
+
 @pytest.mark.anyio
-async def test_middleware_lets_cancellation_propagate_and_logs_nothing(
+@pytest.mark.parametrize(
+    ("inner", "terminal", "status_code", "level"),
+    [
+        (_returns_204, "http.request.completed", 204, "INFO"),
+        (_raises_before_start, "http.request.failed", 500, "ERROR"),
+        (_raises_after_start, "http.request.failed", 500, "ERROR"),
+        (_returns_controlled_503, "http.request.completed", 503, "WARNING"),
+    ],
+    ids=["success", "failure-before-start", "failure-after-start", "controlled-503"],
+)
+async def test_middleware_emits_one_terminal_event_per_request(
+    inner: Callable[[Scope, Receive, ASGISend], Any],
+    terminal: str,
+    status_code: int,
+    level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    async def send(message: Message) -> None:
+        return None
+
+    await UnexpectedErrorMiddleware(inner)(_http_scope(), _receive, send)
+
+    app_records = [r for r in caplog.records if r.name.startswith("app")]
+    logged = events(caplog)
+    assert [event["event"] for event in logged] == ["http.request.started", terminal]
+    (request_id,) = {event["request_id"] for event in logged}
+    assert len(request_id) == 32
+    assert logged[0] == {
+        "event": "http.request.started",
+        "request_id": request_id,
+        "method": "GET",
+        "path": None,
+    }
+    assert app_records[0].levelname == "INFO"
+    assert logged[1]["status_code"] == status_code
+    assert app_records[1].levelname == level
+    if terminal == "http.request.completed":
+        assert set(logged[1]) == {
+            "event",
+            "request_id",
+            "method",
+            "path",
+            "status_code",
+            "duration_ms",
+        }
+        assert type(logged[1]["duration_ms"]) is int
+    assert_logs_hold_none_of(caplog, "secret-detail")
+
+
+@pytest.mark.anyio
+async def test_middleware_lets_cancellation_propagate_and_logs_no_terminal_event(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.DEBUG)
@@ -1078,7 +1243,7 @@ async def test_middleware_lets_cancellation_propagate_and_logs_nothing(
     with pytest.raises(asyncio.CancelledError):
         await UnexpectedErrorMiddleware(cancelled)(_http_scope(), _receive, send)
 
-    assert events(caplog) == []
+    assert [event["event"] for event in events(caplog)] == ["http.request.started"]
 
 
 @pytest.mark.anyio

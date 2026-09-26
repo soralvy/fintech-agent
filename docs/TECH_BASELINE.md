@@ -714,7 +714,8 @@ Both reinforce two design rules: thresholds must be tuned per question type on p
 **Operational behavior: encoding data.** The encoding's BPE ranks are not in the wheel. On first use, tiktoken reads them from its cache: `TIKTOKEN_CACHE_DIR`, else `DATA_GYM_CACHE_DIR`, else `<system temp>/data-gym-cache`. On a cache miss it downloads the file once from `openaipublic.blob.core.windows.net`, verifies it against a SHA-256 pinned inside tiktoken, and writes it to the cache. So:
 
 - The application starts without the file and without network access. The first ingestion on a machine with an empty cache needs outbound HTTPS.
-- If the load fails, for example no network, an unwritable cache, or a hash mismatch, the request returns `503 tokenizer_unavailable` and writes no rows. The next ingestion retries the load. Only the exception type is logged, never the path or response.
+- If the load completes with an error, for example no network, an unwritable cache, or a hash mismatch, the request returns `503 tokenizer_unavailable` and writes no rows. The next ingestion retries the load. Only the exception type is logged, never the path or response.
+- If the load deadline expires instead, the worker may still be running, so that tokenizer instance is latched unavailable until the application restarts. Later new-document ingestions fail fast with the same `503` and start no additional load (`docs/DECISIONS.md` §7.5, §23).
 - For offline or locked-down deployments, pre-populate the cache and point `TIKTOKEN_CACHE_DIR` at it. The BPE file is deliberately not vendored into this repository.
 - Automated tests never load the encoding. Ingestion depends on a `Tokenizer` protocol, tests inject a deterministic fake, and `tests/conftest.py` replaces `tiktoken.get_encoding` for every test so that any accidental load fails instead of downloading.
 
@@ -728,7 +729,7 @@ Both reinforce two design rules: thresholds must be tuned per question type on p
 
 **Verified:** 2026-09-23. The version was resolved and installed by `uv add tiktoken==0.14.0`. The load path, cache lookup, and hash check were read from the installed `tiktoken/load.py`. At verification time the `cl100k_base` file was not yet in the local cache. It was downloaded, hash-verified, and cached during the Milestone 2 manual smoke test (`docs/TASKS.md` Milestone 2), which recorded its size on disk.
 
-*Amended 2026-09-23:* tiktoken's own loader has no HTTP timeout. `TiktokenTokenizer.ensure_ready` bounds it with `asyncio.wait_for` around `asyncio.to_thread`, and `Ingestor` awaits it before chunking, so a stalled download cannot block the event loop (`docs/DECISIONS.md` §7.5).
+*Amended 2026-09-23:* tiktoken's own loader has no HTTP timeout. `TiktokenTokenizer.ensure_ready` bounds it with `asyncio.wait_for` around `asyncio.to_thread`, and `Ingestor` awaits it before chunking, so a stalled download cannot block the event loop (`docs/DECISIONS.md` §7.5). *Amended 2026-09-26, Milestone 7:* each tokenizer instance runs at most one shared loading task. Concurrent callers wait on it through `asyncio.shield`, so a waiter's cancellation does not cancel the shared load. A deadline timeout latches the instance unavailable until restart (`docs/DECISIONS.md` §7.5, §23).
 
 ---
 

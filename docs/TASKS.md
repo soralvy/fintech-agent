@@ -142,7 +142,7 @@ The Milestone 2 architecture audit found these gaps and deliberately deferred th
 | ~~Catch-all `internal_error` envelope, and a `RequestValidationError` handler that keeps JSON-body validation in the SPEC §12.1 envelope~~ | **Done in Milestone 4** (2026-09-24; `UnexpectedErrorMiddleware` and the `RequestValidationError` and `StarletteHTTPException` handlers; `docs/DECISIONS.md` §13) |
 | ~~Split schemas by boundary (HTTP in `schemas.py`; LLM structured outputs and provider results beside their adapters), with a pure citation/context module separate from the graph topology; amend `docs/DECISIONS.md` §4 in the same change~~ | **Done in Milestone 4** (2026-09-24; `app/schemas.py`, `GroundedAnswer` in `app/openai_provider.py`, `app/citations.py`; `docs/DECISIONS.md` §4) |
 | `contextlib.AsyncExitStack` in the lifespan | ~~Milestone 5~~ Milestone 6, when the MCP client becomes the third lifespan resource (*moved 2026-09-24*: the Milestone 5 client is standalone; `docs/changes/M5-mcp-server.md` §15) |
-| Single-flight tokenizer load, so a stalled download cannot pile up worker threads; level and timestamp in JSON log lines | Milestone 7 |
+| ~~Single-flight tokenizer load, so a stalled download cannot pile up worker threads; level and timestamp in JSON log lines~~ | **Done in Milestone 7** (2026-09-26; `app/tokenizer.py`, `app/logging.py`; `docs/DECISIONS.md` §7.5, §19) |
 | Move PDF extraction off the event loop (`asyncio.to_thread`) | Only if the Milestone 8 real-PDF measurement shows the event loop stalling (`docs/DECISIONS.md` §22) |
 
 ---
@@ -427,23 +427,98 @@ External calls: none. No OpenAI, Alpha Vantage, package, or other network reques
 
 # Milestone 7 — HTTP/error/security hardening
 
-Target: ~1–1.5 hours.
+Target: ~5.25–6.75 hours across Stage 0 and Stages A–E, excluding review turnaround. *Re-estimated 2026-09-25* from ~1–1.5 hours, which predated the HTTP lifecycle events, the single-flight tokenizer with its timeout latch, and the local smoke (`docs/changes/M7-http-error-security-hardening.md` §20).
+
+Change specification: `docs/changes/M7-http-error-security-hardening.md`, revision 6. It was built in the approved order: Stage 0 canonical alignment (`de5f543`), Stage A tokenizer single flight and timeout latch (`76e3d15`), Stage B log line level and timestamp (`65bea26`), Stage C one request ID and HTTP lifecycle events (`be1ffc9`), Stage D error envelope normalization (`c210e27`), and Stage E final verification with these completion records.
 
 - [x] Add `/health`. *(Pulled forward into Milestone 1 once the pool existed: `SELECT 1`, `503` on failure, bounded by the pool timeout.)*
-- [ ] Use FastAPI lifespan for shared resources where appropriate. *(Partial: lifespan owns the database pool and, as of Milestone 2, the OpenAI client. The MCP handle joins it when that milestone creates it.)*
-- [ ] Normalize public application error responses.
-- [ ] Confirm database failures do not expose connection strings.
-- [ ] Confirm provider failures do not expose API keys.
-- [ ] Confirm unsupported uploads return controlled errors.
-- [ ] Confirm upload limits.
-- [ ] Confirm question-length validation.
-- [ ] Confirm uploaded document instructions cannot select arbitrary tools.
-- [ ] Confirm MCP accepts no arbitrary URLs.
-- [ ] Confirm all database queries are parameterized.
-- [ ] Avoid logging full documents/prompts by default.
-- [ ] Add HTTP contract tests.
+- [x] Use FastAPI lifespan for shared resources where appropriate. Milestone 6 finished it: the lifespan owns the pool, the OpenAI client, and the optional shared MCP client on an `AsyncExitStack`, closed in reverse order (Milestone 6 T22–T27 in `tests/test_http.py`; spec C2).
+- [x] Normalize public application error responses. `/health`'s `503` and the framework `404`/`405` now use the SPEC §12.1 envelope, and a `405` keeps `Allow` (D1, D2; `test_health.py::test_health_failure_does_not_leak_connection_details`, `test_health_returns_503_within_the_pool_timeout_when_database_is_down`, `test_http.py::test_unknown_paths_and_wrong_methods_use_the_envelope`).
+- [x] Confirm database failures do not expose connection strings. The existing evidence is in spec §13 row 1. The gap it names is closed: with `DEBUG` capture and a control assertion that `psycopg.pool` records exist, no record from any logger holds the DSN password or `postgresql://` (`test_health_returns_503_within_the_pool_timeout_when_database_is_down`).
+- [x] Confirm provider failures do not expose API keys. Existing evidence, spec §13 row 2.
+- [x] Confirm unsupported uploads return controlled errors. Existing evidence, spec §13 row 3.
+- [x] Confirm upload limits. Existing evidence, spec §13 row 4.
+- [x] Confirm question-length validation. Existing evidence, spec §13 row 5.
+- [x] Confirm uploaded document instructions cannot select arbitrary tools. Existing evidence, spec §13 row 6.
+- [x] Confirm MCP accepts no arbitrary URLs. Existing evidence, spec §13 row 7.
+- [x] Confirm all database queries are parameterized. mypy strict over psycopg's `LiteralString` typing, plus the §16.2 boundary greps (D14; spec §13 row 8).
+- [x] Avoid logging full documents/prompts by default. Existing evidence, spec §13 row 9. The new surface is covered: HTTP events log only allow-listed paths and methods (`test_unknown_paths_and_wrong_methods_use_the_envelope`), and the formatter adds only `level` and `timestamp` (`test_logging.py::test_the_formatter_adds_level_and_utc_timestamp`).
+- [x] Add HTTP contract tests. `test_http.py`: `test_http_events_share_one_id_with_ingestion_events`, `test_unknown_paths_and_wrong_methods_use_the_envelope`, `test_middleware_emits_one_terminal_event_per_request`, and `test_middleware_lets_cancellation_propagate_and_logs_no_terminal_event`.
 
 **Exit condition:** known failure paths are controlled and security boundaries from the spec are represented in code/tests.
+
+**Verified 2026-09-26.** The exit condition is met, and AC1–AC18 of `docs/changes/M7-http-error-security-hardening.md` §17 have passing evidence.
+
+Acceptance evidence (tests are in `tests/`; T-numbers refer to the spec's §14):
+
+| AC | Evidence |
+|---|---|
+| AC1 | `test_health.py::test_health_failure_does_not_leak_connection_details`, `test_health_returns_503_within_the_pool_timeout_when_database_is_down` (T10) |
+| AC2, AC6 | `test_http.py::test_unknown_paths_and_wrong_methods_use_the_envelope`, 5 cases (T9), including an unlisted `PROPFIND /health` logged as `method: null`; it replaces `test_an_unknown_route_keeps_the_framework_404`. Its sentinel check covers `app` log lines only: the test client's own `httpx` logger records the request URL, and spec §6.3 puts non-`app` loggers out of scope |
+| AC3, AC14 | every pre-existing suite passes, edited only as spec §14 names |
+| AC4 | `test_http.py::test_http_events_share_one_id_with_ingestion_events` (T8) |
+| AC5 | `test_http.py::test_middleware_emits_one_terminal_event_per_request`, 4 cases (T11); T8; `test_middleware_lets_cancellation_propagate_and_logs_no_terminal_event` (T12). `test_middleware_binds_a_fresh_request_id_per_request` passes unedited (T13) |
+| AC7 | `test_logging.py::test_the_formatter_adds_level_and_utc_timestamp`, `test_the_formatter_passes_a_plain_record_through` (T6, T7), and every caplog suite |
+| AC8 | `test_tokenizer.py::test_concurrent_first_calls_share_one_load` (T1), `test_joining_a_finished_but_unsettled_load_stores_the_encoding` (T1a) |
+| AC9 | `test_tokenizer.py::test_a_completed_load_failure_is_retried_by_the_next_call` (T2), `test_load_failure_is_safe_and_retried` |
+| AC10, AC17 | `test_tokenizer.py::test_a_timed_out_load_latches_and_later_calls_fail_fast` (T3), `test_waiters_on_a_timed_out_load_log_the_transition_once` (T3a) |
+| AC11 | `test_tokenizer.py::test_cancellation_neither_cancels_the_load_nor_latches` (T4) |
+| AC12 | spec §13, with row 1's log gap closed by T10 |
+| AC13 | mypy in the gate and the §16.2 greps below |
+| AC15 | the §16.2 `git diff --stat main` over the protected files is empty |
+| AC16 | the offline gate and the local HTTP smoke below |
+| AC18 | `test_tokenizer.py::test_a_fresh_instance_can_load_after_another_instance_latched` (T3b); the §16.2 `TiktokenTokenizer` grep |
+
+What was built:
+
+- `app/tokenizer.py`: one shared load task per instance, a shielded per-caller deadline, a done-callback that owns the task's state, and the per-instance timeout latch, which the synchronous fallback also honors (D9–D12).
+- `app/logging.py`: `_EventFormatter`, which adds `level` and a UTC `timestamp` to every `app` line. `log_event` and `getMessage()` are unchanged (D8).
+- `app/main.py`: `http.request.started`/`completed` with the allow-listed `method`/`path`, `_bound_request_id()` for the upload route, the `/health` `503` envelope and its OpenAPI entry, and the `404`/`405` envelope (D1, D2, D4–D7).
+- Unchanged, as spec §12.2 requires: every Milestone 4–6 module, `app/ingestion.py`, `app/errors.py`, the migration, `pyproject.toml`, `uv.lock`, `scripts/`, `tests/fakes.py`, `tests/conftest.py`, `tests/db_safety.py`, `tests/fixtures/`, and `.claude/`.
+
+Automated verification (offline, 2026-09-26, before these completion records):
+
+- Offline setup: `OPENAI_API_KEY`, `ALPHA_VANTAGE_API_KEY`, `MCP_TOOL_TIMEOUT_SECONDS`, and the tracing variables were unset. Nothing loads the gitignored `.env`, and `UV_ENV_FILE` was unset. The autouse `_no_tiktoken_encoding_data` fixture replaces `tiktoken.get_encoding` and `tiktoken.load.read_file` with functions that raise, so no test can download an encoding.
+- `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY -u MCP_TOOL_TIMEOUT_SECONDS UV_OFFLINE=1 DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py`: exit 0, `PASSED: all 5 steps; 1185 tests, 0 skipped`. `uv lock --check` resolved 104 packages, 58 files were already formatted, Ruff passed, and mypy found no issues in 41 source files. That is 1168 plus 18 new test cases, minus the superseded 404 test.
+- Without `TEST_DATABASE_URL`, `uv run pytest` reports 1095 passed and 90 skipped, so 90 tests need PostgreSQL and every one of them ran in the gate.
+- `git diff --check`: exit 0.
+- Boundary checks (spec §16.2), all as expected:
+  - `git diff --stat main` over the protected files printed nothing.
+  - The greps for psycopg outside `db.py`, an f-string `execute`, `exception_handler(Exception|500)`, and a direct `logger.*(` call printed nothing.
+  - `uuid4().hex` appears exactly once, at `app/main.py:268` in `UnexpectedErrorMiddleware`.
+  - `TiktokenTokenizer|ensure_ready` appears only in `app/ingestion.py`, `app/tokenizer.py`, and `app/main.py`.
+
+Offline local HTTP smoke (spec §16.3, run once on 2026-09-26 with explicit approval):
+- Each server ran as `.venv/bin/python -m uvicorn app.main:app` on 127.0.0.1:8765.
+- Each started from `env -i` with only `PATH`, `HOME`, `TMPDIR`, `DATABASE_URL`, a dummy `OPENAI_API_KEY`, and `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (both cases) set to the closed `http://127.0.0.1:9`. There was no Alpha Vantage key.
+- No valid query or upload was sent, so no provider call could happen.
+
+1. Healthy database (`fintech`):
+   - `GET /health` returned `200` `{"status":"ok","database":"ok"}`.
+   - `GET /v1/query` returned `405 method_not_allowed` with `allow: POST`.
+   - `GET /nope?q=SMOKE-SENTINEL` returned `404 not_found`.
+   - `POST /v1/documents` with `run.exe` returned `415 unsupported_file_type`.
+   - A 2-character question returned `422 invalid_request`.
+2. Unreachable database (`postgresql://smoke:SMOKE-PW@127.0.0.1:5499/fintech`): `GET /health` returned `503` with the `database_unavailable` envelope.
+3. Logs:
+   - All 20 `app` JSON lines carry `level` and a `timestamp` ending in `Z`.
+   - Each request has exactly one `http.request.started` and one `http.request.completed` under the same 32-hex ID.
+     - The `404` logs `path: null`.
+     - The `503`s log at `WARNING`.
+   - The `415` upload's `ingestion.started` and `ingestion.failed` (`unsupported_file_type`) carry the same ID.
+   - `mcp.startup` is `not_configured`.
+   - Across both logs there are 0 occurrences each of the dummy key, `SMOKE-PW`, `postgresql://`, and `Traceback`.
+   - `SMOKE-SENTINEL` appears once, only in Uvicorn's own access-log line (`"GET /nope?q=SMOKE-SENTINEL HTTP/1.1" 404`), and in no `app` line. Revision 6 of the spec scopes the §16.3 check to `app` lines, since §6.3 puts Uvicorn's access log out of scope.
+   - `psycopg.pool`'s own lines name the host and port, and carry no password or URL.
+4. SIGINT exited 0 for both servers, and nothing was left listening on the port.
+
+External calls: none. No OpenAI, Alpha Vantage, tiktoken, package, or other network request was made. Tests used only fakes and local PostgreSQL.
+
+Post-verification follow-up (2026-09-26, spec revision 6). This applies the two P3 findings of the milestone-wide `/finish-task` review. `TiktokenTokenizer.ensure_ready` now also stores the encoding it reads from the shared task, so a caller that joins a load which finished before its done callback ran no longer leaves `encode` to repeat the load inline. `test_joining_a_finished_but_unsettled_load_stores_the_encoding` (T1a) covers this, and it fails without the fix. The spec text now matches Stage E (T9 `PROPFIND`, AC6, and the `app`-only sentinel scope in T9 and §16.3).
+
+- `env -u OPENAI_API_KEY -u ALPHA_VANTAGE_API_KEY -u MCP_TOOL_TIMEOUT_SECONDS UV_OFFLINE=1 DATABASE_URL=postgresql://localhost:5433/fintech TEST_DATABASE_URL=postgresql://localhost:5433/fintech_test uv run python scripts/verify.py`: exit 0, `PASSED: all 5 steps; 1186 tests, 0 skipped`.
+- `git diff --check`: exit 0. The §16.2 boundary checks give the same results as above.
+- The §16.3 smoke was not repeated. The change touches only `ensure_ready`'s internal state, not startup, the lifespan, the database, or the HTTP contract, and the smoke sends no valid upload.
 
 ---
 
