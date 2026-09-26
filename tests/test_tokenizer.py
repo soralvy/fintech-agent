@@ -7,12 +7,15 @@ encoding or prove the adapter fails safely when the loader is unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 import time
 from collections.abc import Sequence
 
 import pytest
+import tiktoken
 
 from app.errors import TokenizerUnavailableError
 from app.tokenizer import EMBEDDING_ENCODING, TiktokenTokenizer
@@ -170,3 +173,235 @@ async def test_ensure_ready_propagates_load_errors_safely() -> None:
         await tokenizer.ensure_ready()
 
     assert secret_detail not in raised.value.message
+
+
+# ---------------------------------------------------------------------------
+# Single flight and the timeout latch (docs/DECISIONS.md section 7.5)
+#
+# No wall-clock sleep decides an outcome: ``asyncio.sleep(0)`` only yields,
+# and a gated loader stays blocked until the test releases its gate, so a
+# short deadline always expires first. Every gate is released in ``finally``,
+# so a failed assertion cannot leave a worker thread blocked.
+# ---------------------------------------------------------------------------
+
+
+class GatedLoader:
+    """A loader that blocks its worker thread until ``gate`` is set."""
+
+    def __init__(self, *failures: Exception) -> None:
+        self.gate = threading.Event()
+        self.calls = 0
+        self._failures = list(failures)
+
+    def __call__(self, name: str) -> FakeEncoding:
+        self.calls += 1
+        self.gate.wait()
+        if self._failures:
+            raise self._failures.pop(0)
+        return FakeEncoding()
+
+
+def _tokenizer_records(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    return [
+        json.loads(r.getMessage()) for r in caplog.records if r.name == "app.tokenizer"
+    ]
+
+
+def _load_failed(error_type: str) -> dict[str, object]:
+    return {
+        "event": "tokenizer.load_failed",
+        "encoding": "cl100k_base",
+        "error_type": error_type,
+    }
+
+
+TIMEOUT_EVENT = _load_failed("TimeoutError")
+
+
+@pytest.mark.anyio
+async def test_concurrent_first_calls_share_one_load() -> None:
+    loader = GatedLoader()
+    tokenizer = TiktokenTokenizer(loader=loader)
+    try:
+        waiters = [asyncio.create_task(tokenizer.ensure_ready()) for _ in range(5)]
+        await asyncio.sleep(0)
+        loader.gate.set()
+        await asyncio.gather(*waiters)
+    finally:
+        loader.gate.set()
+
+    assert loader.calls == 1
+    assert tokenizer.encode("hi") == list(b"hi")
+    assert loader.calls == 1
+
+
+@pytest.mark.anyio
+async def test_a_completed_load_failure_is_retried_by_the_next_call(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    loader = GatedLoader(OSError("download failed"))
+    tokenizer = TiktokenTokenizer(loader=loader)
+    try:
+        waiters = [asyncio.create_task(tokenizer.ensure_ready()) for _ in range(3)]
+        await asyncio.sleep(0)
+        loader.gate.set()
+        outcomes = await asyncio.gather(*waiters, return_exceptions=True)
+    finally:
+        loader.gate.set()
+
+    assert all(isinstance(o, TokenizerUnavailableError) for o in outcomes)
+    assert all(
+        o.__cause__ is None and o.__suppress_context__
+        for o in outcomes
+        if isinstance(o, BaseException)
+    )
+    assert tokenizer._unavailable is False
+    assert tokenizer._load_task is None
+    # Each waiter on the one failed load logs once, as before single flight.
+    assert _tokenizer_records(caplog) == [_load_failed("OSError")] * 3
+
+    await tokenizer.ensure_ready()
+
+    assert loader.calls == 2
+    assert tokenizer.encode("hi") == list(b"hi")
+
+
+@pytest.mark.anyio
+async def test_a_timed_out_load_latches_and_later_calls_fail_fast(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    gate = threading.Event()
+    calls = 0
+
+    def gated_get_encoding(name: str) -> FakeEncoding:
+        nonlocal calls
+        calls += 1
+        gate.wait()
+        return FakeEncoding()
+
+    monkeypatch.setattr(tiktoken, "get_encoding", gated_get_encoding)
+    tokenizer = TiktokenTokenizer(timeout_seconds=0.01)
+    try:
+        with pytest.raises(TokenizerUnavailableError) as first:
+            await tokenizer.ensure_ready()
+        assert first.value.__cause__ is None and first.value.__suppress_context__
+        assert _tokenizer_records(caplog) == [TIMEOUT_EVENT]
+
+        task = tokenizer._load_task
+        assert task is not None and not task.done()
+
+        for _ in range(2):
+            with pytest.raises(TokenizerUnavailableError) as later:
+                await tokenizer.ensure_ready()
+            assert later.value.__cause__ is None and later.value.__suppress_context__
+        with pytest.raises(TokenizerUnavailableError) as sync:
+            tokenizer.encode("text")
+        assert sync.value.__cause__ is None and sync.value.__suppress_context__
+
+        assert calls == 1
+        assert _tokenizer_records(caplog) == [TIMEOUT_EVENT]
+    finally:
+        gate.set()
+
+    await asyncio.wait({task})
+
+    assert tokenizer._encoding is None, "a success after the latch is discarded"
+    with pytest.raises(TokenizerUnavailableError):
+        await tokenizer.ensure_ready()
+    assert calls == 1
+    assert _tokenizer_records(caplog) == [TIMEOUT_EVENT]
+
+
+@pytest.mark.anyio
+async def test_waiters_on_a_timed_out_load_log_the_transition_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    loader = GatedLoader()
+    tokenizer = TiktokenTokenizer(loader=loader, timeout_seconds=0.01)
+    try:
+        waiters = [asyncio.create_task(tokenizer.ensure_ready()) for _ in range(2)]
+        outcomes = await asyncio.gather(*waiters, return_exceptions=True)
+        task = tokenizer._load_task
+    finally:
+        loader.gate.set()
+
+    assert all(isinstance(o, TokenizerUnavailableError) for o in outcomes)
+    assert _tokenizer_records(caplog) == [TIMEOUT_EVENT]
+    assert loader.calls == 1
+    assert task is not None
+    await asyncio.wait({task})
+
+
+@pytest.mark.anyio
+async def test_a_fresh_instance_can_load_after_another_instance_latched() -> None:
+    loader = GatedLoader()
+    latched = TiktokenTokenizer(loader=loader, timeout_seconds=0.01)
+    try:
+        with pytest.raises(TokenizerUnavailableError):
+            await latched.ensure_ready()
+        task = latched._load_task
+    finally:
+        loader.gate.set()
+    assert task is not None
+    await asyncio.wait({task})
+
+    fresh = TiktokenTokenizer(loader=lambda name: FakeEncoding())
+    await fresh.ensure_ready()
+
+    assert fresh.encode("hi") == list(b"hi")
+    with pytest.raises(TokenizerUnavailableError):
+        await latched.ensure_ready()
+
+
+@pytest.mark.anyio
+async def test_cancellation_neither_cancels_the_load_nor_latches(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    # (a) A cancelled waiter leaves the shared load running.
+    loader = GatedLoader()
+    tokenizer = TiktokenTokenizer(loader=loader)
+    try:
+        waiter = asyncio.create_task(tokenizer.ensure_ready())
+        await asyncio.sleep(0)
+        shared = tokenizer._load_task
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert shared is not None and not shared.cancelled()
+        assert tokenizer._unavailable is False
+
+        second = asyncio.create_task(tokenizer.ensure_ready())
+        await asyncio.sleep(0)
+        loader.gate.set()
+        await second
+    finally:
+        loader.gate.set()
+
+    assert loader.calls == 1
+    assert tokenizer.encode("hi") == list(b"hi")
+
+    # (b) A cancelled shared load (event-loop shutdown only) propagates.
+    loader = GatedLoader()
+    tokenizer = TiktokenTokenizer(loader=loader)
+    try:
+        waiter = asyncio.create_task(tokenizer.ensure_ready())
+        await asyncio.sleep(0)
+        shared = tokenizer._load_task
+        assert shared is not None
+        shared.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    finally:
+        loader.gate.set()
+
+    assert shared.cancelled()
+    assert tokenizer._unavailable is False
+    assert tokenizer._load_task is None
+    assert _tokenizer_records(caplog) == []
+    assert not [r for r in caplog.records if r.name == "asyncio"]
